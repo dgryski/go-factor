@@ -9,7 +9,6 @@ func Trial(n *big.Int) (primes []*big.Int, composites []*big.Int) {
 	var z big.Int
 	var m big.Int
 
-	one := big.NewInt(1)
 
 	for _, p := range smallPrimes {
 		for {
