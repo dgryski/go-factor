@@ -16,8 +16,6 @@ func checkGCD(n, g *big.Int) (newN, newG *big.Int, ok bool) {
 		return nil, nil, false
 	}
 
-	one := big.NewInt(1)
-
 	if z.Cmp(one) == 0 {
 		return nil, nil, false
 	}
@@ -37,7 +35,6 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 	x2 := big.NewInt(start*start + c)
 
 	bigc := big.NewInt(c)
-	two := big.NewInt(2)
 
 	// try to get off the tail
 	for j := 0; j < 1000; j++ {
@@ -85,8 +82,6 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 			x2.Add(x2, bigc)
 		}
 	}
-
-	one := big.NewInt(1)
 
 	if n.Cmp(one) != 0 {
 		if n.ProbablyPrime(10) {
