@@ -18,16 +18,12 @@ func main() {
 
 	n.SetString(flag.Arg(0), 10)
 
-	var ptmp, ctmp []*big.Int
-
 	log.Println("starting trial")
-	ptmp, ctmp = factor.Trial(&n)
+	ptmp, ctmp := factor.Trial(&n)
 
 	if len(ptmp) > 0 {
 		log.Printf("trial=%+v\n", ptmp)
 	}
-
-	var cfinal []*big.Int
 
 	if len(ctmp) > 0 {
 		p := int64(2)
@@ -47,16 +43,31 @@ func main() {
 
 	if len(ctmp) > 0 {
 		log.Println("starting p-1")
+		var comps []*big.Int
 		for _, cc := range ctmp {
 			ptmp, c2 := factor.PMinus1(cc)
 			if len(ptmp) > 0 {
 				log.Printf("p-1=%+v\n", ptmp)
 			}
-			cfinal = append(cfinal, c2...)
+			comps = append(comps, c2...)
 		}
+		ctmp = comps
 	}
 
-	if len(cfinal) > 0 {
-		log.Printf("cfinal=%+v\n", cfinal)
+	if len(ctmp) > 0 {
+		log.Println("starting squfof")
+		var comps []*big.Int
+		for _, cc := range ctmp {
+			ptmp, c2 := factor.Squfof(cc)
+			if len(ptmp) > 0 {
+				log.Printf("squfof=%+v\n", ptmp)
+			}
+			comps = append(comps, c2...)
+		}
+		ctmp = comps
+	}
+
+	if len(ctmp) > 0 {
+		log.Printf("cfinal=%+v\n", ctmp)
 	}
 }
