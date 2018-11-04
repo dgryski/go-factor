@@ -4,9 +4,9 @@ import (
 	"math/big"
 )
 
-const squfofMaxIters = 10000
+const squfofMaxIters = 100000
 
-func Squfof(n *big.Int) (primes, composites []*big.Int) {
+func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 
 	if n.ProbablyPrime(10) {
 		return []*big.Int{n}, nil
@@ -16,12 +16,14 @@ func Squfof(n *big.Int) (primes, composites []*big.Int) {
 	a := big.NewInt(0)
 	b := big.NewInt(0)
 
-	isqrtn := big.NewInt(0).Sqrt(n)
+	d := big.NewInt(0).Mul(n, big.NewInt(k))
+
+	isqrtn := big.NewInt(0).Sqrt(d)
 	bi := big.NewInt(0)
 	pim1 := big.NewInt(0).Set(isqrtn)
 	pi := big.NewInt(0)
 
-	qi := big.NewInt(0).Set(n)
+	qi := big.NewInt(0).Set(d)
 	a.Mul(pim1, pim1)
 	qi.Sub(qi, a)
 
@@ -72,7 +74,7 @@ func Squfof(n *big.Int) (primes, composites []*big.Int) {
 	qim1.Set(b)
 
 	/* qi = (n - pi * pi) / qim1; */
-	a.Set(n)
+	a.Set(d)
 	b.Mul(pi, pi)
 	a.Sub(a, b)
 	qi.Div(a, qim1)
@@ -103,9 +105,9 @@ func Squfof(n *big.Int) (primes, composites []*big.Int) {
 	}
 
 	if newN, newG, ok := checkGCD(n, pi); ok {
-		pr, co := Squfof(newN)
+		pr, co := Squfof(newN, k)
 		primes, composites = append(primes, pr...), append(composites, co...)
-		pr, co = Squfof(newG)
+		pr, co = Squfof(newG, k)
 		primes, composites = append(primes, pr...), append(composites, co...)
 	}
 
