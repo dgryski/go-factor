@@ -1,7 +1,4 @@
 package factor
-
-// TODO(dgryski): shrink size of table
-
 var smallPrimes = []int64{
 	2,
 	3,
