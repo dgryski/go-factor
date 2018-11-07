@@ -4,7 +4,9 @@ import (
 	"math/big"
 )
 
-const squfofMaxIters = 100000
+const squfofMaxIters = 1000000
+
+var maxSqufof = big.NewInt(squfofMaxIters)
 
 func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 
@@ -16,107 +18,149 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 	a := big.NewInt(0)
 	b := big.NewInt(0)
 
-	d := big.NewInt(0).Mul(n, big.NewInt(k))
+	// apply small multiplier
+	N := big.NewInt(0).Mul(n, big.NewInt(k))
 
-	isqrtn := big.NewInt(0).Sqrt(d)
-	bi := big.NewInt(0)
-	pim1 := big.NewInt(0).Set(isqrtn)
-	pi := big.NewInt(0)
+	// s = sqrt(N)
+	s := big.NewInt(0).Sqrt(N)
 
-	qi := big.NewInt(0).Set(d)
-	a.Mul(pim1, pim1)
-	qi.Sub(qi, a)
+	// research says "50 should be big enough" -- need link to paper
+	list := make([]*big.Int, 0, 50)
 
-	qim1 := big.NewInt(1)
-	qip1 := big.NewInt(0)
+	Qprev := big.NewInt(1)
 
-	var qiSquare bool
+	// P = s
+	P := big.NewInt(0).Set(s)
 
-	for i := 0; i < squfofMaxIters; i++ {
+	// L = floor ( 2 * sqrt(2 * s)) == sqrt(8 * s)
+	// B = 3*L == 3*sqrt(8*s)
+	a.Mul(s, big.NewInt(8))
+	L := big.NewInt(0).Sqrt(a)
+	lOverTwo := big.NewInt(0).Rsh(L, 1)
+	B := big.NewInt(0).Mul(L, big.NewInt(3))
 
-		if isSquare(qi) {
-			qiSquare = true
-			break
+	if B.Cmp(maxSqufof) >= 0 {
+		B.Set(maxSqufof)
+	}
+	B64 := B.Uint64()
+
+	// Q = N - P*P
+	Q := big.NewInt(0).Set(N)
+	a.Mul(P, P)
+	Q.Sub(Q, a)
+
+	// needed in loop
+	q := big.NewInt(0)
+	Pnext := big.NewInt(0)
+	t := big.NewInt(0)
+
+	var foundSquare bool
+	for i := uint64(0); i < B64; i++ {
+
+		/* q = (s + P) / Q */
+		q.Add(s, P)
+		q.Div(q, Q)
+
+		/* Pnext = q * Q - P */
+		a.Mul(q, Q)
+		Pnext.Sub(a, P)
+
+		if Q.Cmp(L) <= 0 {
+			e := big.NewInt(0).Set(Q)
+			if e.Bit(0) == 0 {
+				e.Rsh(e, 1)
+				list = append(list, e)
+			} else if e.Cmp(lOverTwo) <= 0 {
+				list = append(list, e)
+			}
 		}
 
-		/* bi = (isqrtn + pim1) / qi; */
-		bi.Add(isqrtn, pim1)
-		bi.Div(bi, qi)
+		/* t = Qprev + q * (P - Pnext) */
+		a.Sub(P, Pnext)
+		b.Mul(q, a)
+		t.Add(Qprev, b)
 
-		/* pi = bi * qi - pim1; */
-		a.Mul(bi, qi)
-		pi.Sub(a, pim1)
+		Qprev.Set(Q)
+		Q.Set(t)
+		P.Set(Pnext)
 
-		/* qip1 = qim1 + bi * (pim1 - pi); */
-		a.Sub(pim1, pi)
-		b.Mul(bi, a)
-		qip1.Add(qim1, b)
-
-		qim1.Set(qi)
-		qi.Set(qip1)
-		pim1.Set(pi)
+		if i&1 == 0 {
+			if r, ok := isSquare(Q); ok && r.Cmp(one) > 0 && !inList(r, list) {
+				// save for outside the loop
+				Qprev.Set(r)
+				foundSquare = true
+				break
+			}
+		}
 	}
 
-	if !qiSquare {
+	if !foundSquare {
 		return primes, []*big.Int{n}
 	}
 
-	/* bi = (isqrtn - pim1) / sqrt(qi); */
-	b.Sqrt(qi)
-	a.Sub(isqrtn, pim1)
-	bi.Div(a, b)
+	// alias so the formulas stay correct
+	r := Qprev
 
-	/* pi = bi * sqrt(qi) + pim1; */
-	a.Mul(bi, b)
-	pi.Add(a, pim1)
+	// P = P + r * floor((s-P)/r)
+	b.Sub(s, P)
+	a.Div(b, r)
+	b.Mul(a, r)
+	P.Add(P, b)
 
-	pim1.Set(pi)
-	qim1.Set(b)
+	// Q = (N - P*P) / Qprev
+	b.Mul(P, P)
+	a.Sub(N, b)
+	Q.Div(a, Qprev)
 
-	/* qi = (n - pi * pi) / qim1; */
-	a.Set(d)
-	b.Mul(pi, pi)
-	a.Sub(a, b)
-	qi.Div(a, qim1)
+	for {
+		/* q = (s + P) / Q */
+		a.Add(s, P)
+		q.Div(a, Q)
 
-	for i := 0; i < squfofMaxIters; i++ {
+		/* Pnext = q * Q - P */
+		a.Mul(q, Q)
+		Pnext.Sub(a, P)
 
-		/* bi = (isqrtn + pim1) / qi; */
-		bi.Add(isqrtn, pim1)
-		bi.Div(bi, qi)
-
-		/* pi = bi * qi - pim1; */
-		a.Mul(bi, qi)
-		pi.Sub(a, pim1)
-
-		if pim1.Cmp(pi) == 0 {
-			// found a factor --
+		if P.Cmp(Pnext) == 0 {
 			break
 		}
 
-		/* qip1 = qim1 + bi * (pim1 - pi); */
-		a.Sub(pim1, pi)
-		b.Mul(bi, a)
-		qip1.Add(qim1, b)
+		/* t = Qprev + q * (P - Pnext) */
+		a.Sub(P, Pnext)
+		b.Mul(q, a)
+		t.Add(Qprev, b)
 
-		qim1.Set(qi)
-		qi.Set(qip1)
-		pim1.Set(pi)
+		Qprev.Set(Q)
+		Q.Set(t)
+		P.Set(Pnext)
 	}
 
-	if newN, newG, ok := checkGCD(n, pi); ok {
+	if newN, newG, ok := checkGCD(n, Q); ok {
 		pr, co := Squfof(newN, k)
 		primes, composites = append(primes, pr...), append(composites, co...)
 		pr, co = Squfof(newG, k)
 		primes, composites = append(primes, pr...), append(composites, co...)
+		return primes, composites
 	}
 
-	return primes, composites
+	return nil, []*big.Int{n}
 }
 
-func isSquare(n *big.Int) bool {
-	t := big.NewInt(0)
-	t = t.Sqrt(n)
-	t.Mul(t, t)
-	return t.Cmp(n) == 0
+func isSquare(q *big.Int) (*big.Int, bool) {
+	// https://www.johndcook.com/blog/2008/11/17/fast-way-to-test-whether-a-number-is-a-square/
+	if h := q.Uint64() & 0x0f; h != 0 && h != 1 && h != 4 && h != 9 {
+		return nil, false
+	}
+
+	r := big.NewInt(0).Sqrt(q)
+	return r, big.NewInt(0).Mul(r, r).Cmp(q) == 0
+}
+
+func inList(r *big.Int, l []*big.Int) bool {
+	for _, v := range l {
+		if r.Cmp(v) == 0 {
+			return true
+		}
+	}
+	return false
 }
