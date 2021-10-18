@@ -56,10 +56,10 @@ func main() {
 
 	if len(ctmp) > 0 {
 		multiplier := []int64{1, 3, 5, 7, 11, 3 * 5, 3 * 7, 3 * 11, 5 * 7, 5 * 11, 7 * 11, 3 * 5 * 7, 3 * 5 * 11, 3 * 7 * 11, 5 * 7 * 11, 3 * 5 * 7 * 11}
+		log.Printf("starting squfof")
 		for _, k := range multiplier {
 			var comps []*big.Int
 			for _, cc := range ctmp {
-				log.Printf("starting squfof(%v)", k)
 				ptmp, c2 := factor.Squfof(cc, k)
 				if len(ptmp) > 0 {
 					log.Printf("squfof=%+v\n", ptmp)
