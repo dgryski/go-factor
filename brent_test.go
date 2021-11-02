@@ -6,6 +6,9 @@ import (
 )
 
 func TestBrent(t *testing.T) {
-	p, c := Brent(big.NewInt(3928471), 19, 1)
+	n := big.NewInt(3928471)
+	orig := (&big.Int{}).Set(n)
+	p, c := Brent(n, 19, 1)
 	t.Log(p, c)
+	verifyFactoring(t, orig, p, c)
 }
