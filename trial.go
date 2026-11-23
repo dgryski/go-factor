@@ -4,7 +4,11 @@ import (
 	"math/big"
 )
 
+// Trial divides n by the small primes. Values below 1 are returned unchanged.
 func Trial(n *big.Int) (primes []*big.Int, composites []*big.Int) {
+	if n.Sign() <= 0 {
+		return nil, []*big.Int{n}
+	}
 
 	var z big.Int
 	var m big.Int

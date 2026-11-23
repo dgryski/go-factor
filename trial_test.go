@@ -14,6 +14,17 @@ func TestTrial(t *testing.T) {
 	verifyFactoring(t, orig, p, c)
 }
 
+func TestTrialNonPositive(t *testing.T) {
+	for _, v := range []int64{0, -1, -12} {
+		n := big.NewInt(v)
+		var p, c []*big.Int
+		withTimeout(t, 5*time.Second, "Trial("+n.String()+")", func() {
+			p, c = Trial(n)
+		})
+		verifyProduct(t, big.NewInt(v), p, c)
+	}
+}
+
 func verifyFactoring(t *testing.T, n *big.Int, p []*big.Int, c []*big.Int) {
 	t.Helper()
 
