@@ -57,6 +57,19 @@ func main() {
 	}
 
 	if len(ctmp) > 0 {
+		log.Println("starting p+1")
+		var comps []*big.Int
+		for _, cc := range ctmp {
+			ptmp, c2 := factor.PPlus1(cc, 10000, 3)
+			if len(ptmp) > 0 {
+				log.Printf("p+1=%+v\n", ptmp)
+			}
+			comps = append(comps, c2...)
+		}
+		ctmp = comps
+	}
+
+	if len(ctmp) > 0 {
 		multiplier := []int64{1, 3, 5, 7, 11, 3 * 5, 3 * 7, 3 * 11, 5 * 7, 5 * 11, 7 * 11, 3 * 5 * 7, 3 * 5 * 11, 3 * 7 * 11, 5 * 7 * 11, 3 * 5 * 7 * 11}
 		log.Printf("starting squfof")
 		for _, k := range multiplier {
