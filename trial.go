@@ -9,6 +9,7 @@ func Trial(n *big.Int) (primes []*big.Int, composites []*big.Int) {
 	if n.Sign() <= 0 {
 		return nil, []*big.Int{n}
 	}
+	n = new(big.Int).Set(n)
 
 	var z big.Int
 	var m big.Int

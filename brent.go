@@ -5,24 +5,13 @@ import (
 )
 
 func checkGCD(n, g *big.Int) (newN, newG *big.Int, ok bool) {
+	z := new(big.Int).GCD(nil, nil, n, g)
 
-	var z big.Int
-
-	g.Abs(g)
-
-	z.GCD(nil, nil, n, g)
-
-	if z.Cmp(n) == 0 {
+	if z.Cmp(n) == 0 || z.Cmp(one) == 0 {
 		return nil, nil, false
 	}
 
-	if z.Cmp(one) == 0 {
-		return nil, nil, false
-	}
-
-	n.Div(n, &z)
-
-	return n, &z, true
+	return new(big.Int).Div(n, z), z, true
 }
 
 func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
