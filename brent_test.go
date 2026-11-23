@@ -26,3 +26,12 @@ func TestBrentCycle(t *testing.T) {
 		verifyProduct(t, orig, p, c)
 	}
 }
+
+func TestBrentPartialBatch(t *testing.T) {
+	// These are found in a batch of fewer than 16 terms.
+	for _, v := range []int64{21, 35, 55, 91, 323} {
+		n := big.NewInt(v)
+		p, c := Brent(n, 2, 1)
+		verifyFactoring(t, big.NewInt(v), p, c)
+	}
+}

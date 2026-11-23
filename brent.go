@@ -48,36 +48,42 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 		f(x2)
 	}
 
+	split := func(newN, newG *big.Int) (primes, composites []*big.Int) {
+		pr, co := Brent(newN, start, c)
+		primes, composites = append(primes, pr...), append(composites, co...)
+		pr, co = Brent(newG, start, c)
+		primes, composites = append(primes, pr...), append(composites, co...)
+		return primes, composites
+	}
+
 	limit := 1
 	product := big.NewInt(1)
+	var tmp big.Int
 
-	terms := 0
+	// A batch never spans two rounds, since x1 changes between them.
+	terms, batch := 0, 0
+loop:
 	for terms < (1 << 16) {
 		for j := 0; j < limit; j++ {
 			f(x2)
 
 			if x1.Cmp(x2) == 0 {
 				// The sequence cycled mod n without finding a factor.
-				return nil, []*big.Int{n}
+				break loop
 			}
 
-			var tmp big.Int
 			tmp.Sub(x1, x2)
 			product.Mul(product, &tmp)
 			product.Mod(product, n)
 
 			terms++
-			if terms%16 == 0 {
-
+			batch++
+			if batch == 16 || j == limit-1 {
 				if newN, newG, ok := checkGCD(n, product); ok {
-					pr, co := Brent(newN, start, c)
-					primes, composites = append(primes, pr...), append(composites, co...)
-					pr, co = Brent(newG, start, c)
-					primes, composites = append(primes, pr...), append(composites, co...)
-					return primes, composites
+					return split(newN, newG)
 				}
-
 				product.SetInt64(1)
+				batch = 0
 			}
 		}
 
@@ -88,13 +94,11 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 		}
 	}
 
-	if n.Cmp(one) != 0 {
-		if n.ProbablyPrime(10) {
-			primes = append(primes, n)
-		} else {
-			composites = append(composites, n)
+	if batch > 0 {
+		if newN, newG, ok := checkGCD(n, product); ok {
+			return split(newN, newG)
 		}
 	}
 
-	return primes, composites
+	return nil, []*big.Int{n}
 }
