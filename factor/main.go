@@ -72,6 +72,23 @@ func main() {
 		}
 	}
 
+	// B1 and curves for factors up to 15, 20 and 25 digits, from the GMP-ECM README.
+	for _, s := range []struct{ b1, curves int }{{2000, 25}, {11000, 90}, {50000, 300}} {
+		if len(ctmp) == 0 {
+			break
+		}
+		log.Printf("starting ecm(b1=%v, curves=%v)", s.b1, s.curves)
+		var comps []*big.Int
+		for _, cc := range ctmp {
+			ptmp, c2 := factor.ECM(cc, s.b1, s.curves)
+			if len(ptmp) > 0 {
+				log.Printf("ecm=%+v\n", ptmp)
+			}
+			comps = append(comps, c2...)
+		}
+		ctmp = comps
+	}
+
 	if len(ctmp) > 0 {
 		log.Printf("cfinal=%+v\n", ctmp)
 	}
