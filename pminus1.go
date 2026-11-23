@@ -5,12 +5,23 @@ import (
 )
 
 func PMinus1(n *big.Int) (primes, composites []*big.Int) {
+	if n.Cmp(one) <= 0 {
+		return nil, nil
+	}
 
 	if n.ProbablyPrime(10) {
 		return []*big.Int{n}, nil
 	}
 
-	a := big.NewInt(2 * 3 * 5 * 7 * 11)
+	if n.Bit(0) == 0 {
+		var half big.Int
+		half.Rsh(n, 1)
+		pr, co := PMinus1(&half)
+		return append([]*big.Int{big.NewInt(2)}, pr...), co
+	}
+
+	// The base must be coprime to n or its common primes are never found.
+	a := big.NewInt(2)
 
 	var one big.Int
 	one.SetInt64(1)

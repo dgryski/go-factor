@@ -14,3 +14,15 @@ func TestPMinus1(t *testing.T) {
 	t.Log(p, c)
 	verifyFactoring(t, orig, p, c)
 }
+
+func TestPMinus1SmallFactor(t *testing.T) {
+	for _, v := range []int64{7 * 1000003, 11 * 1000003, 2 * 3928471, 4 * 3928471, 2, 4} {
+		n := big.NewInt(v)
+		orig := new(big.Int).Set(n)
+		p, c := PMinus1(n)
+		verifyFactoring(t, orig, p, c)
+		if len(c) != 0 {
+			t.Errorf("PMinus1(%v) left composites %v", orig, c)
+		}
+	}
+}
