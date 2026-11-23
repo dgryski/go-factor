@@ -23,8 +23,15 @@ func PMinus1(n *big.Int) (primes, composites []*big.Int) {
 	// The base must be coprime to n or its common primes are never found.
 	a := big.NewInt(2)
 
-	var one big.Int
-	one.SetInt64(1)
+	// a at the start of the current batch, for backtracking
+	saved := new(big.Int).Set(a)
+	start := 0
+
+	var g, aMinus1 big.Int
+	gcd := func() {
+		aMinus1.Sub(a, one)
+		g.GCD(nil, nil, &aMinus1, n)
+	}
 
 	var bigp big.Int
 	var m big.Int
@@ -42,8 +49,26 @@ func PMinus1(n *big.Int) (primes, composites []*big.Int) {
 		a.Exp(a, &m, n)
 
 		if (i > 0 && i%16 == 0) || i == len(smallPrimes)-1 {
-			var aMinus1 big.Int
-			aMinus1.Sub(a, &one)
+			gcd()
+			if g.Cmp(n) == 0 {
+				// Every prime of n was found in this batch. Redo it one
+				// prime power at a time to separate them.
+				a.Set(saved)
+				g.SetInt64(1)
+			replay:
+				for _, q := range smallPrimes[start : i+1] {
+					bigp.SetInt64(q)
+					for m.Set(&bigp); m.Cmp(n) < 0; m.Mul(&m, &bigp) {
+						a.Exp(a, &bigp, n)
+						if gcd(); g.Cmp(one) != 0 {
+							break replay
+						}
+					}
+				}
+				if g.Cmp(n) == 0 {
+					return nil, []*big.Int{n}
+				}
+			}
 			if newN, newG, ok := checkGCD(n, &aMinus1); ok {
 				pr, co := PMinus1(newN)
 				primes, composites = append(primes, pr...), append(composites, co...)
@@ -51,6 +76,8 @@ func PMinus1(n *big.Int) (primes, composites []*big.Int) {
 				primes, composites = append(primes, pr...), append(composites, co...)
 				return primes, composites
 			}
+			saved.Set(a)
+			start = i + 1
 		}
 	}
 

@@ -42,3 +42,21 @@ func TestPMinus1LastBatch(t *testing.T) {
 	pr, c := PMinus1(n)
 	verifyFactoring(t, orig, pr, c)
 }
+
+func TestPMinus1Backtrack(t *testing.T) {
+	// p-1 and q-1 are both 3-smooth, so both are found in the first batch.
+	p := new(big.Int).Lsh(big.NewInt(3), 30)
+	p.Add(p, one)
+	q := new(big.Int).Lsh(big.NewInt(81), 32)
+	q.Add(q, one)
+	if !p.ProbablyPrime(20) || !q.ProbablyPrime(20) {
+		t.Fatal("test factors are not prime")
+	}
+	n := new(big.Int).Mul(p, q)
+	orig := new(big.Int).Set(n)
+	pr, c := PMinus1(n)
+	verifyFactoring(t, orig, pr, c)
+	if len(c) != 0 {
+		t.Errorf("PMinus1(%v) left composites %v", orig, c)
+	}
+}
