@@ -24,6 +24,18 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 	// s = sqrt(N)
 	s := big.NewInt(0).Sqrt(N)
 
+	if a.Mul(s, s).Cmp(N) == 0 {
+		// Q would start at 0. Every prime of n divides s.
+		if newN, newG, ok := checkGCD(n, b.Set(s)); ok {
+			pr, co := Squfof(newN, k)
+			primes, composites = append(primes, pr...), append(composites, co...)
+			pr, co = Squfof(newG, k)
+			primes, composites = append(primes, pr...), append(composites, co...)
+			return primes, composites
+		}
+		return nil, []*big.Int{n}
+	}
+
 	// research says "50 should be big enough" -- need link to paper
 	list := make([]*big.Int, 0, 50)
 
