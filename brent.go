@@ -31,15 +31,21 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 		return []*big.Int{n}, nil
 	}
 
-	x1 := big.NewInt(start)
-	x2 := big.NewInt(start*start + c)
-
 	bigc := big.NewInt(c)
+	f := func(x *big.Int) {
+		x.Mul(x, x)
+		x.Add(x, bigc)
+		x.Mod(x, n)
+	}
+
+	x1 := big.NewInt(start)
+	x1.Mod(x1, n)
+	x2 := new(big.Int).Set(x1)
+	f(x2)
 
 	// try to get off the tail
 	for j := 0; j < 1000; j++ {
-		x2.Exp(x2, two, n)
-		x2.Add(x2, bigc)
+		f(x2)
 	}
 
 	limit := 1
@@ -48,8 +54,7 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 	terms := 0
 	for terms < (1 << 16) {
 		for j := 0; j < limit; j++ {
-			x2.Exp(x2, two, n)
-			x2.Add(x2, bigc)
+			f(x2)
 
 			if x1.Cmp(x2) == 0 {
 				// The sequence cycled mod n without finding a factor.
@@ -59,6 +64,7 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 			var tmp big.Int
 			tmp.Sub(x1, x2)
 			product.Mul(product, &tmp)
+			product.Mod(product, n)
 
 			terms++
 			if terms%16 == 0 {
@@ -78,8 +84,7 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 		x1.Set(x2)
 		limit *= 2
 		for j := 0; j < limit; j++ {
-			x2.Exp(x2, two, n)
-			x2.Add(x2, bigc)
+			f(x2)
 		}
 	}
 
