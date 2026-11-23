@@ -26,3 +26,19 @@ func TestPMinus1SmallFactor(t *testing.T) {
 		}
 	}
 }
+
+func TestPMinus1LastBatch(t *testing.T) {
+	// p-1 has the largest small prime as a factor.
+	last := smallPrimes[len(smallPrimes)-1]
+	p := new(big.Int)
+	for k := int64(1); ; k++ {
+		p.SetInt64(2*k*last + 1)
+		if p.ProbablyPrime(20) {
+			break
+		}
+	}
+	n := new(big.Int).Mul(p, big.NewInt(1000003))
+	orig := new(big.Int).Set(n)
+	pr, c := PMinus1(n)
+	verifyFactoring(t, orig, pr, c)
+}

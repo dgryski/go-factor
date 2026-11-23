@@ -41,7 +41,7 @@ func PMinus1(n *big.Int) (primes, composites []*big.Int) {
 
 		a.Exp(a, &m, n)
 
-		if i > 0 && i%16 == 0 {
+		if (i > 0 && i%16 == 0) || i == len(smallPrimes)-1 {
 			var aMinus1 big.Int
 			aMinus1.Sub(a, &one)
 			if newN, newG, ok := checkGCD(n, &aMinus1); ok {
