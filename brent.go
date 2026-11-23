@@ -52,8 +52,8 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 			x2.Add(x2, bigc)
 
 			if x1.Cmp(x2) == 0 {
-				// algorithm fail?
-				break
+				// The sequence cycled mod n without finding a factor.
+				return nil, []*big.Int{n}
 			}
 
 			var tmp big.Int
