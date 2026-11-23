@@ -38,3 +38,18 @@ func TestSqufofMultiplier(t *testing.T) {
 		verifyFactoring(t, orig, p, c)
 	}
 }
+
+func TestIsSquare(t *testing.T) {
+	r, _ := big.NewInt(0).SetString("123456789012345678901", 10)
+	sq := new(big.Int).Mul(r, r)
+	if got, ok := isSquare(sq); !ok || got.Cmp(r) != 0 {
+		t.Errorf("isSquare(%v) = %v, %v", sq, got, ok)
+	}
+	sq.Add(sq, one)
+	if _, ok := isSquare(sq); ok {
+		t.Errorf("isSquare(%v) = true", sq)
+	}
+	if _, ok := isSquare(big.NewInt(0)); !ok {
+		t.Errorf("isSquare(0) = false")
+	}
+}

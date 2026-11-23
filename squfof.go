@@ -160,7 +160,12 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 
 func isSquare(q *big.Int) (*big.Int, bool) {
 	// https://www.johndcook.com/blog/2008/11/17/fast-way-to-test-whether-a-number-is-a-square/
-	if h := q.Uint64() & 0x0f; h != 0 && h != 1 && h != 4 && h != 9 {
+	// Uint64 is undefined for values above 64 bits, so read the low word.
+	var h big.Word
+	if w := q.Bits(); len(w) > 0 {
+		h = w[0] & 0x0f
+	}
+	if h != 0 && h != 1 && h != 4 && h != 9 {
 		return nil, false
 	}
 
