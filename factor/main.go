@@ -4,11 +4,13 @@ import (
 	"flag"
 	"log"
 	"math/big"
+	"runtime"
 
 	"github.com/dgryski/go-factor"
 )
 
 func main() {
+	// 21251589199163473368424683523876245871651712859289
 
 	flag.Parse()
 
@@ -18,6 +20,11 @@ func main() {
 
 	if _, ok := n.SetString(flag.Arg(0), 10); !ok || n.Cmp(big.NewInt(1)) <= 0 {
 		log.Fatalf("invalid number %q: want an integer greater than 1", flag.Arg(0))
+	}
+
+	if n.ProbablyPrime(20) {
+		log.Printf("prime=%+v\n", &n)
+		return
 	}
 
 	log.Println("starting trial")
@@ -103,6 +110,28 @@ func main() {
 	}
 
 	if len(ctmp) > 0 {
+		// The quadratic sieve trial-divides its candidates instead of
+		// sieving, so larger inputs take a long time and then fail.
+		const qsMaxBits = 64
+		log.Println("starting qs")
+		var comps []*big.Int
+		for _, cc := range ctmp {
+			if cc.BitLen() > qsMaxBits {
+				comps = append(comps, cc)
+				continue
+			}
+			ptmp, c2 := factor.QuadraticSieve(cc)
+			if len(ptmp) > 0 {
+				log.Printf("qs=%+v\n", ptmp)
+			}
+			comps = append(comps, c2...)
+		}
+		ctmp = comps
+	}
+
+	if len(ctmp) > 0 {
 		log.Printf("cfinal=%+v\n", ctmp)
 	}
+
+	runtime.GC()
 }
