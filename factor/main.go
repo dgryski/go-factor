@@ -16,7 +16,9 @@ func main() {
 
 	log.Printf("factoring %+v\n", flag.Arg(0))
 
-	n.SetString(flag.Arg(0), 10)
+	if _, ok := n.SetString(flag.Arg(0), 10); !ok || n.Cmp(big.NewInt(1)) <= 0 {
+		log.Fatalf("invalid number %q: want an integer greater than 1", flag.Arg(0))
+	}
 
 	log.Println("starting trial")
 	ptmp, ctmp := factor.Trial(&n)
