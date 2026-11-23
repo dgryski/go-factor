@@ -28,3 +28,13 @@ func TestSqufofSquare(t *testing.T) {
 		verifyFactoring(t, orig, pr, co)
 	}
 }
+
+func TestSqufofMultiplier(t *testing.T) {
+	// These fail with k=3 if the queue ignores the multiplier.
+	for _, s := range []string{"3017139931213241", "3027440398119283", "3034316960173133"} {
+		n, _ := big.NewInt(0).SetString(s, 10)
+		orig := new(big.Int).Set(n)
+		p, c := Squfof(n, 3)
+		verifyFactoring(t, orig, p, c)
+	}
+}

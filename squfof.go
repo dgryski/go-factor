@@ -20,6 +20,7 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 
 	// apply small multiplier
 	N := big.NewInt(0).Mul(n, big.NewInt(k))
+	twoK := big.NewInt(2 * k)
 
 	// s = sqrt(N)
 	s := big.NewInt(0).Sqrt(N)
@@ -78,11 +79,10 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 		Pnext.Sub(a, P)
 
 		if Q.Cmp(L) <= 0 {
-			e := big.NewInt(0).Set(Q)
-			if e.Bit(0) == 0 {
-				e.Rsh(e, 1)
-				list = append(list, e)
-			} else if e.Cmp(lOverTwo) <= 0 {
+			// Q/gcd(Q, 2k) is Q/2 or Q when k is 1.
+			e := big.NewInt(0).GCD(nil, nil, Q, twoK)
+			e.Div(Q, e)
+			if e.Cmp(lOverTwo) <= 0 {
 				list = append(list, e)
 			}
 		}
