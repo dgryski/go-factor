@@ -35,3 +35,12 @@ func TestBrentPartialBatch(t *testing.T) {
 		verifyFactoring(t, big.NewInt(v), p, c)
 	}
 }
+
+func TestBrentBacktrack(t *testing.T) {
+	// The batch product is 0 mod n here, but single terms are not.
+	for _, v := range []int64{649, 1067, 1357, 1711, 2231} {
+		n := big.NewInt(v)
+		p, c := Brent(n, 2, 1)
+		verifyFactoring(t, big.NewInt(v), p, c)
+	}
+}

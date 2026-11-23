@@ -60,11 +60,46 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 	product := big.NewInt(1)
 	var tmp big.Int
 
+	// x2 at the start of the batch, for backtracking
+	ys := new(big.Int)
+
+	// batchGCD returns gcd(product, n), or nil if it is 1. If it is n the
+	// batch is redone one term at a time to try to separate the factors.
+	batchGCD := func(count int) *big.Int {
+		g := new(big.Int).GCD(nil, nil, product, n)
+		if g.Cmp(n) == 0 {
+			y := new(big.Int).Set(ys)
+			for k := 0; k < count; k++ {
+				f(y)
+				tmp.Sub(x1, y)
+				tmp.Mod(&tmp, n)
+				if g.GCD(nil, nil, &tmp, n); g.Cmp(one) != 0 {
+					break
+				}
+			}
+		}
+		if g.Cmp(one) == 0 {
+			return nil
+		}
+		return g
+	}
+
+	// found splits n by g, or gives up if g is n.
+	found := func(g *big.Int) (primes, composites []*big.Int) {
+		if g.Cmp(n) == 0 {
+			return nil, []*big.Int{n}
+		}
+		return split(new(big.Int).Div(n, g), g)
+	}
+
 	// A batch never spans two rounds, since x1 changes between them.
 	terms, batch := 0, 0
 loop:
 	for terms < (1 << 16) {
 		for j := 0; j < limit; j++ {
+			if batch == 0 {
+				ys.Set(x2)
+			}
 			f(x2)
 
 			if x1.Cmp(x2) == 0 {
@@ -79,8 +114,8 @@ loop:
 			terms++
 			batch++
 			if batch == 16 || j == limit-1 {
-				if newN, newG, ok := checkGCD(n, product); ok {
-					return split(newN, newG)
+				if g := batchGCD(batch); g != nil {
+					return found(g)
 				}
 				product.SetInt64(1)
 				batch = 0
@@ -90,13 +125,16 @@ loop:
 		x1.Set(x2)
 		limit *= 2
 		for j := 0; j < limit; j++ {
+			if batch == 0 {
+				ys.Set(x2)
+			}
 			f(x2)
 		}
 	}
 
 	if batch > 0 {
-		if newN, newG, ok := checkGCD(n, product); ok {
-			return split(newN, newG)
+		if g := batchGCD(batch); g != nil {
+			return found(g)
 		}
 	}
 
