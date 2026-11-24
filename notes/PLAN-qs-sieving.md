@@ -40,10 +40,15 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
     bucket. Each block then adds its bucket's entries instead of looping over
     every root.
   - The threshold is per block, from the exact |Y| at the block's ends, and at
-    the vertex if it lies inside the block.
-  - `tryFactorize` checks primes below 16384 from a packed (p, r1, r2) table
-    rebuilt for each polynomial. For larger primes it divides only by the
-    bucket entries at the candidate's offset.
+    the vertex if it lies inside the block. It's rounded up to an integer
+    once per block, so the scan compares bytes to an int.
+  - `tryFactorize` checks primes below 2048 (`resieveCut`) from a packed
+    (p, r1, r2) table rebuilt for each polynomial. `bucketHits` finds the
+    rest for all of a block's candidates at once: primes from 2048 to 16384
+    by walking back from their next-block offsets (resieving), and larger
+    primes from the block's bucket.
+  - `log2Big` reads the top words of a big.Int instead of shifting a copy,
+    and `tryFactorize` and `addRelation` use scratch big.Ints on the sieve.
 - **Relations:**
   - Each relation stores its factors sparsely, as column indices repeated by
     multiplicity, rather than a dense exponent vector.
@@ -67,7 +72,10 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
     the reduced matrix if it has at least 1000 columns. It uses
     A = B·P·Bᵀ with a random symmetric invertible P (see "Block Lanczos"
     below). Dense GF(2) elimination solves smaller matrices, and is the
-    fallback if block Lanczos finds fewer than 16 independent dependencies.
+    fallback if three block Lanczos runs, with seeds 1–3, each find fewer
+    than 16 independent dependencies. A failed run costs about 1.5 s at 80
+    digits, and dense elimination about 12 s. Repeated dependencies from the
+    final step are dropped by hash.
   - `TestFindDependencies` checks the dependencies against full dense
     elimination: the count, that each sums to zero, and that they're
     independent.
@@ -122,8 +130,8 @@ These were measured, not guessed. Redo them if the candidate check gets faster.
   half the run time. It now checks only after a division.
 - **`bucketCut`:** 16384 was fastest among 2048–65536 at 219 and 240 bits.
   2048 was 15% slower and 65536 10% slower.
-- **Resieving** (`notes/_qa-drafts5/`) didn't pay and isn't used.
-  - It walks each prime from 2048 up back through every block with a
+- **Resieving, first try** (`notes/_qa-drafts5/`) didn't pay.
+  - It walked each prime from 2048 up back through every block with a
     candidate. At 200 bits that's about 28 µs per block, against about 4.7 µs
     per candidate for the old full scan, so it breaks even at about 7
     candidates per block. Blocks had 3.4 at 200 bits and 1.5 at 240.
@@ -132,8 +140,20 @@ These were measured, not guessed. Redo them if the candidate check gets faster.
     large prime.
   - Bucket sieving gets most of the benefit instead, because a candidate's
     large primes come from its block's bucket.
-  - It may pay again with double large primes, where those candidates become
-    partials.
+- **Resieving, now used**, only for primes from 2048 to 16384, inside
+  `bucketHits`. From `notes/ai_studio_code.txt`, together with the integer
+  threshold, the allocation fixes, the cofactor guards and the block Lanczos
+  retries. With double large primes off, on the seed-7 semiprimes, it
+  collected exactly the same relations as before, in:
+
+  | bits | before | after |
+  |------|--------|-------|
+  | 200  | 1.93 s | 2.13 s |
+  | 219  | 7.82 s | 7.31 s |
+  | 240  | 29.0 s | 25.8 s |
+
+  These are single runs on a laptop. The 219-bit baseline was 6.4 s in
+  earlier sessions, so compare only numbers from the same session.
 
 ### Fixed from the drafts
 
@@ -166,8 +186,9 @@ msieve 1.53 factoring it by SIQS in 1 min 36 s:
 - 49,954 relations: 26,246 full and 23,708 combined from 267,452 partials
 - a sparse matrix solved by block Lanczos
 
-`factor -v -methods=qs` factors it completely in 2 min 42 s, about 1.7×
-msieve's time:
+`factor -v -methods=qs` factors it completely in 21.4 s with parallel
+sieving on 15 workers (see "Parallel sieving"). On one worker it took
+2 min 42 s, about 1.7× msieve's time:
 
 - SIQS chose k = 5 and B = 1,570,053 (59,370 primes, M = 128K).
 - It collected 59,391 relations in 2 min 34 s, against 5 min before bucket
@@ -271,6 +292,11 @@ so far is faster. Tuning was stopped part way.
 - **`qs/dlp.go`:** `isPrime64`, exact Miller–Rabin for `uint64` with the
   7-base set from https://miller-rabin.appspot.com; `rho64`, Brent's rho; and
   `splitCofactor`.
+  - `rho64` handles n ≤ 1 and even n, keeps c < n, and gives up after about
+    2¹⁹ steps per c, so a prime can't make it spin.
+  - `splitCofactor` rejects cofactors above lpBound² before any primality
+    test, and `tryFactorize` only takes a cofactor up to lpBound as one large
+    prime if it's below pMax² or prime.
   - Both use Montgomery arithmetic (`mont`), because `bits.Div64` is software
     on arm64. With `bits.Div64`, splitting took 36% of a 240-bit run.
 - **`qs/dlp_test.go`:** `isPrime64` against a sieve below 200,000 and known
@@ -323,20 +349,167 @@ against 21.6 s committed, with the difference from the overshoot.
   which costs the bucket size times the number of candidates. That's what
   `bucketHits` replaces.
 
+**Measured after `bucketHits` and resieving from 2048, same semiprimes:**
+
+| bits | off | 0.4 | 0.5 | 0.55 | 0.6 | 0.65 |
+|---|---|---|---|---|---|---|
+| 219 | 7.24 s | 7.14 s | 7.99 s | 9.12 s | 10.4 s | 11.1 s |
+| 240 | 25.2 s | 24.1 s | 26.9 s | 29.2 s | 30.3 s | 32.9 s |
+
+At 240 bits 0.4 is about 4% faster than off, and needs 34,596 polynomials
+against 40,332. Above 0.5 the partials grow faster than they combine: 0.65
+keeps 335,668 partials for 19,955 relations, against 126,268 for 12,002 with
+double large primes off.
+
+**80 digits, 15 workers, partial sweep.** `split` on the 266-bit reference
+number with `dlpMinBits = 250`. The run was stopped after 7 of its 12
+settings, so 256K with double large primes on wasn't measured:
+
+| M | frac | total | sieve | polynomials | partials | matrix | matrix time |
+|---|---|---|---|---|---|---|---|
+| 128K | off | 18.8 s | 16.5 s | 225,643 | 272,610 | 85,508×83,516 | 2.2 s |
+| 128K | 0.4 | 19.5 s | 16.9 s | 202,893 | 335,668 | 95,424×92,248 | 2.4 s |
+| 128K | 0.5 | 20.3 s | 16.4 s | 176,303 | 456,626 | 112,107×108,229 | 3.6 s |
+| 128K | 0.55 | 20.2 s | 15.7 s | 162,469 | 529,529 | 123,050×118,751 | 4.1 s |
+| 128K | 0.6 | 20.5 s | 15.5 s | 148,614 | 563,488 | 122,146×121,409 | 4.5 s |
+| 128K | 0.65 | 20.5 s | 15.1 s | 143,046 | 618,720 | 133,913×131,188 | 4.9 s |
+| 256K | off | 17.6 s | 14.9 s | 129,832 | 272,610 | 85,207×83,671 | 2.6 s |
+
+- Double large primes cut the sieving time by up to 8% at 0.65, but the
+  matrix grows with the large prime columns, and its time more than doubles.
+  So the total is 1–2 s slower at every fraction.
+- 256K with double large primes off is the fastest so far: its sieving is
+  10% faster than at 128K, because each polynomial's setup and
+  `fillBuckets` cover twice the interval. It needs 129,832 polynomials
+  against 225,643.
+- The sieving gain may be bigger with one worker, where the collector's
+  share of the time is smaller. Those runs take about 2.5 minutes each.
+- Pruning the matrix harder, or merging partials that share a large prime
+  before the structured elimination, might recover the difference.
+
+The sweep is `TestSweep` in `qs/dlptune_test.go`:
+
+    QS_N=73129071533331481181630024590293633952610077040929361500801632604572796624590389 \
+    QS_RANGE=131072,262144 QS_DLP=0,0.4,0.5 QS_WORKERS=15 \
+        go test ./qs -run Sweep -v -tune -timeout 120m
+
 **Not done:**
-- Timing `bucketHits`, then rerunning the sweep at 219 and 240 bits and at 80
-  digits.
+- The rest of the 80-digit sweep: 256K with double large primes on, and
+  everything with one worker.
+- Making 256K the default for B ≥ 100,000 (`largeSieveRange`, a var while
+  it's tuned), after checking it at 70–75 digits too.
 - Choosing `dlpMinBits` and the slack fraction, then making the variables
   constants.
-- A full 80-digit run with double large primes.
-- Trying resieving for primes below `bucketCut` again, if candidate counts
-  stay high.
 - Tightening the recount near the end, so runs overshoot less than 6%.
+
+## Parallel sieving (done, uncommitted, 2026-11-24)
+
+Sieve SIQS polynomials on several goroutines and merge the relations in one
+place. `singlePoly` stays single-threaded, since it only runs below 60 bits.
+
+**Unit of work: one A and all 2^(s−1) of its polynomials.** Each A is
+independent once chosen, and the per-A setup (B_j, A⁻¹ mod p, the Gray code
+deltas) belongs to whoever sieves it. Workers pull A values from a channel,
+so slower cores take fewer.
+
+**Splitting `sieve`:**
+- Shared and read-only: `n`, `kn`, `log2KN`, each prime's `p`, `t` and
+  `logP`, `slack`, `lpBound`, `pMax`, `dlpCap`, `sieveFrom`, `resieveFrom`
+  and `bucketFrom`.
+- Per worker, in a new `worker` type: a copy of `roots` (which holds `r1`,
+  `r2`, `off1`, `off2` and `inA`), `aInv`, `deltas`, `buf`, `buckets`,
+  `small`, the candidate arrays, `scratch`, and the scratch big.Ints.
+  `sievePoly`, `bucketHits`, `fillBuckets`, `tryFactorize`, `setRoots`,
+  `setRootsInv`, `moveRoots` and `maxLog2Y` become `worker` methods.
+- Collector only: `relations`, `partials`, `seenX`, `partialExcess`,
+  `nextCount`, `done`, `countPartials`, `logProgress` and the polynomial
+  count.
+
+Workers don't call `addRelation`. For each A they send a batch: its sequence
+number, the polynomials sieved, and the candidate relations (X mod n,
+factors, lp1, lp2). Deduplication, the check for a large prime dividing n,
+the L·L case and the partial count all stay in the collector, so none of
+them need locks. A factor found by accident can only come from
+`addRelation`, so it also turns up in the collector.
+
+**Goroutines:**
+1. A generator owns `rng` and the `seen` map, calls `chooseA`, and sends
+   (seq, A, aIdx) on a channel buffered to about one per worker. It closes
+   the channel when `chooseA` runs out, which replaces "ran out of
+   polynomials".
+2. `Workers` workers, `runtime.GOMAXPROCS(0)` by default, run today's per-A
+   loop. Where it now calls `s.done()`, per block and per polynomial, they
+   check an `atomic.Bool` stop flag instead.
+3. The collector is the calling goroutine, so `s.siqs` keeps its signature
+   and `TestRelations` and `TestDLPRelations` work unchanged. It applies
+   batches in sequence order, holding early ones in a small map. When
+   `done()` turns true or it finds a factor, it sets the stop flag, drains
+   the channels and waits for the workers.
+
+**Why batches are applied in order.** `chooseA` depends only on `rng` and
+`seen`, so the generator makes the same sequence of A values as today. Applied
+in order, the collector sees the same `addRelation` calls as the sequential
+code and stops at the same relation, so every worker count collects exactly
+the same relations. The workers only do some extra work that's thrown away.
+That makes `Workers=1` against `Workers=N` an exact correctness test, and
+keeps timings, saved relations and the matrix step reproducible. The cost is
+some waiting behind a slow A, and A-sized units keep that small.
+
+**Workers.** `qs.Workers` (`factor -workers`) is the most workers, and 0
+means `runtime.GOMAXPROCS(0)`. TinyGo's `GOMAXPROCS` always returns 1, so
+`factor.tiny` sieves on one worker without a build tag. `workers()` also
+caps the count by input size, because small runs need only a few A values
+and extra workers mostly sieve past the end: one worker below 80 bits, 4
+below 130, 8 below 170, and no cap above that. These limits are from this
+laptop (5 performance and 10 efficiency cores).
+
+`split` time by worker count, before the caps (seed-1 semiprimes, 10 runs
+each):
+
+| bits | 1 | 2 | 4 | 8 | 15 |
+|---|---|---|---|---|---|
+| 90  | 2.4 ms | 1.6 ms | 1.4 ms | 2.3 ms | 3.9 ms |
+| 120 | 8.4 ms | 5.4 ms | 4.3 ms | 5.3 ms | 7.8 ms |
+| 140 | 35 ms | 20 ms | 14 ms | 13 ms | 17 ms |
+| 160 | 121 ms | 68 ms | 44 ms | 35 ms | 37 ms |
+| 180 | 456 ms | 247 ms | 154 ms | 105 ms | 94 ms |
+
+At 70 bits 4 workers were already slower than one (1.47 ms against 1.16 ms).
+
+Seed-7 semiprimes, double large primes off. Every worker count collected
+the same relations and polynomials as the sequential code:
+
+| bits | 1 | 2 | 4 | 5 | 8 | 15 |
+|---|---|---|---|---|---|---|
+| 200 | 2.08 s | 1.11 s | 0.62 s | 0.52 s | 0.38 s | 0.32 s |
+| 219 | 7.13 s | 3.79 s | 2.13 s | 1.78 s | 1.23 s | – |
+| 240 | 24.8 s | 13.2 s | 10.0 s | 9.5 s | 4.7 s | 2.9 s |
+
+The 80-digit number now factors completely in 21.4 s with 15 workers,
+against 2 min 42 s: about 19 s of sieving, 2.5 s for the matrix, and under
+a second for the 209-bit cofactor.
+
+**Tests:** `TestWorkers` checks that 1 and 4 workers give identical
+relations and partials, in order, at 120 and 160 bits and with double large
+primes on. `go test -race` is clean on `TestWorkers`, `TestRelations`,
+`TestDLPRelations` and the semiprime tests.
+
+**Not done:**
+- Profiling the collector. At 240 bits it handles about 126k partials and
+  about 60 `countPartials` runs. If it becomes the bottleneck with more
+  cores, run the count on a snapshot in its own goroutine. `done` would
+  then lag a little, which only adds overshoot.
+- Profiling GC. Each worker allocates its relations' X and factors.
+- Smaller work units, such as half an A, if the end of a run with many
+  workers wastes too much.
+- The 219- and 240-bit double large prime sweeps above were single-threaded.
+  `TestDLPTune` now uses all the workers, so set `Workers = 1` to compare.
 
 ## Next steps
 
 1. **Finish double large primes** (above).
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
-3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile.
-4. **`factor` defaults.** Raise `qsMaxBits`, since 80 digits now takes under
-   3 minutes.
+3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
+   hot-path big.Int allocations are gone; profile again.
+4. **`factor` defaults.** Raise `qsMaxBits`, since 80 digits now takes about
+   20 seconds with 15 workers.
