@@ -113,23 +113,6 @@ func TestRelations(t *testing.T) {
 	}
 }
 
-func BenchmarkFindDependencies(b *testing.B) {
-	for _, numCols := range []int{2000, 10000} {
-		rng := rand.New(rand.NewSource(42))
-		rels := make([]relation, numCols+extraRelations)
-		for i := range rels {
-			for k := 0; k < 25; k++ {
-				rels[i].Factors = append(rels[i].Factors, int32(rng.Intn(numCols)))
-			}
-		}
-		b.Run(fmt.Sprintf("cols=%d", numCols), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
-				findDependencies(rels, numCols)
-			}
-		})
-	}
-}
-
 func BenchmarkQuadraticSieve(b *testing.B) {
 	for _, bits := range []int{30, 40, 50, 60, 70, 80} {
 		rnd := rand.New(rand.NewSource(1))

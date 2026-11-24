@@ -894,64 +894,6 @@ func (s *sieve) addRelation(x *big.Int, factors []int32, lp uint64) *big.Int {
 	return nil
 }
 
-// findDependencies returns subsets of rows whose exponent vectors sum to zero
-// mod 2. Each subset is a bitset over row indices.
-func findDependencies(relations []relation, numCols int) [][]uint64 {
-	numRows := len(relations)
-	colWords := (numCols + 63) / 64
-	rowWords := (numRows + 63) / 64
-
-	// Each row holds its exponent vector mod 2 and a record of which
-	// original rows were XORed into it, starting with just itself. The rows
-	// share two flat backing arrays.
-	vecBuf := make([]uint64, numRows*colWords)
-	comboBuf := make([]uint64, numRows*rowWords)
-	vec := make([][]uint64, numRows)
-	combo := make([][]uint64, numRows)
-	for i, rel := range relations {
-		vec[i] = vecBuf[i*colWords : (i+1)*colWords]
-		for _, c := range rel.Factors {
-			vec[i][c/64] ^= 1 << (uint(c) % 64)
-		}
-		combo[i] = comboBuf[i*rowWords : (i+1)*rowWords]
-		combo[i][i/64] |= 1 << (uint(i) % 64)
-	}
-
-	// Reduce to row echelon form, swapping each pivot up so that only the
-	// rows below it need clearing. Words before the pivot's are already
-	// zero in every row below.
-	pivots := 0
-	for c := 0; c < numCols && pivots < numRows; c++ {
-		w, bit := c/64, uint64(1)<<(uint(c)%64)
-		p := pivots
-		for p < numRows && vec[p][w]&bit == 0 {
-			p++
-		}
-		if p == numRows {
-			continue
-		}
-		vec[pivots], vec[p] = vec[p], vec[pivots]
-		combo[pivots], combo[p] = combo[p], combo[pivots]
-
-		pv, pc := vec[pivots], combo[pivots]
-		for i := pivots + 1; i < numRows; i++ {
-			if vec[i][w]&bit == 0 {
-				continue
-			}
-			for k := w; k < colWords; k++ {
-				vec[i][k] ^= pv[k]
-			}
-			for k := range pc {
-				combo[i][k] ^= pc[k]
-			}
-		}
-		pivots++
-	}
-
-	// The rows below the last pivot are now all zero.
-	return combo[pivots:]
-}
-
 // tryDependency combines the relations selected by dep into a congruence of
 // squares a² ≡ b² (mod n) and returns a non-trivial factor of n, or nil.
 func tryDependency(n *big.Int, factorBase []int64, relations []relation, dep []uint64) *big.Int {

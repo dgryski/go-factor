@@ -1,6 +1,6 @@
 # Plan: the quadratic sieve
 
-## Current state (2026-11-23)
+## Current state (2026-11-24)
 
 Stages 1–3 of the original plan are done, except for a sparse matrix solver.
 The code is in package `qs` (`qs/qs.go`). The AI drafts that SIQS, the
@@ -43,8 +43,19 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
   - Relations whose ±X was already seen are dropped. Different polynomials do
     find the same X, and before this check those copies made about 1% of
     70-bit SIQS runs fail with only trivial dependencies.
-- **`findDependencies`:** dense GF(2) elimination in row echelon form, with
-  pivot swaps and flat backing arrays.
+- **`findDependencies`** (`qs/matrix.go`):
+  - Structured Gaussian elimination first. It deletes rows with a column no
+    other row has, merges the two rows of each weight-2 column, and pivots on
+    columns of weight 3–6 when that adds at most 64 entries.
+  - Each XOR is recorded as a node, so dependencies of the reduced matrix
+    trace back to the original relations.
+  - Dense GF(2) elimination then solves the reduced matrix.
+  - `TestFindDependencies` checks the dependencies against full dense
+    elimination: the count, that each sums to zero, and that they're
+    independent.
+  - The structured elimination and resieving started from the drafts in
+    `notes/_qs-drafts2/`. The block Lanczos there has an F term that doesn't
+    match Montgomery's formula.
 - **`factor` command:**
   - `-methods=trial,qs` runs only the listed methods, in the fixed order.
   - `-v` turns on QS logging.
@@ -119,19 +130,28 @@ msieve 1.53 factoring it by SIQS in 1 min 36 s:
 - 49,954 relations: 26,246 full and 23,708 combined from 267,452 partials
 - a sparse matrix solved by block Lanczos
 
-This SIQS chose k = 5 and B = 1,570,053 (59,370 primes, M = 128K). It
-collected 59,391 relations, with 239,765 partials left uncombined, in
-4 min 58 s. That's about 3× msieve's whole run. I stopped it after more than
-4 minutes in `findDependencies`, which hadn't finished. The dense matrix needs
-about 2 × 59k × 59k bits ≈ 900 MB, and elimination is O(n³/64).
+`factor -v -methods=qs` now factors it completely in 7 min 14 s, about 4.5×
+msieve's time:
+
+- SIQS chose k = 5 and B = 1,570,053 (59,370 primes, M = 128K).
+- It collected 59,391 relations in 5 min.
+- Structured elimination took 73 ms and reduced the matrix from 59,391×59,371
+  to 37,301×34,845. The dense solve took 2 min.
+- The first split found p18. QS then split the 209-bit cofactor into p23 and
+  p41 in 14 s.
+
+Without structured elimination, the dense matrix needed about 900 MB and was
+still running after 4 minutes.
 
 ## Next steps
 
-1. **Sparse linear algebra.** This is now the limit at 80 digits.
-   - First, remove singletons (columns that appear in only one relation) and
-     the empty columns, then use structured Gaussian elimination to shrink the
-     matrix before the dense step.
-   - After that, or instead, block Lanczos.
+1. **A smaller reduced matrix.** At 80 digits the dense solve still takes
+   2 minutes.
+   - The reduced matrix has about 2,450 more rows than columns, because many
+     primes never occur in a relation. Deleting the heaviest surplus rows
+     empties more columns, so the elimination can keep going.
+   - Also try heavier pivots than weight 6 and a fill limit above 64.
+   - Block Lanczos if that isn't enough.
 2. **A faster candidate check.** `tryFactorize` scans every root for each
    candidate.
    - Resieve the block for the larger primes, or keep a compact
