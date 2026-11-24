@@ -4,6 +4,8 @@ import (
 	"math/big"
 	"testing"
 	"time"
+
+	"github.com/dgryski/go-factor/internal/testutil"
 )
 
 func TestBrent(t *testing.T) {
@@ -11,7 +13,7 @@ func TestBrent(t *testing.T) {
 	orig := (&big.Int{}).Set(n)
 	p, c := Brent(n, 19, 1)
 	t.Log(p, c)
-	verifyFactoring(t, orig, p, c)
+	testutil.VerifyFactoring(t, orig, p, c)
 }
 
 func TestBrentCycle(t *testing.T) {
@@ -20,10 +22,10 @@ func TestBrentCycle(t *testing.T) {
 		n := big.NewInt(v)
 		orig := new(big.Int).Set(n)
 		var p, c []*big.Int
-		withTimeout(t, 5*time.Second, "Brent("+orig.String()+")", func() {
+		testutil.WithTimeout(t, 5*time.Second, "Brent("+orig.String()+")", func() {
 			p, c = Brent(n, 2, 1)
 		})
-		verifyProduct(t, orig, p, c)
+		testutil.VerifyProduct(t, orig, p, c)
 	}
 }
 
@@ -32,7 +34,7 @@ func TestBrentPartialBatch(t *testing.T) {
 	for _, v := range []int64{21, 35, 55, 91, 323} {
 		n := big.NewInt(v)
 		p, c := Brent(n, 2, 1)
-		verifyFactoring(t, big.NewInt(v), p, c)
+		testutil.VerifyFactoring(t, big.NewInt(v), p, c)
 	}
 }
 
@@ -41,6 +43,6 @@ func TestBrentBacktrack(t *testing.T) {
 	for _, v := range []int64{649, 1067, 1357, 1711, 2231} {
 		n := big.NewInt(v)
 		p, c := Brent(n, 2, 1)
-		verifyFactoring(t, big.NewInt(v), p, c)
+		testutil.VerifyFactoring(t, big.NewInt(v), p, c)
 	}
 }

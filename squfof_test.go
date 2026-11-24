@@ -3,6 +3,8 @@ package factor
 import (
 	"math/big"
 	"testing"
+
+	"github.com/dgryski/go-factor/internal/testutil"
 )
 
 func TestSqufof(t *testing.T) {
@@ -10,7 +12,7 @@ func TestSqufof(t *testing.T) {
 	orig := (&big.Int{}).Set(n)
 	p, c := Squfof(n, 5)
 	t.Log(p, c)
-	verifyFactoring(t, orig, p, c)
+	testutil.VerifyFactoring(t, orig, p, c)
 }
 
 func TestSqufofSquare(t *testing.T) {
@@ -25,7 +27,7 @@ func TestSqufofSquare(t *testing.T) {
 	} {
 		orig := new(big.Int).Set(tt.n)
 		pr, co := Squfof(tt.n, tt.k)
-		verifyFactoring(t, orig, pr, co)
+		testutil.VerifyFactoring(t, orig, pr, co)
 	}
 }
 
@@ -35,7 +37,7 @@ func TestSqufofMultiplier(t *testing.T) {
 		n, _ := big.NewInt(0).SetString(s, 10)
 		orig := new(big.Int).Set(n)
 		p, c := Squfof(n, 3)
-		verifyFactoring(t, orig, p, c)
+		testutil.VerifyFactoring(t, orig, p, c)
 	}
 }
 

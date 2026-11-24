@@ -5,14 +5,40 @@ import (
 	"log"
 	"math/big"
 	"runtime"
+	"strings"
 
 	"github.com/dgryski/go-factor"
+	"github.com/dgryski/go-factor/qs"
 )
+
+// allMethods lists the factoring methods in the order they run.
+var allMethods = []string{"trial", "brent", "p-1", "p+1", "squfof", "ecm", "qs"}
 
 func main() {
 	// 21251589199163473368424683523876245871651712859289
 
+	verbose := flag.Bool("v", false, "log progress during the quadratic sieve")
+	methods := flag.String("methods", strings.Join(allMethods, ","), "comma-separated methods to run, always in the order "+strings.Join(allMethods, ","))
 	flag.Parse()
+
+	if *verbose {
+		qs.Logf = log.Printf
+	}
+
+	run := make(map[string]bool)
+	for _, m := range strings.Split(*methods, ",") {
+		m = strings.TrimSpace(m)
+		known := false
+		for _, a := range allMethods {
+			known = known || m == a
+		}
+		if !known {
+			log.Fatalf("unknown method %q: want some of %s", m, strings.Join(allMethods, ","))
+		}
+		run[m] = true
+	}
+	methodsSet := false
+	flag.Visit(func(f *flag.Flag) { methodsSet = methodsSet || f.Name == "methods" })
 
 	var n big.Int
 
@@ -27,14 +53,18 @@ func main() {
 		return
 	}
 
-	log.Println("starting trial")
-	ptmp, ctmp := factor.Trial(&n)
+	ctmp := []*big.Int{&n}
 
-	if len(ptmp) > 0 {
-		log.Printf("trial=%+v\n", ptmp)
+	if run["trial"] {
+		log.Println("starting trial")
+		var ptmp []*big.Int
+		ptmp, ctmp = factor.Trial(&n)
+		if len(ptmp) > 0 {
+			log.Printf("trial=%+v\n", ptmp)
+		}
 	}
 
-	if len(ctmp) > 0 {
+	if run["brent"] && len(ctmp) > 0 {
 		p := int64(2)
 		for _, v := range []int64{1, -1, 3} {
 			var comps []*big.Int
@@ -50,7 +80,7 @@ func main() {
 		}
 	}
 
-	if len(ctmp) > 0 {
+	if run["p-1"] && len(ctmp) > 0 {
 		log.Println("starting p-1")
 		var comps []*big.Int
 		for _, cc := range ctmp {
@@ -63,7 +93,7 @@ func main() {
 		ctmp = comps
 	}
 
-	if len(ctmp) > 0 {
+	if run["p+1"] && len(ctmp) > 0 {
 		log.Println("starting p+1")
 		var comps []*big.Int
 		for _, cc := range ctmp {
@@ -76,7 +106,7 @@ func main() {
 		ctmp = comps
 	}
 
-	if len(ctmp) > 0 {
+	if run["squfof"] && len(ctmp) > 0 {
 		multiplier := []int64{1, 3, 5, 7, 11, 3 * 5, 3 * 7, 3 * 11, 5 * 7, 5 * 11, 7 * 11, 3 * 5 * 7, 3 * 5 * 11, 3 * 7 * 11, 5 * 7 * 11, 3 * 5 * 7 * 11}
 		log.Printf("starting squfof")
 		for _, k := range multiplier {
@@ -94,7 +124,7 @@ func main() {
 
 	// B1 and curves for factors up to 15, 20 and 25 digits, from the GMP-ECM README.
 	for _, s := range []struct{ b1, curves int }{{2000, 25}, {11000, 90}, {50000, 300}} {
-		if len(ctmp) == 0 {
+		if !run["ecm"] || len(ctmp) == 0 {
 			break
 		}
 		log.Printf("starting ecm(b1=%v, curves=%v)", s.b1, s.curves)
@@ -109,18 +139,20 @@ func main() {
 		ctmp = comps
 	}
 
-	if len(ctmp) > 0 {
-		// The quadratic sieve trial-divides its candidates instead of
-		// sieving, so larger inputs take a long time and then fail.
-		const qsMaxBits = 64
+	if run["qs"] && len(ctmp) > 0 {
+		// Above about 220 bits (66 digits) the quadratic sieve takes
+		// minutes, and its dense matrix needs gigabytes. Asking for qs by
+		// name with -methods lifts the limit.
+		const qsMaxBits = 220
 		log.Println("starting qs")
 		var comps []*big.Int
 		for _, cc := range ctmp {
-			if cc.BitLen() > qsMaxBits {
+			if !methodsSet && cc.BitLen() > qsMaxBits {
+				log.Printf("skipping qs for %d-bit %v", cc.BitLen(), cc)
 				comps = append(comps, cc)
 				continue
 			}
-			ptmp, c2 := factor.QuadraticSieve(cc)
+			ptmp, c2 := qs.QuadraticSieve(cc)
 			if len(ptmp) > 0 {
 				log.Printf("qs=%+v\n", ptmp)
 			}

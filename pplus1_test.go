@@ -3,6 +3,8 @@ package factor
 import (
 	"math/big"
 	"testing"
+
+	"github.com/dgryski/go-factor/internal/testutil"
 )
 
 func TestLucasV(t *testing.T) {
@@ -58,7 +60,7 @@ func TestPPlus1(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			n := new(big.Int).Mul(tt.p, q)
 			pr, c := PPlus1(n, 2000, 10)
-			verifyFactoring(t, n, pr, c)
+			testutil.VerifyFactoring(t, n, pr, c)
 			if len(c) != 0 {
 				t.Errorf("PPlus1(%v) left composites %v", n, c)
 			}
@@ -71,7 +73,7 @@ func TestPPlus1Backtrack(t *testing.T) {
 	// both are found in that batch whatever the starting value.
 	n := big.NewInt(2944999 * 2740219)
 	pr, c := PPlus1(n, 2000, 1)
-	verifyFactoring(t, big.NewInt(2944999*2740219), pr, c)
+	testutil.VerifyFactoring(t, big.NewInt(2944999*2740219), pr, c)
 	if len(c) != 0 {
 		t.Errorf("PPlus1(%v) left composites %v", n, c)
 	}
@@ -81,7 +83,7 @@ func TestPPlus1Small(t *testing.T) {
 	for _, v := range []int64{1, 2, 4, 7, 2 * 1000003} {
 		n := big.NewInt(v)
 		p, c := PPlus1(n, 2000, 4)
-		verifyProduct(t, big.NewInt(v), p, c)
+		testutil.VerifyProduct(t, big.NewInt(v), p, c)
 		if len(c) != 0 {
 			t.Errorf("PPlus1(%v) left composites %v", v, c)
 		}

@@ -3,6 +3,8 @@ package factor
 import (
 	"math/big"
 	"testing"
+
+	"github.com/dgryski/go-factor/internal/testutil"
 )
 
 func nextPrime(s string) *big.Int {
@@ -36,7 +38,7 @@ func TestECM(t *testing.T) {
 			n := product(tt.factors...)
 			orig := new(big.Int).Set(n)
 			p, c := ECM(n, 2000, 50)
-			verifyFactoring(t, orig, p, c)
+			testutil.VerifyFactoring(t, orig, p, c)
 			if len(c) != 0 {
 				t.Errorf("composites left: %v", c)
 			}

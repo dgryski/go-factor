@@ -3,6 +3,8 @@ package factor
 import (
 	"math/big"
 	"testing"
+
+	"github.com/dgryski/go-factor/internal/testutil"
 )
 
 func TestPMinus1(t *testing.T) {
@@ -12,7 +14,7 @@ func TestPMinus1(t *testing.T) {
 	orig := (&big.Int{}).Set(n)
 	p, c := PMinus1(n)
 	t.Log(p, c)
-	verifyFactoring(t, orig, p, c)
+	testutil.VerifyFactoring(t, orig, p, c)
 }
 
 func TestPMinus1SmallFactor(t *testing.T) {
@@ -20,7 +22,7 @@ func TestPMinus1SmallFactor(t *testing.T) {
 		n := big.NewInt(v)
 		orig := new(big.Int).Set(n)
 		p, c := PMinus1(n)
-		verifyFactoring(t, orig, p, c)
+		testutil.VerifyFactoring(t, orig, p, c)
 		if len(c) != 0 {
 			t.Errorf("PMinus1(%v) left composites %v", orig, c)
 		}
@@ -40,7 +42,7 @@ func TestPMinus1LastBatch(t *testing.T) {
 	n := new(big.Int).Mul(p, big.NewInt(1000003))
 	orig := new(big.Int).Set(n)
 	pr, c := PMinus1(n)
-	verifyFactoring(t, orig, pr, c)
+	testutil.VerifyFactoring(t, orig, pr, c)
 }
 
 func TestPMinus1Backtrack(t *testing.T) {
@@ -55,7 +57,7 @@ func TestPMinus1Backtrack(t *testing.T) {
 	n := new(big.Int).Mul(p, q)
 	orig := new(big.Int).Set(n)
 	pr, c := PMinus1(n)
-	verifyFactoring(t, orig, pr, c)
+	testutil.VerifyFactoring(t, orig, pr, c)
 	if len(c) != 0 {
 		t.Errorf("PMinus1(%v) left composites %v", orig, c)
 	}
