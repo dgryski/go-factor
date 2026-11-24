@@ -38,9 +38,13 @@ func TestFindDependencies(t *testing.T) {
 		rels := randomRelations(rng, size.rows, size.cols)
 		rows := rowsOf(rels)
 		deps := findDependencies(rels, size.cols)
+		// Pruning surplus rows may drop dependencies, but keeps keepSurplus.
 		want := len(denseDependencies(rows, size.cols))
-		if len(deps) != want {
-			t.Errorf("%d×%d: %d dependencies, want %d", size.rows, size.cols, len(deps), want)
+		if want > keepSurplus {
+			want = keepSurplus
+		}
+		if len(deps) < want {
+			t.Errorf("%d×%d: %d dependencies, want at least %d", size.rows, size.cols, len(deps), want)
 		}
 
 		// Each dependency must be non-empty and sum to zero.

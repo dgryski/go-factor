@@ -6,10 +6,26 @@ import (
 	"time"
 )
 
-const (
-	maxPivotWeight = 6  // the structured elimination pivots on columns with at most this many rows
-	maxPivotFill   = 64 // and skips a pivot that would add more entries than this
-)
+const keepSurplus = 64 // rows beyond the column count kept for dependencies
+
+// pivotLimits returns the heaviest column the structured elimination pivots
+// on, and the most entries a pivot may add. Higher limits shrink large
+// matrices more but only slow down small ones, and going past 50 and 4000
+// didn't shrink the 80-digit test matrix below about 15k columns.
+func pivotLimits(numCols int) (weight, fill int) {
+	weight, fill = numCols/1000, numCols/16
+	if weight < 6 {
+		weight = 6
+	} else if weight > 50 {
+		weight = 50
+	}
+	if fill < 64 {
+		fill = 64
+	} else if fill > 4000 {
+		fill = 4000
+	}
+	return weight, fill
+}
 
 // findDependencies returns subsets of relations whose exponent vectors sum
 // to zero mod 2, as bitsets over relation indices. Structured Gaussian
@@ -73,6 +89,8 @@ type reducer struct {
 	merges  [][2]int32 // node numOrig+i is the XOR of nodes merges[i]
 	numOrig int
 
+	maxWeight, maxFill int // pivot limits from pivotLimits
+
 	colRows [][]int32 // rows that have contained each column, possibly stale
 	weight  []int     // number of live rows containing each column
 	queue   []int32   // columns whose weight dropped to 1 or 2
@@ -88,6 +106,7 @@ func newReducer(rows [][]int32, numCols int) *reducer {
 		colRows: make([][]int32, numCols),
 		weight:  make([]int, numCols),
 	}
+	r.maxWeight, r.maxFill = pivotLimits(numCols)
 	for i, row := range rows {
 		r.node[i] = int32(i)
 		r.alive[i] = len(row) > 0
@@ -180,14 +199,52 @@ func (r *reducer) xorInto(dst, src int32) {
 }
 
 // reduce removes rows with a column no other row has, merges the two rows
-// of each column of weight 2, and pivots on light columns while the fill-in
-// stays small.
+// of each column of weight 2, pivots on light columns, and deletes surplus
+// rows.
 func (r *reducer) reduce() {
+	for {
+		r.pivot()
+		if !r.pruneSurplus() {
+			return
+		}
+	}
+}
+
+// pruneSurplus deletes the heaviest rows while there are more than
+// keepSurplus rows beyond the column count, half the surplus at a time so
+// that the columns emptied in between can be eliminated too.
+func (r *reducer) pruneSurplus() bool {
+	var live []int32
+	for i, alive := range r.alive {
+		if alive {
+			live = append(live, int32(i))
+		}
+	}
+	cols := 0
+	for _, w := range r.weight {
+		if w > 0 {
+			cols++
+		}
+	}
+	surplus := len(live) - cols - keepSurplus
+	if surplus <= 0 {
+		return false
+	}
+	sort.Slice(live, func(i, j int) bool { return len(r.rows[live[i]]) > len(r.rows[live[j]]) })
+	for _, row := range live[:(surplus+1)/2] {
+		r.deleteRow(row)
+	}
+	return true
+}
+
+// pivot eliminates columns of weight up to r.maxWeight while the fill-in
+// stays below r.maxFill.
+func (r *reducer) pivot() {
 	for {
 		r.drain()
 		progress := false
 		for c := range r.weight {
-			if w := r.weight[c]; w < 3 || w > maxPivotWeight {
+			if w := r.weight[c]; w < 3 || w > r.maxWeight {
 				continue
 			}
 			rows := r.liveRows(int32(c))
@@ -197,7 +254,7 @@ func (r *reducer) reduce() {
 					piv = i
 				}
 			}
-			if (len(rows)-1)*(len(r.rows[rows[piv]])-1) > maxPivotFill {
+			if (len(rows)-1)*(len(r.rows[rows[piv]])-1) > r.maxFill {
 				continue
 			}
 			p := rows[piv]
