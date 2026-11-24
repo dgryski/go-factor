@@ -56,10 +56,11 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
     2,450 surplus rows.
   - Each XOR is recorded as a node, so dependencies of the reduced matrix
     trace back to the original relations.
-  - Block Lanczos (`qs/lanczos.go`, from `notes/_qs-drafts3/`) then solves
-    the reduced matrix if it has at least 1000 columns. Dense GF(2)
-    elimination solves smaller ones, and is the fallback if block Lanczos
-    finds fewer than 16 independent dependencies.
+  - Block Lanczos (`qs/lanczos.go`, from `notes/_qs-drafts4/`) then solves
+    the reduced matrix if it has at least 1000 columns. It uses
+    A = B·P·Bᵀ with a random symmetric invertible P (see "Block Lanczos"
+    below). Dense GF(2) elimination solves smaller matrices, and is the
+    fallback if block Lanczos finds fewer than 16 independent dependencies.
   - `TestFindDependencies` checks the dependencies against full dense
     elimination: the count, that each sums to zero, and that they're
     independent.
@@ -173,9 +174,8 @@ Pivot limits tried on the saved relations, with the reduced size each gave:
 
 ### Block Lanczos
 
-`solveBlockLanczos` from `notes/_qs-drafts2/ai_studio_code(2).go`, run
-unchanged apart from its inputs and outputs. The version in
-`notes/_qs-drafts3/` gave the same results:
+The first two drafts (`notes/_qs-drafts2/`, `notes/_qs-drafts3/`) used
+A = B·Bᵀ. Run unchanged apart from inputs and outputs, they gave:
 
 | Matrix | Block Lanczos | Dense |
 |---|---|---|
@@ -211,13 +211,33 @@ Ruled out:
 - **Size:** reduced matrices up to 30,939×30,875, needing 489 iterations,
   work.
 
-The structured elimination's matrices had a gap of 0 in every case tried,
-which is why `findDependencies` runs block Lanczos only after it.
+The structured elimination's matrices had a gap of 0 in every case tried.
+`notes/_qs-drafts3/` also doesn't compile as written:
+`int64(0x9e3779b97f4a7c15)` overflows.
 
-The F term (`F_i = W_{i−2}⁻¹ · (I − S_{i−1}) · T_i · S_i`) doesn't match
-Montgomery's formula, but it found the full 64 whenever the gap was 0.
-`notes/_qs-drafts3/` doesn't compile as written: `int64(0x9e3779b97f4a7c15)`
-overflows.
+**The fix, in `notes/_qs-drafts4/`:** solve with A = B·P·Bᵀ, where P = Lᵀ·L.
+L = U1·Perm·L1, with L1 and U1 unit triangular with up to 3 random
+off-diagonal entries per row, and Perm a random permutation. B·P·Bᵀ equals
+(B·Lᵀ)(B·Lᵀ)ᵀ, so this mixes the columns of B by an invertible map.
+ker(Bᵀ) is unchanged, and the row combinations orthogonal to every row
+mostly stop being orthogonal. The final step still checks against the
+original Bᵀ.
+
+| Matrix | B·P·Bᵀ | B·Bᵀ |
+|---|---|---|
+| 209-bit unreduced, 10,328×10,308 (gap 22) | 64 independent, 169 ms | 42, 150 ms |
+| 80-digit unreduced, 59,391×59,371 | 63 independent, 5.3 s | 0, 4.8 s |
+| 80-digit reduced, 15,649×15,585 | 63 independent, 1.6 s | 64, 1.6 s |
+| test matrices with gap 90 and 99 | 63 and 64 independent | – |
+
+Applying P costs about 7 passes over a vector per iteration, about 5–10%.
+Reducing first is still faster at 80 digits: 2.3 s in all, against 5.3 s for
+block Lanczos alone on the unreduced matrix.
+
+`TestFMatchesMontgomery` compares the F term,
+`W_{i−2}⁻¹ · (I − S_{i−1}) · T_i · S_i`, with Montgomery's formula at every
+iteration on a random 450×400 matrix, and they agree. That supports the
+simpler form but doesn't prove it in general.
 
 ## Next steps
 
