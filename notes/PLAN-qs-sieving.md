@@ -3,10 +3,9 @@
 ## Current state (2026-11-24)
 
 Stages 1–3 of the original plan are done, except for a sparse matrix solver.
-The code is in package `qs` (`qs/qs.go`). The AI drafts that SIQS, the
-multiplier, large primes and the faster elimination started from are in
-`notes/_qs-drafts/`. The leading underscore keeps `go build ./...` from
-compiling them. See "Fixed from the drafts" below for what was wrong in them.
+The code is in package `qs` (`qs/qs.go`). SIQS, the multiplier, large primes
+and the faster elimination started from AI drafts. See "Fixed from the
+drafts" below for what was wrong in them.
 
 - `qs.QuadraticSieve(n) (primes, composites []*big.Int)` recurses on the two
   halves found by `split`. `qs.Logf`, if set, gets progress messages.
@@ -68,7 +67,7 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
     2,450 surplus rows.
   - Each XOR is recorded as a node, so dependencies of the reduced matrix
     trace back to the original relations.
-  - Block Lanczos (`qs/lanczos.go`, from `notes/_qs-drafts4/`) then solves
+  - Block Lanczos (`qs/lanczos.go`) then solves
     the reduced matrix if it has at least 1000 columns. It uses
     A = B·P·Bᵀ with a random symmetric invertible P (see "Block Lanczos"
     below). Dense GF(2) elimination solves smaller matrices, and is the
@@ -79,8 +78,8 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
   - `TestFindDependencies` checks the dependencies against full dense
     elimination: the count, that each sums to zero, and that they're
     independent.
-  - The structured elimination and resieving started from the drafts in
-    `notes/_qs-drafts2/`. See "Block Lanczos" below for the draft solver.
+  - The structured elimination started from a draft. See "Block Lanczos"
+    below for the draft solver.
   - `factor -qs-save=DIR` saves relations after sieving, and
     `go test ./qs -run SavedRelations -relations=FILE` reruns the matrix and
     square root steps on them. Relations for the 80-digit number and its
@@ -130,7 +129,7 @@ These were measured, not guessed. Redo them if the candidate check gets faster.
   half the run time. It now checks only after a division.
 - **`bucketCut`:** 16384 was fastest among 2048–65536 at 219 and 240 bits.
   2048 was 15% slower and 65536 10% slower.
-- **Resieving, first try** (`notes/_qa-drafts5/`) didn't pay.
+- **Resieving, first try** didn't pay.
   - It walked each prime from 2048 up back through every block with a
     candidate. At 200 bits that's about 28 µs per block, against about 4.7 µs
     per candidate for the old full scan, so it breaks even at about 7
@@ -141,10 +140,10 @@ These were measured, not guessed. Redo them if the candidate check gets faster.
   - Bucket sieving gets most of the benefit instead, because a candidate's
     large primes come from its block's bucket.
 - **Resieving, now used**, only for primes from 2048 to 16384, inside
-  `bucketHits`. From `notes/ai_studio_code.txt`, together with the integer
-  threshold, the allocation fixes, the cofactor guards and the block Lanczos
-  retries. With double large primes off, on the seed-7 semiprimes, it
-  collected exactly the same relations as before, in:
+  `bucketHits`. It went in together with the integer threshold, the
+  allocation fixes, the cofactor guards and the block Lanczos retries. With
+  double large primes off, on the seed-7 semiprimes, it collected exactly the
+  same relations as before, in:
 
   | bits | before | after |
   |------|--------|-------|
@@ -217,8 +216,7 @@ Pivot limits tried on the saved relations, with the reduced size each gave:
 
 ### Block Lanczos
 
-The first two drafts (`notes/_qs-drafts2/`, `notes/_qs-drafts3/`) used
-A = B·Bᵀ. Run unchanged apart from inputs and outputs, they gave:
+The first two drafts used A = B·Bᵀ. Run unchanged apart from inputs and outputs, they gave:
 
 | Matrix | Block Lanczos | Dense |
 |---|---|---|
@@ -255,10 +253,10 @@ Ruled out:
   work.
 
 The structured elimination's matrices had a gap of 0 in every case tried.
-`notes/_qs-drafts3/` also doesn't compile as written:
+The second draft also didn't compile as written:
 `int64(0x9e3779b97f4a7c15)` overflows.
 
-**The fix, in `notes/_qs-drafts4/`:** solve with A = B·P·Bᵀ, where P = Lᵀ·L.
+**The fix:** solve with A = B·P·Bᵀ, where P = Lᵀ·L.
 L = U1·Perm·L1, with L1 and U1 unit triangular with up to 3 random
 off-diagonal entries per row, and Perm a random permutation. B·P·Bᵀ equals
 (B·Lᵀ)(B·Lᵀ)ᵀ, so this mixes the columns of B by an invertible map.
@@ -282,9 +280,9 @@ block Lanczos alone on the unreduced matrix.
 iteration on a random 450×400 matrix, and they agree. That supports the
 simpler form but doesn't prove it in general.
 
-## Double large primes (in progress, uncommitted, 2026-11-24)
+## Double large primes (in progress, 2026-11-24)
 
-Started from `notes/_qs-drafts6/`. The code is committed, with double large
+Started from a draft. The code is committed, with double large
 primes off by default (`dlpMinBits = 1 << 30`), because no setting measured
 so far is faster. Tuning was stopped part way.
 
@@ -402,7 +400,7 @@ The sweep is `TestSweep` in `qs/dlptune_test.go`:
   constants.
 - Tightening the recount near the end, so runs overshoot less than 6%.
 
-## Parallel sieving (done, uncommitted, 2026-11-24)
+## Parallel sieving (done, 2026-11-24)
 
 Sieve SIQS polynomials on several goroutines and merge the relations in one
 place. `singlePoly` stays single-threaded, since it only runs below 60 bits.
