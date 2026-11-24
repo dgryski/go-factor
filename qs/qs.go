@@ -28,6 +28,7 @@ const (
 	blockShift    = 15 // sieve blocks are 32 KB, sized for L1 cache
 	blockSize     = 1 << blockShift
 	bucketCut     = 16384 // primes from here up are sieved through per-block buckets
+	resieveCut    = 2048  // primes from here to bucketCut are found again by resieving
 	minSievePrime = 30    // smaller primes are not sieved, only allowed for in the threshold
 
 	// A candidate may score this many times log2(largest base prime) below
@@ -344,14 +345,34 @@ func sqrtModPrime(n, p uint32) uint32 {
 	return uint32(r)
 }
 
-// log2Big returns log2(v) for v > 0.
+// log2Big returns log2(v) for v > 0. It reads v's top 53 bits from its
+// words, so it doesn't allocate on 64-bit platforms.
 func log2Big(v *big.Int) float64 {
-	shift := v.BitLen() - 53
-	if shift <= 0 {
-		return math.Log2(float64(v.Uint64()))
+	if bits.UintSize != 64 {
+		shift := v.BitLen() - 53
+		if shift <= 0 {
+			return math.Log2(float64(v.Uint64()))
+		}
+		top := new(big.Int).Rsh(v, uint(shift)).Uint64()
+		return math.Log2(float64(top)) + float64(shift)
 	}
-	top := new(big.Int).Rsh(v, uint(shift)).Uint64()
-	return math.Log2(float64(top)) + float64(shift)
+	words := v.Bits()
+	if len(words) == 0 {
+		return math.Inf(-1)
+	}
+	top := uint64(words[len(words)-1])
+	topBits := bits.Len64(top)
+	bitLen := (len(words)-1)*64 + topBits
+	if bitLen <= 53 {
+		return math.Log2(float64(top))
+	}
+	shift := topBits - 53
+	sig := top >> uint(shift)
+	if shift < 0 {
+		prev := uint64(words[len(words)-2])
+		sig = top<<uint(-shift) | prev>>uint(64+shift)
+	}
+	return math.Log2(float64(sig)) + float64(bitLen-53)
 }
 
 // relation stores X² ≡ Y (mod N), with Y recorded only as its factors.
@@ -387,6 +408,10 @@ type sieve struct {
 	relations []relation
 	seenX     map[string]bool // min(X, n−X) for every relation and partial
 
+	// Scratch space for sievePoly, tryFactorize and addRelation.
+	temp, xModN, key big.Int
+	keyBuf           []byte
+
 	// Partial relations have one or two large primes up to lpBound left over.
 	// Cofactors up to dlpCap are split into two. Large primes that occur in
 	// more than one partial become matrix columns in finish.
@@ -400,10 +425,13 @@ type sieve struct {
 
 	// Primes from bucketFrom up are sieved by walking each polynomial's
 	// interval once and filing the hits by block. A bucket entry packs
-	// log2(p) << 48 | prime index << 16 | offset in the block.
-	bucketFrom int
-	buckets    [][]uint64
-	small      []smallRoot // primes below bucketCut not dividing a
+	// log2(p) << 48 | prime index << 16 | offset in the block. Primes from
+	// resieveFrom to bucketFrom are sieved block by block, and found again
+	// for the block's candidates by walking back from their next offsets.
+	resieveFrom int
+	bucketFrom  int
+	buckets     [][]uint64
+	small       []smallRoot // primes below resieveCut not dividing a
 
 	// The current block's candidates, and the bucket primes hitting each.
 	cands    []int
@@ -455,9 +483,13 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 		s.sieveFrom, smallSlack = 0, 0
 	}
 
+	s.resieveFrom = sort.Search(len(s.roots), func(i int) bool { return s.roots[i].p >= resieveCut })
+	if s.resieveFrom < s.sieveFrom {
+		s.resieveFrom = s.sieveFrom
+	}
 	s.bucketFrom = sort.Search(len(s.roots), func(i int) bool { return s.roots[i].p >= bucketCut })
-	if s.bucketFrom < s.sieveFrom {
-		s.bucketFrom = s.sieveFrom
+	if s.bucketFrom < s.resieveFrom {
+		s.bucketFrom = s.resieveFrom
 	}
 
 	pMax := uint64(s.roots[len(s.roots)-1].p)
@@ -735,7 +767,7 @@ func addMod(a, b, p uint32) uint32 {
 // factor of n if it finds one by accident.
 func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 	s.small = s.small[:0]
-	for i := 0; i < s.bucketFrom; i++ {
+	for i := 0; i < s.resieveFrom; i++ {
 		if rt := &s.roots[i]; !rt.inA {
 			s.small = append(s.small, smallRoot{idx: int32(i), p: rt.p, r1: rt.r1, r2: rt.r2})
 		}
@@ -782,17 +814,20 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 			block[uint16(e)] += byte(e >> 48)
 		}
 
-		threshold := s.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack
+		thresh := int(math.Ceil(s.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack))
+		if thresh < 0 {
+			thresh = 0
+		}
 		s.cands = s.cands[:0]
 		for i, score := range block {
-			if float64(score) >= threshold {
+			if int(score) >= thresh {
 				s.cands = append(s.cands, i)
 			}
 		}
 		if len(s.cands) == 0 {
 			continue
 		}
-		s.bucketHits(bucket)
+		s.bucketHits(bucket, len(block))
 
 		for k, i := range s.cands {
 			off := blockStart + int64(i)
@@ -809,7 +844,7 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 			if !ok {
 				continue
 			}
-			if f := s.addRelation(new(big.Int).Mod(&x, s.n), factors, lp1, lp2); f != nil {
+			if f := s.addRelation(s.xModN.Mod(&x, s.n), factors, lp1, lp2); f != nil {
 				return f
 			}
 			if s.done() {
@@ -820,8 +855,10 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 	return nil
 }
 
-// bucketHits sets s.candHits to the bucket primes hitting each candidate.
-func (s *sieve) bucketHits(bucket []uint64) {
+// bucketHits sets s.candHits to the primes from s.resieveFrom up hitting
+// each candidate. It must run after the block of length blockLen is sieved,
+// when off1 and off2 hold the offsets of the next block's first hits.
+func (s *sieve) bucketHits(bucket []uint64, blockLen int) {
 	for len(s.candHits) < len(s.cands) {
 		s.candHits = append(s.candHits, nil)
 	}
@@ -829,6 +866,27 @@ func (s *sieve) bucketHits(bucket []uint64) {
 		s.candBits[i/64] |= 1 << (uint(i) % 64)
 		s.candSlot[i] = uint16(k)
 		s.candHits[k] = s.candHits[k][:0]
+	}
+	for i := s.resieveFrom; i < s.bucketFrom; i++ {
+		rt := &s.roots[i]
+		if rt.inA {
+			continue
+		}
+		p := int(rt.p)
+		for j := int(rt.off1) + blockLen - p; j >= 0; j -= p {
+			if s.candBits[uint(j)/64]&(1<<(uint(j)%64)) != 0 {
+				k := s.candSlot[j]
+				s.candHits[k] = append(s.candHits[k], int32(i))
+			}
+		}
+		if rt.r2 != rt.r1 {
+			for j := int(rt.off2) + blockLen - p; j >= 0; j -= p {
+				if s.candBits[uint(j)/64]&(1<<(uint(j)%64)) != 0 {
+					k := s.candSlot[j]
+					s.candHits[k] = append(s.candHits[k], int32(i))
+				}
+			}
+		}
 	}
 	for _, e := range bucket {
 		if j := uint16(e); s.candBits[j/64]&(1<<(j%64)) != 0 {
@@ -904,12 +962,12 @@ func nextOffset(start int64, root, p uint32) uint32 {
 }
 
 // tryFactorize attempts to factor y = Y(x) over the factor base. It divides
-// by the small primes whose roots match x and by the bucket primes in hits.
+// by the small primes whose roots match x and by the larger primes in hits.
 // A relation's Y is a·Y(x), so each prime of a is counted once more. A
 // cofactor made of one or two primes up to lpBound is returned as lp1, lp2.
 func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp1, lp2 uint64, ok bool) {
 	factors = s.scratch[:0]
-	temp := new(big.Int).Abs(y)
+	temp := s.temp.Abs(y)
 	if y.Sign() < 0 {
 		factors = append(factors, 0)
 	}
@@ -954,7 +1012,7 @@ func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fac
 		}
 		c := temp.Uint64()
 		switch {
-		case c <= s.lpBound:
+		case c <= s.lpBound && (c < s.pMax*s.pMax || isPrime64(c)):
 			lp1 = c
 		case c <= s.dlpCap:
 			if lp1, lp2, ok = splitCofactor(c, s.pMax, s.lpBound); !ok {
@@ -974,23 +1032,30 @@ type smallRoot struct {
 }
 
 // addRelation records a full relation, or a partial one with large primes
-// lp1 and lp2 (0 if absent). It returns a factor of n if a large prime
-// divides n.
+// lp1 and lp2 (0 if absent). x is copied if the relation is kept. It returns
+// a factor of n if a large prime divides n.
 func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.Int {
 	// Every polynomial gives Y = X² − kN, so different polynomials can find
 	// the same X, and −X gives the same Y. Either way the copy only adds a
 	// trivial dependency.
-	key := new(big.Int).Lsh(x, 1)
+	key := s.key.Lsh(x, 1)
 	if key.Cmp(s.n) > 0 {
 		key.Sub(s.n, x)
 	} else {
 		key.Set(x)
 	}
-	if k := string(key.Bytes()); s.seenX[k] {
-		return nil
+	kb := s.keyBuf[:0]
+	if n := (key.BitLen() + 7) / 8; cap(kb) >= n {
+		kb = key.FillBytes(kb[:n])
 	} else {
-		s.seenX[k] = true
+		kb = key.Bytes()
 	}
+	s.keyBuf = kb
+	if s.seenX[string(kb)] {
+		return nil
+	}
+	s.seenX[string(kb)] = true
+	x = new(big.Int).Set(x)
 
 	var r, l big.Int
 	for _, lp := range [2]uint64{lp1, lp2} {

@@ -90,12 +90,20 @@ func isPrime64(n uint64) bool {
 	return true
 }
 
-// rho64 returns a non-trivial factor of the odd composite n, found with
-// Brent's variant of Pollard's rho, or 0 if it gives up. It works in
-// Montgomery form, which doesn't change any gcd since 2⁶⁴ is coprime to n.
+// rho64 returns a non-trivial factor of the composite n, found with Brent's
+// variant of Pollard's rho, or 0 if it gives up. It works in Montgomery
+// form, which doesn't change any gcd since 2⁶⁴ is coprime to n. Each
+// constant c runs at most about 2¹⁹ steps, so a prime n can't make it spin.
 func rho64(n uint64) uint64 {
+	if n <= 1 {
+		return 0
+	}
+	if n&1 == 0 {
+		return 2 // Montgomery form needs n odd
+	}
 	m := newMont(n)
-	for c := uint64(1); c < 16; c++ {
+	// c < n keeps f(v) below 2n, so one subtraction reduces it.
+	for c := uint64(1); c < 16 && c < n; c++ {
 		f := func(v uint64) uint64 {
 			v = m.mul(v, v) + c
 			if v >= n {
@@ -105,7 +113,7 @@ func rho64(n uint64) uint64 {
 		}
 		y, r, q, g := uint64(2), uint64(1), uint64(1), uint64(1)
 		var x, ys uint64
-		for g == 1 {
+		for g == 1 && r <= 1<<18 {
 			x = y
 			for i := uint64(0); i < r; i++ {
 				y = f(y)
@@ -123,9 +131,11 @@ func rho64(n uint64) uint64 {
 		}
 		if g == n {
 			// The batch overshot, so retry its steps one at a time.
-			for g = 1; g == 1; {
+			for {
 				ys = f(ys)
-				g = gcd64(absDiff(x, ys), n)
+				if g = gcd64(absDiff(x, ys), n); g > 1 {
+					break
+				}
 			}
 		}
 		if g > 1 && g < n {
@@ -145,6 +155,9 @@ func absDiff(a, b uint64) uint64 {
 // splitCofactor returns the two primes, each at most lpBound, whose product
 // is c. Every prime up to pMax must already be divided out of c.
 func splitCofactor(c, pMax, lpBound uint64) (lp1, lp2 uint64, ok bool) {
+	if hi, lo := bits.Mul64(lpBound, lpBound); hi == 0 && c > lo {
+		return 0, 0, false // too large for two primes up to lpBound
+	}
 	if c < pMax*pMax || isPrime64(c) {
 		return 0, 0, false // a prime too large to keep
 	}

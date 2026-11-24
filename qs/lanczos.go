@@ -536,18 +536,28 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 		piv++
 	}
 
+	// Different combinations can give the same rows, so drop repeats by
+	// their FNV-1a hash.
 	var deps [][]int
-
+	seen := make(map[uint64]bool)
 	for k := piv; k < 128; k++ {
 		d0, d1 := comb[k][0], comb[k][1]
 		var dep []int
+		h := uint64(14695981039346656037)
 		for r := 0; r < R; r++ {
 			bit := (bits.OnesCount64(xy[r]&d0) + bits.OnesCount64(vi[r]&d1)) & 1
 			if bit != 0 {
 				dep = append(dep, r)
+				for v, i := uint32(r), 0; i < 4; v, i = v>>8, i+1 {
+					h = (h ^ uint64(v&0xff)) * 1099511628211
+				}
 			}
 		}
-		if len(dep) > 0 && isDependency(rows, numCols, dep) {
+		if len(dep) == 0 || seen[h] {
+			continue
+		}
+		seen[h] = true
+		if isDependency(rows, numCols, dep) {
 			deps = append(deps, dep)
 		}
 	}

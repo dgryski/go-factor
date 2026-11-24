@@ -49,12 +49,57 @@ func TestSplitCofactor(t *testing.T) {
 			t.Fatalf("splitCofactor(%d·%d) = %d, %d, %v", a, b, lp1, lp2, ok)
 		}
 	}
-	// One factor too large, and a prime cofactor.
+	// The square of the bound, and the largest square below it.
+	l := randPrime(lpBound-1<<16, lpBound)
+	if lp1, lp2, ok := splitCofactor(l*l, pMax, lpBound); !ok || lp1 != l || lp2 != l {
+		t.Errorf("splitCofactor(%d²) = %d, %d, %v", l, lp1, lp2, ok)
+	}
+	// One factor too large, a cofactor above lpBound², three primes, and a
+	// prime cofactor.
 	if _, _, ok := splitCofactor(randPrime(pMax, 2*pMax)*randPrime(lpBound, 2*lpBound), pMax, lpBound); ok {
 		t.Error("accepted a factor above lpBound")
 	}
+	if _, _, ok := splitCofactor(lpBound*lpBound+1, pMax, lpBound); ok {
+		t.Error("accepted a cofactor above lpBound²")
+	}
+	if _, _, ok := splitCofactor(randPrime(pMax, 2*pMax)*randPrime(pMax, 2*pMax)*randPrime(pMax, 2*pMax), pMax, lpBound); ok {
+		t.Error("accepted three primes")
+	}
 	if _, _, ok := splitCofactor(randPrime(pMax*pMax, 2*pMax*pMax), pMax, lpBound); ok {
 		t.Error("accepted a prime cofactor")
+	}
+}
+
+func TestRho64(t *testing.T) {
+	for _, n := range []uint64{0, 1} {
+		if d := rho64(n); d != 0 {
+			t.Errorf("rho64(%d) = %d", n, d)
+		}
+	}
+	if d := rho64(18); d != 2 {
+		t.Errorf("rho64(18) = %d", d)
+	}
+	// Small odd composites may defeat rho, but any answer must divide n.
+	for _, n := range []uint64{9, 15, 21, 25, 49, 91} {
+		if d := rho64(n); d != 0 && (d == 1 || d == n || n%d != 0) {
+			t.Errorf("rho64(%d) = %d", n, d)
+		}
+	}
+	// A prime gives up rather than spinning.
+	if d := rho64(1000000007); d != 0 {
+		t.Errorf("rho64(1000000007) = %d", d)
+	}
+	rng := rand.New(rand.NewSource(2))
+	for i := 0; i < 200; i++ {
+		var p, q uint64
+		for p = uint64(rng.Int63n(1e8)); !isPrime64(p) || p < 3; p++ {
+		}
+		for q = uint64(rng.Int63n(1e8)); !isPrime64(q) || q < 3; q++ {
+		}
+		n := p * q
+		if d := rho64(n); d == 0 || d == 1 || d == n || n%d != 0 {
+			t.Fatalf("rho64(%d·%d) = %d", p, q, d)
+		}
 	}
 }
 

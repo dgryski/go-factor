@@ -10,9 +10,11 @@ const (
 	keepSurplus = 64 // rows beyond the column count kept for dependencies
 
 	// Block Lanczos solves reduced matrices of at least lanczosMinCols
-	// columns, unless it finds fewer than lanczosMinDeps independent ones.
+	// columns, unless lanczosSeeds runs each find fewer than lanczosMinDeps
+	// independent ones.
 	lanczosMinCols = 1000
 	lanczosMinDeps = 16
+	lanczosSeeds   = 3 // block Lanczos runs to try before dense elimination
 )
 
 // pivotLimits returns the heaviest column the structured elimination pivots
@@ -54,11 +56,14 @@ func findDependencies(relations []relation, numCols int) [][]uint64 {
 		deps = append(deps, r.expand([]int32{node}))
 	}
 	var roots []int32
-	if denseCols >= lanczosMinCols {
+	// A failed block Lanczos run costs much less than dense elimination, so
+	// try a few seeds first.
+	for seed := int64(1); denseCols >= lanczosMinCols && seed <= lanczosSeeds; seed++ {
 		start := time.Now()
-		bl := blockLanczos(dense, denseCols, 1)
+		bl := blockLanczos(dense, denseCols, seed)
 		indep := independentCount(bl, len(dense))
-		logf("qs: block Lanczos found %d independent dependencies in %v", indep, time.Since(start).Round(time.Millisecond))
+		logf("qs: block Lanczos (seed %d) found %d independent dependencies in %v",
+			seed, indep, time.Since(start).Round(time.Millisecond))
 		if indep >= lanczosMinDeps {
 			for _, dep := range bl {
 				roots = roots[:0]

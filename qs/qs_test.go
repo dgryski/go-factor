@@ -2,6 +2,7 @@ package qs
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"math/rand"
 	"testing"
@@ -61,6 +62,36 @@ func TestQuadraticSieveSIQS(t *testing.T) {
 		t.Skip("slow")
 	}
 	testSemiprimes(t, siqsMinBits/2, 75, 5, 3)
+}
+
+func TestLog2Big(t *testing.T) {
+	rng := rand.New(rand.NewSource(3))
+	lengths := []int{52, 53, 54, 63, 64, 65, 117, 128, 266}
+	for n := 1; n <= 512; n++ {
+		lengths = append(lengths, n)
+	}
+	for _, n := range lengths {
+		for i := 0; i < 20; i++ {
+			v := new(big.Int).Rand(rng, new(big.Int).Lsh(one, uint(n-1)))
+			v.SetBit(v, n-1, 1)
+			if i == 0 {
+				v.Lsh(one, uint(n-1)) // a power of two
+			}
+			// Exact for the top 53 bits, then the logarithm of the rest.
+			want := float64(n - 1)
+			if n > 1 {
+				shift := n - 53
+				if shift < 0 {
+					shift = 0
+				}
+				top := new(big.Int).Rsh(v, uint(shift))
+				want = math.Log2(float64(top.Uint64())) + float64(shift)
+			}
+			if got := log2Big(v); got != want {
+				t.Fatalf("log2Big(%v) = %v, want %v (%d bits)", v, got, want, n)
+			}
+		}
+	}
 }
 
 func TestSqrtModPrime(t *testing.T) {
