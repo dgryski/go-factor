@@ -25,8 +25,10 @@ var one = big.NewInt(1)
 const extraRelations = 20
 
 const (
-	blockSize     = 32 * 1024 // sieve block size, sized for L1 cache
-	minSievePrime = 30        // smaller primes are not sieved, only allowed for in the threshold
+	blockShift    = 15 // sieve blocks are 32 KB, sized for L1 cache
+	blockSize     = 1 << blockShift
+	bucketCut     = 16384 // primes from here up are sieved through per-block buckets
+	minSievePrime = 30    // smaller primes are not sieved, only allowed for in the threshold
 
 	// A candidate may score this many times log2(largest base prime) below
 	// log2|Y|.
@@ -387,6 +389,14 @@ type sieve struct {
 	scratch   []int32
 	buf       [blockSize]byte
 
+	// Primes from bucketFrom up are sieved by walking each polynomial's
+	// interval once and filing the hits by block. A bucket entry packs
+	// log2(p) << 48 | prime index << 16 | offset in the block.
+	bucketFrom int
+	buckets    [][]uint64
+	small      []smallRoot // primes below bucketCut not dividing a
+	hits       []int32     // bucket primes hitting the current candidate
+
 	// For progress logging.
 	combined int // relations made from two partials
 	polys    int // polynomials sieved
@@ -431,6 +441,11 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 	}
 	if len(s.roots)-s.sieveFrom < 8 {
 		s.sieveFrom, smallSlack = 0, 0
+	}
+
+	s.bucketFrom = sort.Search(len(s.roots), func(i int) bool { return s.roots[i].p >= bucketCut })
+	if s.bucketFrom < s.sieveFrom {
+		s.bucketFrom = s.sieveFrom
 	}
 
 	pMax := uint64(s.roots[len(s.roots)-1].p)
@@ -699,14 +714,21 @@ func addMod(a, b, p uint32) uint32 {
 // the relations it finds. aIdx lists the primes dividing a. It returns a
 // factor of n if it finds one by accident.
 func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
-	for i := s.sieveFrom; i < len(s.roots); i++ {
+	s.small = s.small[:0]
+	for i := 0; i < s.bucketFrom; i++ {
+		if rt := &s.roots[i]; !rt.inA {
+			s.small = append(s.small, smallRoot{idx: int32(i), p: rt.p, r1: rt.r1, r2: rt.r2})
+		}
+	}
+	for i := s.sieveFrom; i < s.bucketFrom; i++ {
 		rt := &s.roots[i]
 		rt.off1 = nextOffset(lo, rt.r1, rt.p)
 		rt.off2 = nextOffset(lo, rt.r2, rt.p)
 	}
+	s.fillBuckets(lo, hi)
 
 	var x, y big.Int
-	for blockStart := lo; blockStart < hi && len(s.relations) < s.want; blockStart += blockSize {
+	for blockStart, bi := lo, 0; blockStart < hi && len(s.relations) < s.want; blockStart, bi = blockStart+blockSize, bi+1 {
 		blockLen := int64(blockSize)
 		if hi-blockStart < blockLen {
 			blockLen = hi - blockStart
@@ -716,7 +738,7 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 			block[i] = 0
 		}
 
-		for i := s.sieveFrom; i < len(s.roots); i++ {
+		for i := s.sieveFrom; i < s.bucketFrom; i++ {
 			rt := &s.roots[i]
 			if rt.inA {
 				continue
@@ -735,6 +757,10 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 				rt.off2 = uint32(j - len(block))
 			}
 		}
+		bucket := s.buckets[bi]
+		for _, e := range bucket {
+			block[uint16(e)] += byte(e >> 48)
+		}
 
 		threshold := s.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack
 		for i, score := range block {
@@ -751,7 +777,13 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 			if y.Sign() == 0 {
 				continue
 			}
-			factors, lp, ok := s.tryFactorize(off, &y, aIdx)
+			s.hits = s.hits[:0]
+			for _, e := range bucket {
+				if uint16(e) == uint16(i) {
+					s.hits = append(s.hits, int32(uint32(e>>16)))
+				}
+			}
+			factors, lp, ok := s.tryFactorize(off, &y, aIdx, s.hits)
 			if !ok {
 				continue
 			}
@@ -764,6 +796,37 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 		}
 	}
 	return nil
+}
+
+// fillBuckets files every hit in [lo, hi) of the primes from s.bucketFrom up
+// into the bucket of its block.
+func (s *sieve) fillBuckets(lo, hi int64) {
+	n := int((hi - lo + blockSize - 1) >> blockShift)
+	for len(s.buckets) < n {
+		s.buckets = append(s.buckets, nil)
+	}
+	for i := range s.buckets[:n] {
+		s.buckets[i] = s.buckets[i][:0]
+	}
+	total := uint64(hi - lo)
+	for i := s.bucketFrom; i < len(s.roots); i++ {
+		rt := &s.roots[i]
+		if rt.inA {
+			continue
+		}
+		p := uint64(rt.p)
+		tag := uint64(rt.logP)<<48 | uint64(i)<<16
+		for off := uint64(nextOffset(lo, rt.r1, rt.p)); off < total; off += p {
+			b := off >> blockShift
+			s.buckets[b] = append(s.buckets[b], tag|off&(blockSize-1))
+		}
+		if rt.r2 != rt.r1 {
+			for off := uint64(nextOffset(lo, rt.r2, rt.p)); off < total; off += p {
+				b := off >> blockShift
+				s.buckets[b] = append(s.buckets[b], tag|off&(blockSize-1))
+			}
+		}
+	}
 }
 
 // maxLog2Y returns log2 of the largest |Y(x)| for x in [from, to). |Y| is
@@ -797,11 +860,11 @@ func nextOffset(start int64, root, p uint32) uint32 {
 	return uint32(off)
 }
 
-// tryFactorize attempts to factor y = Y(x) over the factor base, trial
-// dividing only by primes whose roots match x. A relation's Y is a·Y(x), so
-// each prime of a is counted once more. A cofactor that is a prime up to the
-// large prime bound is returned as lp.
-func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int) (factors []int32, lp uint64, ok bool) {
+// tryFactorize attempts to factor y = Y(x) over the factor base. It divides
+// by the small primes whose roots match x and by the bucket primes in hits.
+// A relation's Y is a·Y(x), so each prime of a is counted once more. A
+// cofactor that is a prime up to the large prime bound is returned as lp.
+func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp uint64, ok bool) {
 	factors = s.scratch[:0]
 	temp := new(big.Int).Abs(y)
 	if y.Sign() < 0 {
@@ -809,36 +872,34 @@ func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int) (factors []int32, 
 	}
 
 	var bigP, q, r big.Int
-	divide := func(i int) {
+	divide := func(i int32) {
 		bigP.SetUint64(uint64(s.roots[i].p))
 		for {
 			q.QuoRem(temp, &bigP, &r)
 			if r.Sign() != 0 {
 				break
 			}
-			factors = append(factors, int32(i+1))
+			factors = append(factors, i+1)
 			temp.Set(&q)
 		}
 	}
 
 	for _, i := range aIdx {
 		factors = append(factors, int32(i+1))
-		divide(i)
+		divide(int32(i))
 	}
-	for i := range s.roots {
-		rt := &s.roots[i]
-		if rt.inA {
-			continue
-		}
-		xr := x % int64(rt.p)
+	for i := range s.small {
+		sr := &s.small[i]
+		xr := x % int64(sr.p)
 		if xr < 0 {
-			xr += int64(rt.p)
+			xr += int64(sr.p)
 		}
-		if uint32(xr) == rt.r1 || uint32(xr) == rt.r2 {
-			if divide(i); temp.Cmp(one) == 0 {
-				break
-			}
+		if uint32(xr) == sr.r1 || uint32(xr) == sr.r2 {
+			divide(sr.idx)
 		}
+	}
+	for _, i := range hits {
+		divide(i)
 	}
 	s.scratch = factors[:0]
 
@@ -851,6 +912,12 @@ func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int) (factors []int32, 
 		lp = temp.Uint64()
 	}
 	return append([]int32(nil), factors...), lp, true
+}
+
+// smallRoot packs what tryFactorize needs to test a small prime.
+type smallRoot struct {
+	idx       int32
+	p, r1, r2 uint32
 }
 
 // addRelation records a relation, combining it with an earlier partial

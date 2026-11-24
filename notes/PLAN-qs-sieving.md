@@ -34,9 +34,16 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
   - 32 KB blocks.
   - Primes below 30 aren't sieved, and the threshold allows for their
     contribution.
+  - Primes from 16384 up (`bucketCut`) are bucket sieved. `fillBuckets` walks
+    each such prime's hits across the polynomial's whole interval once, and
+    files each as log₂p << 48 | prime index << 16 | offset in its block's
+    bucket. Each block then adds its bucket's entries instead of looping over
+    every root.
   - The threshold is per block, from the exact |Y| at the block's ends, and at
     the vertex if it lies inside the block.
-  - `tryFactorize` divides only by primes whose roots match x.
+  - `tryFactorize` checks primes below 16384 from a packed (p, r1, r2) table
+    rebuilt for each polynomial. For larger primes it divides only by the
+    bucket entries at the candidate's offset.
 - **Relations:**
   - Each relation stores its factors sparsely, as column indices repeated by
     multiplicity, rather than a dense exponent vector.
@@ -84,17 +91,19 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
 
 Time for `split` on random balanced semiprimes, from one sample per size:
 
-| bits | first sieve (single poly) | now |
-|------|------|-------|
-| 60   | 0.82 ms | 0.55 ms |
-| 80   | 5 ms    | 0.93 ms |
-| 100  | 39 ms   | 2.6 ms  |
-| 120  | 217 ms  | 7.0 ms  |
-| 140  | –       | 29 ms   |
-| 160  | –       | 128 ms  |
-| 180  | –       | 1.1 s   |
-| 200  | –       | 3.8 s   |
-| 220  | –       | 17 s    |
+| bits | first sieve (single poly) | SIQS | SIQS with buckets |
+|------|------|-------|------|
+| 60   | 0.82 ms | 0.55 ms | 0.49 ms |
+| 80   | 5 ms    | 0.93 ms | 0.78 ms |
+| 100  | 39 ms   | 2.6 ms  | 2.2 ms |
+| 120  | 217 ms  | 7.0 ms  | 6.0 ms |
+| 160  | –       | 154 ms  | 143 ms |
+| 200  | –       | 2.86 s  | 1.89 s |
+| 219  | –       | 11.0 s  | 6.18 s |
+| 240  | –       | 40.4 s  | 21.6 s |
+
+The 160–240-bit rows are fixed semiprimes (seed 7), and both columns collected
+the same relations.
 
 ### Tuning results
 
@@ -110,8 +119,21 @@ These were measured, not guessed. Redo them if the candidate check gets faster.
 - **SIQS below about 60 bits:** the pool of A primes is too small, so it runs
   out of distinct A values before it has enough relations.
 - **`tryFactorize`:** it called `temp.Cmp(one)` for every root, which took
-  half the run time. It now checks only after a division. The remaining cost
-  is the x mod p scan over all roots for each candidate.
+  half the run time. It now checks only after a division.
+- **`bucketCut`:** 16384 was fastest among 2048–65536 at 219 and 240 bits.
+  2048 was 15% slower and 65536 10% slower.
+- **Resieving** (`notes/_qa-drafts5/`) didn't pay and isn't used.
+  - It walks each prime from 2048 up back through every block with a
+    candidate. At 200 bits that's about 28 µs per block, against about 4.7 µs
+    per candidate for the old full scan, so it breaks even at about 7
+    candidates per block. Blocks had 3.4 at 200 bits and 1.5 at 240.
+  - Looser thresholds gave 40–85 candidates per block but made runs slower,
+    because the extra candidates nearly all leave cofactors too big for one
+    large prime.
+  - Bucket sieving gets most of the benefit instead, because a candidate's
+    large primes come from its block's bucket.
+  - It may pay again with double large primes, where those candidates become
+    partials.
 
 ### Fixed from the drafts
 
@@ -144,12 +166,12 @@ msieve 1.53 factoring it by SIQS in 1 min 36 s:
 - 49,954 relations: 26,246 full and 23,708 combined from 267,452 partials
 - a sparse matrix solved by block Lanczos
 
-`factor -v -methods=qs` factors it completely in about 5 min, about 3×
-msieve's time. That's from the 5-minute sieve plus the 2.3 s matrix step
-measured on the saved relations, not a full run:
+`factor -v -methods=qs` factors it completely in 2 min 42 s, about 1.7×
+msieve's time:
 
 - SIQS chose k = 5 and B = 1,570,053 (59,370 primes, M = 128K).
-- It collected 59,391 relations in 5 min.
+- It collected 59,391 relations in 2 min 34 s, against 5 min before bucket
+  sieving.
 - Structured elimination reduces the matrix from 59,391×59,371 to
   15,649×15,585 in 0.7 s, and block Lanczos solves that in 1.5 s. The whole
   matrix step takes 2.3 s.
@@ -241,14 +263,16 @@ simpler form but doesn't prove it in general.
 
 ## Next steps
 
-1. **A faster candidate check.** `tryFactorize` scans every root for each
-   candidate.
-   - Resieve the block for the larger primes, or keep a compact
-     (p, r1, r2) array for the scan.
-   - Once that's cheaper, retune the large prime slack. More candidates may
-     then pay off.
-2. **Matching msieve's sieve speed.**
-   - Sieve the largest primes with bucket sieving rather than once per block.
-   - Retune B and M for SIQS at 70–80 digits. Ours is larger than msieve's.
-3. **`factor` defaults.** Raise `qsMaxBits` once 80 digits finishes in
-   minutes.
+1. **Double large primes** (`notes/_qs-drafts6/`).
+   - `classifyCofactor` splits cofactors up to about 2⁵⁰ with `uint64`
+     Miller–Rabin and Brent's rho.
+   - Large primes become extra matrix columns after pruning those that appear
+     only once, so the structured elimination merges their chains.
+   - Still needed: a periodic recount on the large-prime graph to know when
+     to stop sieving, and `tryDependency` support for large-prime columns.
+   - Then retune slack and the large-prime multiplier upward, and try
+     resieving again.
+2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
+3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile.
+4. **`factor` defaults.** Raise `qsMaxBits`, since 80 digits now takes under
+   3 minutes.
