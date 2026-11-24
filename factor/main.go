@@ -18,12 +18,14 @@ func main() {
 	// 21251589199163473368424683523876245871651712859289
 
 	verbose := flag.Bool("v", false, "log progress during the quadratic sieve")
+	qsSave := flag.String("qs-save", "", "directory to save the quadratic sieve's relations in, as <n>.rel")
 	methods := flag.String("methods", strings.Join(allMethods, ","), "comma-separated methods to run, always in the order "+strings.Join(allMethods, ","))
 	flag.Parse()
 
 	if *verbose {
 		qs.Logf = log.Printf
 	}
+	qs.SaveDir = *qsSave
 
 	run := make(map[string]bool)
 	for _, m := range strings.Split(*methods, ",") {

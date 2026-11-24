@@ -115,6 +115,9 @@ func split(n *big.Int) (*big.Int, *big.Int) {
 		logf("qs: not enough relations, giving up")
 		return nil, nil // not enough relations to guarantee a dependency
 	}
+	if SaveDir != "" {
+		saveRelations(n, factorBase, s.relations)
+	}
 	start := time.Now()
 	deps := findDependencies(s.relations, s.numCols)
 	logf("qs: matrix %d×%d, %d dependencies in %v",
