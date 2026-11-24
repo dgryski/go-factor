@@ -145,6 +145,51 @@ func TestRelations(t *testing.T) {
 	}
 }
 
+// TestWorkers checks that SIQS collects the same relations and partials, in
+// the same order, with one worker and with several, and with double large
+// primes on and off.
+func TestWorkers(t *testing.T) {
+	defer func(w, d int) { Workers, dlpMinBits = w, d }(Workers, dlpMinBits)
+	rnd := rand.New(rand.NewSource(5))
+	for _, c := range []struct{ bits, dlpMinBits int }{{60, 1 << 30}, {80, 1 << 30}, {80, 0}} {
+		dlpMinBits = c.dlpMinBits
+		n := new(big.Int).Mul(testutil.RandomPrime(rnd, c.bits), testutil.RandomPrime(rnd, c.bits))
+		b, _, sieveRange := params(n)
+		kn := new(big.Int).Mul(n, big.NewInt(knuthSchroeppel(n)))
+		factorBase := buildFactorBase(kn, primesUpTo(b))
+		var runs [2]*sieve
+		for i, w := range []int{1, 4} {
+			Workers = w
+			runs[i] = newSieve(n, kn, factorBase, true)
+			if f := runs[i].siqs(sieveRange); f != nil {
+				t.Fatalf("%v: found factor %v while sieving", n, f)
+			}
+		}
+		one, four := runs[0], runs[1]
+		if four.workers() != 4 {
+			t.Fatalf("%d bits: %d workers, want 4", n.BitLen(), four.workers())
+		}
+		if one.polys != four.polys || len(one.relations) != len(four.relations) || len(one.partials) != len(four.partials) {
+			t.Fatalf("%d bits: %d polynomials, %d relations, %d partials with one worker; %d, %d, %d with four",
+				n.BitLen(), one.polys, len(one.relations), len(one.partials), four.polys, len(four.relations), len(four.partials))
+		}
+		same := func(a, b relation) bool {
+			return a.X.Cmp(b.X) == 0 && fmt.Sprint(a.Factors) == fmt.Sprint(b.Factors)
+		}
+		for i := range one.relations {
+			if !same(one.relations[i], four.relations[i]) {
+				t.Fatalf("%d bits: relation %d differs", n.BitLen(), i)
+			}
+		}
+		for i := range one.partials {
+			p, q := one.partials[i], four.partials[i]
+			if !same(p.relation, q.relation) || p.lp1 != q.lp1 || p.lp2 != q.lp2 {
+				t.Fatalf("%d bits: partial %d differs", n.BitLen(), i)
+			}
+		}
+	}
+}
+
 func BenchmarkQuadraticSieve(b *testing.B) {
 	for _, bits := range []int{30, 40, 50, 60, 70, 80} {
 		rnd := rand.New(rand.NewSource(1))

@@ -12,7 +12,10 @@ import (
 	"math/big"
 	"math/bits"
 	"math/rand"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -184,7 +187,7 @@ func params(n *big.Int) (b int64, siqs bool, sieveRange int64) {
 	case b < 100000:
 		sieveRange = 64 * 1024
 	default:
-		sieveRange = 128 * 1024
+		sieveRange = largeSieveRange
 	}
 	return b, true, sieveRange
 }
@@ -398,30 +401,14 @@ type root struct {
 type sieve struct {
 	n, kn     *big.Int
 	log2KN    float64
-	roots     []root
+	roots     []root // the roots before any polynomial, copied by each worker
 	numCols   int
 	want      int
 	sieveFrom int     // index of the first sieved prime
 	slack     float64 // how far below log2|Y| a candidate may score
 	lpBound   uint64
-
-	relations []relation
-	seenX     map[string]bool // min(X, n−X) for every relation and partial
-
-	// Scratch space for sievePoly, tryFactorize and addRelation.
-	temp, xModN, key big.Int
-	keyBuf           []byte
-
-	// Partial relations have one or two large primes up to lpBound left over.
-	// Cofactors up to dlpCap are split into two. Large primes that occur in
-	// more than one partial become matrix columns in finish.
-	partials      []partial
-	pMax          uint64
-	dlpCap        uint64
-	partialExcess int // surviving partials minus large primes at the last count
-	nextCount     int // len(partials) at which to count again
-	scratch       []int32
-	buf           [blockSize]byte
+	pMax      uint64
+	dlpCap    uint64 // cofactors up to this are split into two large primes
 
 	// Primes from bucketFrom up are sieved by walking each polynomial's
 	// interval once and filing the hits by block. A bucket entry packs
@@ -430,19 +417,97 @@ type sieve struct {
 	// for the block's candidates by walking back from their next offsets.
 	resieveFrom int
 	bucketFrom  int
-	buckets     [][]uint64
-	small       []smallRoot // primes below resieveCut not dividing a
 
-	// The current block's candidates, and the bucket primes hitting each.
-	cands    []int
-	candHits [][]int32
-	candBits [blockSize / 64]uint64
-	candSlot [blockSize]uint16 // index in cands of each candidate's offset
+	// The rest is only used by the goroutine collecting relations.
+	relations []relation
+	seenX     map[string]bool // min(X, n−X) for every relation and partial
+	key       big.Int
+	keyBuf    []byte
+
+	// Partial relations have one or two large primes up to lpBound left over.
+	// Large primes that occur in more than one partial become matrix columns
+	// in finish.
+	partials      []partial
+	partialExcess int // surviving partials minus large primes at the last count
+	nextCount     int // len(partials) at which to count again
 
 	// For progress logging.
 	polys   int // polynomials sieved
 	start   time.Time
 	lastLog time.Time
+}
+
+// worker sieves polynomials. Each worker has its own copy of the roots and
+// its own buffers, so several can run at once. It passes the relations it
+// finds to emit, and stops early once stop is set.
+type worker struct {
+	s     *sieve // read only
+	roots []root
+	emit  func(found)
+	stop  *atomic.Bool
+	poly  int // index of the polynomial being sieved within its A
+
+	aInv    []uint32
+	deltas  [][]uint32
+	buf     [blockSize]byte
+	buckets [][]uint64
+	small   []smallRoot // primes below resieveCut not dividing a
+
+	// The current block's candidates, and the primes from resieveFrom up
+	// hitting each.
+	cands    []int
+	candHits [][]int32
+	candBits [blockSize / 64]uint64
+	candSlot [blockSize]uint16 // index in cands of each candidate's offset
+
+	scratch []int32
+	temp    big.Int
+}
+
+func (s *sieve) newWorker(stop *atomic.Bool, emit func(found)) *worker {
+	return &worker{
+		s:     s,
+		roots: append([]root(nil), s.roots...),
+		emit:  emit,
+		stop:  stop,
+		aInv:  make([]uint32, len(s.roots)),
+	}
+}
+
+// found is a relation from a worker, not yet checked against the others.
+type found struct {
+	x        *big.Int // reduced mod n
+	factors  []int32
+	lp1, lp2 uint64
+	poly     int // index of its polynomial within its A
+}
+
+// Workers is the most goroutines that sieve SIQS polynomials. 0 means
+// runtime.GOMAXPROCS(0).
+var Workers = 0
+
+// workers returns how many goroutines to sieve with. Small inputs need too
+// few polynomials to keep many workers busy, so extra ones mostly sieve past
+// the point where sieving stops. The limits are from timings on a 15-core
+// laptop.
+func (s *sieve) workers() int {
+	n := runtime.GOMAXPROCS(0)
+	if Workers > 0 {
+		n = Workers
+	}
+	limit := n
+	switch bits := s.n.BitLen(); {
+	case bits < 80:
+		limit = 1
+	case bits < 130:
+		limit = 4
+	case bits < 170:
+		limit = 8
+	}
+	if n > limit {
+		n = limit
+	}
+	return n
 }
 
 func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
@@ -515,7 +580,14 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 func (s *sieve) singlePoly(sieveRange int64) *big.Int {
 	m := new(big.Int).Sqrt(s.kn)
 	m.Add(m, one)
-	s.setRoots(one, m)
+	var stop atomic.Bool
+	var factor *big.Int
+	w := s.newWorker(&stop, func(f found) {
+		if factor = s.addRelation(f.x, f.factors, f.lp1, f.lp2); factor != nil || s.done() {
+			stop.Store(true)
+		}
+	})
+	w.setRoots(one, m)
 
 	// Stop before X reaches zero, since X and −X give the same Y and would
 	// only add duplicate rows (and so trivial dependencies).
@@ -524,12 +596,18 @@ func (s *sieve) singlePoly(sieveRange int64) *big.Int {
 		lo = 1 - m.Int64()
 	}
 	s.polys = 1
-	return s.sievePoly(one, m, nil, lo, sieveRange)
+	w.sievePoly(one, m, nil, lo, sieveRange)
+	return factor
 }
 
 // siqs sieves x in [−sieveRange, sieveRange) for each of a sequence of
 // polynomials until it has enough relations or runs out of polynomials. It
 // returns a factor of n if it finds one by accident.
+//
+// One goroutine chooses the A values, workers sieve all the polynomials for
+// one A at a time, and the calling goroutine adds their relations in the
+// order of the A values. The relations are the same for any number of
+// workers. Workers only do extra work past the point where sieving stops.
 func (s *sieve) siqs(sieveRange int64) *big.Int {
 	// With A ≈ √(2kN) / M, the largest |Y| at x = 0 and at x = ±M are
 	// about the same.
@@ -542,87 +620,167 @@ func (s *sieve) siqs(sieveRange int64) *big.Int {
 		}
 	}
 
-	rng := rand.New(rand.NewSource(1))
-	seen := make(map[string]bool)
-	var bigP, r, aq, twoBv big.Int
-	aInv := make([]uint32, len(s.roots))
-	var deltas [][]uint32
+	type job struct {
+		seq  int
+		a    *big.Int
+		aIdx []int
+	}
+	type batch struct {
+		seq, polys int
+		rels       []found
+	}
+	nw := s.workers()
+	jobs := make(chan job, nw)
+	results := make(chan batch, nw)
+	quit := make(chan struct{})
+	var stop atomic.Bool
 
-	for !s.done() {
-		a, aIdx := chooseA(rng, s.roots, pool, log2Target, seen)
-		if a == nil {
-			logf("qs: ran out of polynomials")
-			return nil
-		}
-		for _, idx := range aIdx {
-			s.roots[idx].inA = true
-		}
-
-		// B = Σ B_j with B_j ≡ ±t_j (mod q_j) and B_j ≡ 0 (mod A/q_j), so
-		// B² ≡ kN (mod A). Flipping the signs of B_0..B_{s−2} gives
-		// 2^(s−1) polynomials for this A.
-		bj := make([]*big.Int, len(aIdx))
-		b := new(big.Int)
-		for j, idx := range aIdx {
-			q := uint64(s.roots[idx].p)
-			bigP.SetUint64(q)
-			aq.Quo(a, &bigP)
-			gamma := uint64(s.roots[idx].t) * invMod(r.Mod(&aq, &bigP).Uint64(), q) % q
-			if gamma > q/2 {
-				gamma = q - gamma
+	go func() {
+		defer close(jobs)
+		rng := rand.New(rand.NewSource(1))
+		seen := make(map[string]bool)
+		for seq := 0; ; seq++ {
+			a, aIdx := chooseA(rng, s.roots, pool, log2Target, seen)
+			if a == nil {
+				return
 			}
-			bj[j] = new(big.Int).Mul(new(big.Int).SetUint64(gamma), &aq)
-			b.Add(b, bj[j])
-		}
-
-		// When the sign of B_v flips, every root moves by 2·B_v·A⁻¹ (mod p).
-		for len(deltas) < len(aIdx)-1 {
-			deltas = append(deltas, make([]uint32, len(s.roots)))
-		}
-		for i := range s.roots {
-			rt := &s.roots[i]
-			if rt.inA {
-				continue
-			}
-			p := uint64(rt.p)
-			bigP.SetUint64(p)
-			aInv[i] = uint32(invMod(r.Mod(a, &bigP).Uint64(), p))
-			for v := 0; v < len(aIdx)-1; v++ {
-				deltas[v][i] = uint32(2 * r.Mod(bj[v], &bigP).Uint64() * uint64(aInv[i]) % p)
+			select {
+			case jobs <- job{seq, a, aIdx}:
+			case <-quit:
+				return
 			}
 		}
-		s.setRootsInv(b, aInv)
+	}()
 
-		for poly := 1; ; poly++ {
-			if f := s.sievePoly(a, b, aIdx, -sieveRange, sieveRange); f != nil {
-				return f
+	var wg sync.WaitGroup
+	for i := 0; i < nw; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var b batch
+			w := s.newWorker(&stop, func(f found) { b.rels = append(b.rels, f) })
+			for j := range jobs {
+				b = batch{seq: j.seq}
+				b.polys = w.sieveA(j.a, j.aIdx, sieveRange)
+				results <- b
 			}
-			s.polys++
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var factor *big.Int
+	finished := false
+	pending := make(map[int]batch)
+	next := 0
+	for b := range results {
+		if finished {
+			continue // drain until the workers exit
+		}
+		pending[b.seq] = b
+		for !finished {
+			b, ok := pending[next]
+			if !ok {
+				break
+			}
+			delete(pending, next)
+			next++
+			polys := b.polys
+			for _, f := range b.rels {
+				if factor = s.addRelation(f.x, f.factors, f.lp1, f.lp2); factor != nil || s.done() {
+					polys, finished = f.poly+1, true
+					break
+				}
+			}
+			s.polys += polys
 			if Logf != nil && time.Since(s.lastLog) > 5*time.Second {
 				s.logProgress()
 				s.lastLog = time.Now()
 			}
-			if poly == 1<<uint(len(aIdx)-1) || s.done() {
-				break
-			}
-
-			// Gray code order: step poly flips the sign of B_v.
-			v := bits.TrailingZeros(uint(poly))
-			twoBv.Lsh(bj[v], 1)
-			if poly>>uint(v+1)&1 == 0 {
-				b.Sub(b, &twoBv)
-				s.moveRoots(deltas[v], true)
-			} else {
-				b.Add(b, &twoBv)
-				s.moveRoots(deltas[v], false)
-			}
 		}
-
-		for _, idx := range aIdx {
-			s.roots[idx].inA = false
+		if finished {
+			stop.Store(true)
+			close(quit)
 		}
 	}
-	return nil
+	if !finished {
+		logf("qs: ran out of polynomials")
+	}
+	return factor
+}
+
+// sieveA sieves the 2^(s−1) polynomials for a, whose primes are aIdx, in
+// Gray code order, until they're done or w.stop is set. It returns how many
+// it sieved.
+func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
+	if w.stop.Load() {
+		return 0
+	}
+	for _, idx := range aIdx {
+		w.roots[idx].inA = true
+	}
+	defer func() {
+		for _, idx := range aIdx {
+			w.roots[idx].inA = false
+		}
+	}()
+
+	// B = Σ B_j with B_j ≡ ±t_j (mod q_j) and B_j ≡ 0 (mod A/q_j), so
+	// B² ≡ kN (mod A). Flipping the signs of B_0..B_{s−2} gives
+	// 2^(s−1) polynomials for this A.
+	var bigP, r, aq, twoBv big.Int
+	bj := make([]*big.Int, len(aIdx))
+	b := new(big.Int)
+	for j, idx := range aIdx {
+		q := uint64(w.roots[idx].p)
+		bigP.SetUint64(q)
+		aq.Quo(a, &bigP)
+		gamma := uint64(w.roots[idx].t) * invMod(r.Mod(&aq, &bigP).Uint64(), q) % q
+		if gamma > q/2 {
+			gamma = q - gamma
+		}
+		bj[j] = new(big.Int).Mul(new(big.Int).SetUint64(gamma), &aq)
+		b.Add(b, bj[j])
+	}
+
+	// When the sign of B_v flips, every root moves by 2·B_v·A⁻¹ (mod p).
+	for len(w.deltas) < len(aIdx)-1 {
+		w.deltas = append(w.deltas, make([]uint32, len(w.roots)))
+	}
+	for i := range w.roots {
+		rt := &w.roots[i]
+		if rt.inA {
+			continue
+		}
+		p := uint64(rt.p)
+		bigP.SetUint64(p)
+		w.aInv[i] = uint32(invMod(r.Mod(a, &bigP).Uint64(), p))
+		for v := 0; v < len(aIdx)-1; v++ {
+			w.deltas[v][i] = uint32(2 * r.Mod(bj[v], &bigP).Uint64() * uint64(w.aInv[i]) % p)
+		}
+	}
+	w.setRootsInv(b, w.aInv)
+
+	for poly := 1; ; poly++ {
+		w.poly = poly - 1
+		w.sievePoly(a, b, aIdx, -sieveRange, sieveRange)
+		if poly == 1<<uint(len(aIdx)-1) || w.stop.Load() {
+			return poly
+		}
+
+		// Gray code order: step poly flips the sign of B_v.
+		v := bits.TrailingZeros(uint(poly))
+		twoBv.Lsh(bj[v], 1)
+		if poly>>uint(v+1)&1 == 0 {
+			b.Sub(b, &twoBv)
+			w.moveRoots(w.deltas[v], true)
+		} else {
+			b.Add(b, &twoBv)
+			w.moveRoots(w.deltas[v], false)
+		}
+	}
 }
 
 // chooseA returns a product A of distinct primes from pool, with log2(A)
@@ -712,23 +870,22 @@ func chooseA(rng *rand.Rand, roots []root, pool []int, log2Target float64, seen 
 
 // setRoots computes the roots of every prime not in A for the polynomial
 // with coefficients a and b.
-func (s *sieve) setRoots(a, b *big.Int) {
-	aInv := make([]uint32, len(s.roots))
+func (w *worker) setRoots(a, b *big.Int) {
 	var r, bigP big.Int
-	for i := range s.roots {
-		if !s.roots[i].inA {
-			p := uint64(s.roots[i].p)
-			aInv[i] = uint32(invMod(r.Mod(a, bigP.SetUint64(p)).Uint64(), p))
+	for i := range w.roots {
+		if !w.roots[i].inA {
+			p := uint64(w.roots[i].p)
+			w.aInv[i] = uint32(invMod(r.Mod(a, bigP.SetUint64(p)).Uint64(), p))
 		}
 	}
-	s.setRootsInv(b, aInv)
+	w.setRootsInv(b, w.aInv)
 }
 
 // setRootsInv is setRoots with A⁻¹ mod p already computed for each prime.
-func (s *sieve) setRootsInv(b *big.Int, aInv []uint32) {
+func (w *worker) setRootsInv(b *big.Int, aInv []uint32) {
 	var r, bigP big.Int
-	for i := range s.roots {
-		rt := &s.roots[i]
+	for i := range w.roots {
+		rt := &w.roots[i]
 		if rt.inA {
 			continue
 		}
@@ -740,9 +897,9 @@ func (s *sieve) setRootsInv(b *big.Int, aInv []uint32) {
 }
 
 // moveRoots adds delta[i] to both roots of each prime, or subtracts it.
-func (s *sieve) moveRoots(delta []uint32, add bool) {
-	for i := range s.roots {
-		rt := &s.roots[i]
+func (w *worker) moveRoots(delta []uint32, add bool) {
+	for i := range w.roots {
+		rt := &w.roots[i]
 		d := delta[i]
 		if rt.inA || d == 0 {
 			continue
@@ -762,36 +919,36 @@ func addMod(a, b, p uint32) uint32 {
 	return a + b
 }
 
-// sievePoly sieves Y(x) = ((ax + b)² − kN) / a for x in [lo, hi) and adds
-// the relations it finds. aIdx lists the primes dividing a. It returns a
-// factor of n if it finds one by accident.
-func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
-	s.small = s.small[:0]
+// sievePoly sieves Y(x) = ((ax + b)² − kN) / a for x in [lo, hi) and passes
+// the relations it finds to w.emit. aIdx lists the primes dividing a.
+func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
+	s := w.s
+	w.small = w.small[:0]
 	for i := 0; i < s.resieveFrom; i++ {
-		if rt := &s.roots[i]; !rt.inA {
-			s.small = append(s.small, smallRoot{idx: int32(i), p: rt.p, r1: rt.r1, r2: rt.r2})
+		if rt := &w.roots[i]; !rt.inA {
+			w.small = append(w.small, smallRoot{idx: int32(i), p: rt.p, r1: rt.r1, r2: rt.r2})
 		}
 	}
 	for i := s.sieveFrom; i < s.bucketFrom; i++ {
-		rt := &s.roots[i]
+		rt := &w.roots[i]
 		rt.off1 = nextOffset(lo, rt.r1, rt.p)
 		rt.off2 = nextOffset(lo, rt.r2, rt.p)
 	}
-	s.fillBuckets(lo, hi)
+	w.fillBuckets(lo, hi)
 
 	var x, y big.Int
-	for blockStart, bi := lo, 0; blockStart < hi && !s.done(); blockStart, bi = blockStart+blockSize, bi+1 {
+	for blockStart, bi := lo, 0; blockStart < hi && !w.stop.Load(); blockStart, bi = blockStart+blockSize, bi+1 {
 		blockLen := int64(blockSize)
 		if hi-blockStart < blockLen {
 			blockLen = hi - blockStart
 		}
-		block := s.buf[:blockLen]
+		block := w.buf[:blockLen]
 		for i := range block {
 			block[i] = 0
 		}
 
 		for i := s.sieveFrom; i < s.bucketFrom; i++ {
-			rt := &s.roots[i]
+			rt := &w.roots[i]
 			if rt.inA {
 				continue
 			}
@@ -809,27 +966,27 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 				rt.off2 = uint32(j - len(block))
 			}
 		}
-		bucket := s.buckets[bi]
+		bucket := w.buckets[bi]
 		for _, e := range bucket {
 			block[uint16(e)] += byte(e >> 48)
 		}
 
-		thresh := int(math.Ceil(s.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack))
+		thresh := int(math.Ceil(w.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack))
 		if thresh < 0 {
 			thresh = 0
 		}
-		s.cands = s.cands[:0]
+		w.cands = w.cands[:0]
 		for i, score := range block {
 			if int(score) >= thresh {
-				s.cands = append(s.cands, i)
+				w.cands = append(w.cands, i)
 			}
 		}
-		if len(s.cands) == 0 {
+		if len(w.cands) == 0 {
 			continue
 		}
-		s.bucketHits(bucket, len(block))
+		w.bucketHits(bucket, len(block))
 
-		for k, i := range s.cands {
+		for k, i := range w.cands {
 			off := blockStart + int64(i)
 			x.SetInt64(off)
 			x.Mul(&x, a)
@@ -840,78 +997,77 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 			if y.Sign() == 0 {
 				continue
 			}
-			factors, lp1, lp2, ok := s.tryFactorize(off, &y, aIdx, s.candHits[k])
+			factors, lp1, lp2, ok := w.tryFactorize(off, &y, aIdx, w.candHits[k])
 			if !ok {
 				continue
 			}
-			if f := s.addRelation(s.xModN.Mod(&x, s.n), factors, lp1, lp2); f != nil {
-				return f
-			}
-			if s.done() {
+			w.emit(found{new(big.Int).Mod(&x, s.n), factors, lp1, lp2, w.poly})
+			if w.stop.Load() {
 				break
 			}
 		}
 	}
-	return nil
 }
 
-// bucketHits sets s.candHits to the primes from s.resieveFrom up hitting
+// bucketHits sets w.candHits to the primes from resieveFrom up hitting
 // each candidate. It must run after the block of length blockLen is sieved,
 // when off1 and off2 hold the offsets of the next block's first hits.
-func (s *sieve) bucketHits(bucket []uint64, blockLen int) {
-	for len(s.candHits) < len(s.cands) {
-		s.candHits = append(s.candHits, nil)
+func (w *worker) bucketHits(bucket []uint64, blockLen int) {
+	s := w.s
+	for len(w.candHits) < len(w.cands) {
+		w.candHits = append(w.candHits, nil)
 	}
-	for k, i := range s.cands {
-		s.candBits[i/64] |= 1 << (uint(i) % 64)
-		s.candSlot[i] = uint16(k)
-		s.candHits[k] = s.candHits[k][:0]
+	for k, i := range w.cands {
+		w.candBits[i/64] |= 1 << (uint(i) % 64)
+		w.candSlot[i] = uint16(k)
+		w.candHits[k] = w.candHits[k][:0]
 	}
 	for i := s.resieveFrom; i < s.bucketFrom; i++ {
-		rt := &s.roots[i]
+		rt := &w.roots[i]
 		if rt.inA {
 			continue
 		}
 		p := int(rt.p)
 		for j := int(rt.off1) + blockLen - p; j >= 0; j -= p {
-			if s.candBits[uint(j)/64]&(1<<(uint(j)%64)) != 0 {
-				k := s.candSlot[j]
-				s.candHits[k] = append(s.candHits[k], int32(i))
+			if w.candBits[uint(j)/64]&(1<<(uint(j)%64)) != 0 {
+				k := w.candSlot[j]
+				w.candHits[k] = append(w.candHits[k], int32(i))
 			}
 		}
 		if rt.r2 != rt.r1 {
 			for j := int(rt.off2) + blockLen - p; j >= 0; j -= p {
-				if s.candBits[uint(j)/64]&(1<<(uint(j)%64)) != 0 {
-					k := s.candSlot[j]
-					s.candHits[k] = append(s.candHits[k], int32(i))
+				if w.candBits[uint(j)/64]&(1<<(uint(j)%64)) != 0 {
+					k := w.candSlot[j]
+					w.candHits[k] = append(w.candHits[k], int32(i))
 				}
 			}
 		}
 	}
 	for _, e := range bucket {
-		if j := uint16(e); s.candBits[j/64]&(1<<(j%64)) != 0 {
-			k := s.candSlot[j]
-			s.candHits[k] = append(s.candHits[k], int32(uint32(e>>16)))
+		if j := uint16(e); w.candBits[j/64]&(1<<(j%64)) != 0 {
+			k := w.candSlot[j]
+			w.candHits[k] = append(w.candHits[k], int32(uint32(e>>16)))
 		}
 	}
-	for _, i := range s.cands {
-		s.candBits[i/64] = 0
+	for _, i := range w.cands {
+		w.candBits[i/64] = 0
 	}
 }
 
-// fillBuckets files every hit in [lo, hi) of the primes from s.bucketFrom up
+// fillBuckets files every hit in [lo, hi) of the primes from bucketFrom up
 // into the bucket of its block.
-func (s *sieve) fillBuckets(lo, hi int64) {
+func (w *worker) fillBuckets(lo, hi int64) {
+	s := w.s
 	n := int((hi - lo + blockSize - 1) >> blockShift)
-	for len(s.buckets) < n {
-		s.buckets = append(s.buckets, nil)
+	for len(w.buckets) < n {
+		w.buckets = append(w.buckets, nil)
 	}
-	for i := range s.buckets[:n] {
-		s.buckets[i] = s.buckets[i][:0]
+	for i := range w.buckets[:n] {
+		w.buckets[i] = w.buckets[i][:0]
 	}
 	total := uint64(hi - lo)
-	for i := s.bucketFrom; i < len(s.roots); i++ {
-		rt := &s.roots[i]
+	for i := s.bucketFrom; i < len(w.roots); i++ {
+		rt := &w.roots[i]
 		if rt.inA {
 			continue
 		}
@@ -919,12 +1075,12 @@ func (s *sieve) fillBuckets(lo, hi int64) {
 		tag := uint64(rt.logP)<<48 | uint64(i)<<16
 		for off := uint64(nextOffset(lo, rt.r1, rt.p)); off < total; off += p {
 			b := off >> blockShift
-			s.buckets[b] = append(s.buckets[b], tag|off&(blockSize-1))
+			w.buckets[b] = append(w.buckets[b], tag|off&(blockSize-1))
 		}
 		if rt.r2 != rt.r1 {
 			for off := uint64(nextOffset(lo, rt.r2, rt.p)); off < total; off += p {
 				b := off >> blockShift
-				s.buckets[b] = append(s.buckets[b], tag|off&(blockSize-1))
+				w.buckets[b] = append(w.buckets[b], tag|off&(blockSize-1))
 			}
 		}
 	}
@@ -932,7 +1088,8 @@ func (s *sieve) fillBuckets(lo, hi int64) {
 
 // maxLog2Y returns log2 of the largest |Y(x)| for x in [from, to). |Y| is
 // largest either at one end, or where ax + b = 0 if that lies in between.
-func (s *sieve) maxLog2Y(a, b *big.Int, from, to int64) float64 {
+func (w *worker) maxLog2Y(a, b *big.Int, from, to int64) float64 {
+	s := w.s
 	var x, y big.Int
 	best, signs := 0.0, 0
 	for _, off := range [2]int64{from, to - 1} {
@@ -965,16 +1122,17 @@ func nextOffset(start int64, root, p uint32) uint32 {
 // by the small primes whose roots match x and by the larger primes in hits.
 // A relation's Y is a·Y(x), so each prime of a is counted once more. A
 // cofactor made of one or two primes up to lpBound is returned as lp1, lp2.
-func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp1, lp2 uint64, ok bool) {
-	factors = s.scratch[:0]
-	temp := s.temp.Abs(y)
+func (w *worker) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp1, lp2 uint64, ok bool) {
+	s := w.s
+	factors = w.scratch[:0]
+	temp := w.temp.Abs(y)
 	if y.Sign() < 0 {
 		factors = append(factors, 0)
 	}
 
 	var bigP, q, r big.Int
 	divide := func(i int32) {
-		bigP.SetUint64(uint64(s.roots[i].p))
+		bigP.SetUint64(uint64(w.roots[i].p))
 		for {
 			q.QuoRem(temp, &bigP, &r)
 			if r.Sign() != 0 {
@@ -989,8 +1147,8 @@ func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fac
 		factors = append(factors, int32(i+1))
 		divide(int32(i))
 	}
-	for i := range s.small {
-		sr := &s.small[i]
+	for i := range w.small {
+		sr := &w.small[i]
 		xr := x % int64(sr.p)
 		if xr < 0 {
 			xr += int64(sr.p)
@@ -1002,7 +1160,7 @@ func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fac
 	for _, i := range hits {
 		divide(i)
 	}
-	s.scratch = factors[:0]
+	w.scratch = factors[:0]
 
 	// Every prime up to the largest base prime has been divided out, so a
 	// cofactor below its square is prime.
@@ -1032,8 +1190,8 @@ type smallRoot struct {
 }
 
 // addRelation records a full relation, or a partial one with large primes
-// lp1 and lp2 (0 if absent). x is copied if the relation is kept. It returns
-// a factor of n if a large prime divides n.
+// lp1 and lp2 (0 if absent). The relation keeps x, and may change it. It
+// returns a factor of n if a large prime divides n.
 func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.Int {
 	// Every polynomial gives Y = X² − kN, so different polynomials can find
 	// the same X, and −X gives the same Y. Either way the copy only adds a
@@ -1055,7 +1213,6 @@ func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.I
 		return nil
 	}
 	s.seenX[string(kb)] = true
-	x = new(big.Int).Set(x)
 
 	var r, l big.Int
 	for _, lp := range [2]uint64{lp1, lp2} {
@@ -1228,6 +1385,10 @@ func tryDependency(n *big.Int, factorBase []int64, relations []relation, dep []u
 	}
 	return nil
 }
+
+// largeSieveRange is the SIQS sieve half-width for factor bases from 100,000
+// primes up. It's a var while it's being tuned.
+var largeSieveRange int64 = 128 * 1024
 
 // Double large primes are still being tuned, so they're off by default. Set
 // dlpMinBits to turn them on for inputs of at least that many bits.
