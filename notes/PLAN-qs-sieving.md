@@ -1,74 +1,87 @@
 # Plan: real sieving for the quadratic sieve
 
-## Current state (2026-11-22)
+## Current state (2026-11-23)
+
+Stage 1 is done. It started from `qs/ai_studio_code.go`, an untracked AI draft
+that is `package main` and doesn't build on its own. Delete it once it's no
+longer needed.
 
 - `qs.go` (package `factor`) has `QuadraticSieve(n) (primes, composites []*big.Int)`,
   which recurses on the two halves found by `qsSplit`.
-- `qsSplit` does not sieve. It builds a `big.Int` Q(x) = (⌈√N⌉ + x)² − N for every
-  candidate x and trial-divides it by every factor base prime (`tryFactorize`).
-  That makes it Dixon/Kraitchik rather than a quadratic sieve.
-- Parameters are fixed in three steps by bit length: B = 250/1000/5000 and
-  range = 2000/20000/100000.
-- Linear algebra (`findDependencies`, bit-packed GF(2) elimination that tracks
-  row combinations) and the gcd step (`tryDependency`, which tries a−b and a+b)
-  are correct and can be reused as they are.
-- `qs_test.go` covers edge cases and random semiprimes with 10–26-bit factors.
-- `factor/main.go` runs QS after Squfof, only on composites ≤ 64 bits
-  (`qsMaxBits`). In practice Brent, p−1 and Squfof factor such numbers first,
-  so the stage rarely fires.
+- `qsSplit` removes small factors by trial division up to B, builds the factor
+  base, and calls `sieve`. Linear algebra (`findDependencies`) and the gcd step
+  (`tryDependency`) are unchanged.
+- `sieve` is a single-polynomial sieve over X = ⌈√N⌉ + x:
+  - x ∈ [max(−M, 1−m), M), in 32 KB blocks. X ≤ 0 is skipped because it only
+    repeats the positive side's Y values.
+  - Roots come from Tonelli–Shanks in `uint64` (`sqrtModPrime`, `buildRootTable`).
+  - Primes below 30 are not sieved. The threshold is lowered by their expected
+    contribution of about 2·log₂p/p (log₂2/2 for p = 2).
+  - Threshold per block: log₂(|x|·(2m + |x|)) at the block's largest |x|,
+    minus 1.75·log₂(p_max) and the small-prime allowance.
+  - `tryFactorize(x, y, roots)` divides only by primes whose roots match x mod p.
+- `qsParams` sets B = 3·L(N)^½, with a minimum of 500, and M = max(B/3, 256)·B.
+  - With B = L(N)^½, as the plan suggested, the base is far too small below
+    about 80 bits: about half of 40–70-bit semiprimes failed.
+  - With a minimum of 128 instead of 500, about 1% of 18–42-bit semiprimes
+    ran out of sieve range before finding enough relations.
+  - There is no fallback that sieves further out when relations run short.
+    `qsSplit` returns nil.
+- `go.mod` says go 1.17, so the code avoids the `min`, `max` and `clear`
+  builtins.
 
-Sieving replaces per-candidate big-integer work with integer additions over a
-byte array. Expensive division then happens only on candidates that look smooth.
-Each stage below is usable and tested on its own. The public API never changes.
+Measured with qsSplit on random balanced semiprimes, averaged per number:
 
-## Stage 1: single-polynomial sieve
+| bits | old (trial division) | sieve |
+|------|------|-------|
+| 40   | 4.4 ms | 0.19 ms |
+| 52   | 40 ms  | 0.44 ms |
+| 60   | 84 ms  | 0.82 ms |
+| 80   | –      | 5 ms    |
+| 100  | –      | 39 ms   |
+| 120  | –      | 217 ms  |
 
-Replace the `try` loop in `qsSplit`. Factor base building, `findDependencies`
-and `tryDependency` stay.
+Still open from stage 1:
 
-1. **Square roots mod p.** Add `sqrtModPrime(nmodp, p uint32) uint32`
-   (Tonelli–Shanks). Base primes fit in 32 bits, so use `uint64` arithmetic
-   with no `big.Int`. Precompute for each prime p:
-   - the root t
-   - log₂p as a byte
-   - the two starting offsets x ≡ (±t − m) mod p, where m = ⌈√N⌉
+- **Tests not written yet:**
+  - Tonelli–Shanks against brute force.
+  - The sieve, with very high slack, against brute-force `tryFactorize`.
+  - `BenchmarkQuadraticSieve`. The numbers above came from a throwaway test.
+- **`factor/main.go`:** it still limits QS to composites ≤ 64 bits
+  (`qsMaxBits`). That can go up to about 120 bits.
 
-   p = 2 has a single root and needs special handling.
-2. **Sieve in blocks.** Cover x ∈ [−M, M) in cache-sized blocks of about 32 KB
-   of `[]byte` each. For each prime, add log p at both roots, stepping by p.
-   Save each prime's next offset when a block ends instead of recomputing it.
-   Skip primes below about 30, which cost the most to sieve and add the least,
-   and lower the threshold to make up for them.
-3. **Threshold.** In a block, |Q(x)| ≈ 2·|x|·m. Use log₂ of that, computed once
-   per block from its largest |x|, minus a slack of T·log₂(p_max) with T around
-   1.5–2 (tune it). Positions scoring above the threshold are candidates.
-4. **Checking candidates.** Only for candidates, compute Q(x) as a `big.Int`.
-   Divide by p only when x mod p matches one of p's roots (an integer test).
-   That turns hundreds of big divisions per candidate into a handful. Add a
-   `tryFactorize` variant that takes the root table. The sign column is
-   unchanged: negative x still gives negative Q.
-5. **Parameters.** Replace the size steps with formulas:
-   - L(N) = exp(√(ln N · ln ln N))
-   - factor base bound B ≈ L(N)^½
-   - M chosen as a multiple of B
+## Reference: an 80-digit number
 
-   Tune both against benchmarks. If an interval doesn't produce enough
-   relations, sieve the next interval out on each side instead of giving up.
+73129071533331481181630024590293633952610077040929361500801632604572796624590389
+(266 bits) = p18 · p23 · p41:
 
-**Tests:**
+- 104194448528493551
+- 11494857165741861450481
+- 61057905163708884083219136437717059663819
 
-- Tonelli–Shanks against brute force for every prime < 10⁵, and for random
-  residues mod larger primes.
-- With the slack set very high, so every position is a candidate, the sieve
-  must find exactly the smooth values a brute-force `tryFactorize` finds over
-  the same interval.
-- The existing `qs_test.go` cases, plus random semiprimes of 30–45 bits.
-- `BenchmarkQuadraticSieve` per input size, used to tune B, M and T.
+These are easy targets for ECM: GMP-ECM with B1 = 11000 found p18 in step 2
+within a minute. `factor/msieve.log` has msieve 1.53 factoring it by SIQS in
+1 min 36 s with these settings:
 
-**Expected reach:** single-polynomial QS is the textbook version. Rough guess,
-to be confirmed by the benchmarks: practical to about 25–30 digits. Past that,
-|Q(x)| grows with x and smooth values become rare. After this stage, raise
-`qsMaxBits` in `factor/main.go` to what the benchmarks support.
+- multiplier 5
+- 12 blocks of 32 KB per polynomial
+- factor base bound 1,301,057 (49,858 primes)
+- large prime bound 1.3·10⁸ (26 bits)
+- 49,954 relations: 26,246 full and 23,708 combined from 267,452 partials
+- a sparse matrix with about 30 entries per column
+
+The current single-polynomial sieve can't get there with any choice of
+parameters:
+
+- **qsParams' own choice:** B ≈ 1.6·10⁷ (about 490k primes) and M ≈ 9·10¹³.
+- **msieve's B instead:** |Y| ≈ 2·|x|·√N is about 2¹⁷⁰ across a useful
+  interval. My rough estimate is that about 1 in 10⁸–10⁹ positions is smooth,
+  so that's days to weeks of sieving.
+- **A 50k-prime dense matrix:** about 300 MB plus the same again for the
+  combination bitsets. That's workable but slow.
+
+Reaching this size needs stages 2 and 3 below: SIQS, large primes, a multiplier
+and a sparse solver, with settings close to msieve's.
 
 ## Stage 2: cheap improvements
 
@@ -82,8 +95,8 @@ to be confirmed by the benchmarks: practical to about 25–30 digits. Past that,
   large-prime bound.
 - **Faster elimination.** `findDependencies` XORs every row for each pivot.
   That's fine for a few thousand primes, but limit the search to the rows that
-  can still be pivots and benchmark it. Block Lanczos isn't worth it at these
-  sizes.
+  can still be pivots and benchmark it. Block Lanczos isn't worth it below
+  about 20k primes, but 80-digit inputs need about 50k.
 
 ## Stage 3: many polynomials (SIQS)
 
