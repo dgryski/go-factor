@@ -56,7 +56,10 @@ compiling them. See "Fixed from the drafts" below for what was wrong in them.
     2,450 surplus rows.
   - Each XOR is recorded as a node, so dependencies of the reduced matrix
     trace back to the original relations.
-  - Dense GF(2) elimination then solves the reduced matrix.
+  - Block Lanczos (`qs/lanczos.go`, from `notes/_qs-drafts3/`) then solves
+    the reduced matrix if it has at least 1000 columns. Dense GF(2)
+    elimination solves smaller ones, and is the fallback if block Lanczos
+    finds fewer than 16 independent dependencies.
   - `TestFindDependencies` checks the dependencies against full dense
     elimination: the count, that each sums to zero, and that they're
     independent.
@@ -140,15 +143,18 @@ msieve 1.53 factoring it by SIQS in 1 min 36 s:
 - 49,954 relations: 26,246 full and 23,708 combined from 267,452 partials
 - a sparse matrix solved by block Lanczos
 
-`factor -v -methods=qs` factors it completely in about 5.5 min, about 3.4×
-msieve's time. That's from the 5-minute sieve plus the 13.6 s matrix step
+`factor -v -methods=qs` factors it completely in about 5 min, about 3×
+msieve's time. That's from the 5-minute sieve plus the 2.3 s matrix step
 measured on the saved relations, not a full run:
 
 - SIQS chose k = 5 and B = 1,570,053 (59,370 primes, M = 128K).
 - It collected 59,391 relations in 5 min.
-- Structured elimination now reduces the matrix from 59,391×59,371 to
-  15,649×15,585 in 0.8 s. The whole matrix step takes 13.6 s. It took 2 min
-  with the first version of the elimination, which reached 37,301×34,845.
+- Structured elimination reduces the matrix from 59,391×59,371 to
+  15,649×15,585 in 0.7 s, and block Lanczos solves that in 1.5 s. The whole
+  matrix step takes 2.3 s.
+- Earlier versions: 13.6 s with dense elimination on the same reduced matrix,
+  and 2 min with the first version of the elimination, which reached
+  37,301×34,845.
 - The first split found p18. QS then split the 209-bit cofactor into p23 and
   p41 in 14 s.
 
@@ -168,7 +174,8 @@ Pivot limits tried on the saved relations, with the reduced size each gave:
 ### Block Lanczos
 
 `solveBlockLanczos` from `notes/_qs-drafts2/ai_studio_code(2).go`, run
-unchanged apart from its inputs and outputs:
+unchanged apart from its inputs and outputs. The version in
+`notes/_qs-drafts3/` gave the same results:
 
 | Matrix | Block Lanczos | Dense |
 |---|---|---|
@@ -177,23 +184,51 @@ unchanged apart from its inputs and outputs:
 | unreduced 80-digit, 59,391×59,371 | none, 5.4 s | – |
 
 Its last step checks every result, so a failure means fewer dependencies,
-never wrong ones. Why it finds none on the unreduced matrix isn't confirmed.
-That matrix has about 2,400 surplus rows, which can stop the method from
-finding anything, and the draft's F term doesn't match Montgomery's formula.
+never wrong ones.
+
+**Why it fails on unreduced matrices.** It solves A·X = A·Y with A = B·Bᵀ,
+then looks for dependencies among the 64 columns of X − Y (and those of the
+last V, which is zero here). X − Y lies in ker(A). Any part of ker(A) outside
+ker(Bᵀ) costs one of those 64 columns. That part has dimension
+rank(B) − rank(B·Bᵀ), from row combinations orthogonal to every row.
+
+On the 209-bit relations:
+
+| Matrix | rank(B) | rank(B·Bᵀ) | gap | dependencies found |
+|---|---|---|---|---|
+| reduced, 3,707×3,643 | 3,641 | 3,641 | 0 | 65 |
+| unreduced, 10,328×10,308 | 9,999 | 9,977 | 22 | 42 |
+
+So 64 − gap = 42. The unreduced 80-digit matrix gives none, so its gap is
+probably at least 64, but that's an inference. Computing rank(B·Bᵀ) at 59k is
+too slow.
+
+Ruled out:
+- **Surplus rows:** trimming the unreduced 80-digit matrix to 64 surplus rows
+  (57,089×57,025) still gives none.
+- **Breakdown:** every failing run ends with V = 0 after about rows/64
+  iterations, the expected length.
+- **Size:** reduced matrices up to 30,939×30,875, needing 489 iterations,
+  work.
+
+The structured elimination's matrices had a gap of 0 in every case tried,
+which is why `findDependencies` runs block Lanczos only after it.
+
+The F term (`F_i = W_{i−2}⁻¹ · (I − S_{i−1}) · T_i · S_i`) doesn't match
+Montgomery's formula, but it found the full 64 whenever the gap was 0.
+`notes/_qs-drafts3/` doesn't compile as written: `int64(0x9e3779b97f4a7c15)`
+overflows.
 
 ## Next steps
 
-1. **Block Lanczos after the structured elimination**, falling back to dense
-   elimination if it returns too few dependencies. That would bring the
-   80-digit matrix step from 13.6 s to about 2 s.
-2. **A faster candidate check.** `tryFactorize` scans every root for each
+1. **A faster candidate check.** `tryFactorize` scans every root for each
    candidate.
    - Resieve the block for the larger primes, or keep a compact
      (p, r1, r2) array for the scan.
    - Once that's cheaper, retune the large prime slack. More candidates may
      then pay off.
-3. **Matching msieve's sieve speed.**
+2. **Matching msieve's sieve speed.**
    - Sieve the largest primes with bucket sieving rather than once per block.
    - Retune B and M for SIQS at 70–80 digits. Ours is larger than msieve's.
-4. **`factor` defaults.** Raise `qsMaxBits` once 80 digits finishes in
+3. **`factor` defaults.** Raise `qsMaxBits` once 80 digits finishes in
    minutes.

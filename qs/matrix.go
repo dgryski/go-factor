@@ -6,7 +6,14 @@ import (
 	"time"
 )
 
-const keepSurplus = 64 // rows beyond the column count kept for dependencies
+const (
+	keepSurplus = 64 // rows beyond the column count kept for dependencies
+
+	// Block Lanczos solves reduced matrices of at least lanczosMinCols
+	// columns, unless it finds fewer than lanczosMinDeps independent ones.
+	lanczosMinCols = 1000
+	lanczosMinDeps = 16
+)
 
 // pivotLimits returns the heaviest column the structured elimination pivots
 // on, and the most entries a pivot may add. Higher limits shrink large
@@ -29,7 +36,8 @@ func pivotLimits(numCols int) (weight, fill int) {
 
 // findDependencies returns subsets of relations whose exponent vectors sum
 // to zero mod 2, as bitsets over relation indices. Structured Gaussian
-// elimination shrinks the matrix and dense elimination solves what is left.
+// elimination shrinks the matrix, and block Lanczos or dense elimination
+// solves what is left.
 func findDependencies(relations []relation, numCols int) [][]uint64 {
 	start := time.Now()
 	rows := make([][]int32, len(relations))
@@ -46,6 +54,22 @@ func findDependencies(relations []relation, numCols int) [][]uint64 {
 		deps = append(deps, r.expand([]int32{node}))
 	}
 	var roots []int32
+	if denseCols >= lanczosMinCols {
+		start := time.Now()
+		bl := blockLanczos(dense, denseCols, 1)
+		indep := independentCount(bl, len(dense))
+		logf("qs: block Lanczos found %d independent dependencies in %v", indep, time.Since(start).Round(time.Millisecond))
+		if indep >= lanczosMinDeps {
+			for _, dep := range bl {
+				roots = roots[:0]
+				for _, i := range dep {
+					roots = append(roots, nodes[i])
+				}
+				deps = append(deps, r.expand(roots))
+			}
+			return deps
+		}
+	}
 	for _, combo := range denseDependencies(dense, denseCols) {
 		roots = roots[:0]
 		for w, word := range combo {
@@ -57,6 +81,19 @@ func findDependencies(relations []relation, numCols int) [][]uint64 {
 		deps = append(deps, r.expand(roots))
 	}
 	return deps
+}
+
+// independentCount returns how many of deps, subsets of numRows rows, are
+// linearly independent.
+func independentCount(deps [][]int, numRows int) int {
+	rows := make([][]int32, len(deps))
+	for i, dep := range deps {
+		rows[i] = make([]int32, len(dep))
+		for j, r := range dep {
+			rows[i][j] = int32(r)
+		}
+	}
+	return len(deps) - len(denseDependencies(rows, numRows))
 }
 
 // oddColumns returns the sorted columns that appear an odd number of times
