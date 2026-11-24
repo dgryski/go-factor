@@ -113,19 +113,21 @@ func split(n *big.Int) (*big.Int, *big.Int) {
 		return f, new(big.Int).Div(n, f)
 	}
 
-	if len(s.relations) <= s.numCols {
+	primes = s.finish(factorBase)
+	numCols := len(primes) + 1
+	if len(s.relations) <= numCols {
 		logf("qs: not enough relations, giving up")
 		return nil, nil // not enough relations to guarantee a dependency
 	}
 	if SaveDir != "" {
-		saveRelations(n, factorBase, s.relations)
+		saveRelations(n, primes, s.relations)
 	}
 	start := time.Now()
-	deps := findDependencies(s.relations, s.numCols)
+	deps := findDependencies(s.relations, numCols)
 	logf("qs: matrix %d×%d, %d dependencies in %v",
-		len(s.relations), s.numCols, len(deps), time.Since(start).Round(time.Millisecond))
+		len(s.relations), numCols, len(deps), time.Since(start).Round(time.Millisecond))
 	for i, dep := range deps {
-		if f := tryDependency(n, factorBase, s.relations, dep); f != nil {
+		if f := tryDependency(n, primes, s.relations, dep); f != nil {
 			logf("qs: dependency %d gave factor %v", i+1, f)
 			return f, new(big.Int).Div(n, f)
 		}
@@ -145,9 +147,8 @@ func logf(format string, args ...interface{}) {
 
 // logProgress reports how many relations the sieve has collected.
 func (s *sieve) logProgress() {
-	full := len(s.relations) - s.combined
 	logf("qs: %d/%d relations (%d full, %d from partials), %d partials, %d polynomials, %v",
-		len(s.relations), s.want, full, s.combined, len(s.partials), s.polys,
+		len(s.relations)+s.partialExcess, s.want, len(s.relations), s.partialExcess, len(s.partials), s.polys,
 		time.Since(s.start).Round(time.Millisecond))
 }
 
@@ -384,10 +385,18 @@ type sieve struct {
 	lpBound   uint64
 
 	relations []relation
-	partials  map[uint64]relation // partial relations by their large prime
-	seenX     map[string]bool     // min(X, n−X) for every relation and partial
-	scratch   []int32
-	buf       [blockSize]byte
+	seenX     map[string]bool // min(X, n−X) for every relation and partial
+
+	// Partial relations have one or two large primes up to lpBound left over.
+	// Cofactors up to dlpCap are split into two. Large primes that occur in
+	// more than one partial become matrix columns in finish.
+	partials      []partial
+	pMax          uint64
+	dlpCap        uint64
+	partialExcess int // surviving partials minus large primes at the last count
+	nextCount     int // len(partials) at which to count again
+	scratch       []int32
+	buf           [blockSize]byte
 
 	// Primes from bucketFrom up are sieved by walking each polynomial's
 	// interval once and filing the hits by block. A bucket entry packs
@@ -395,25 +404,28 @@ type sieve struct {
 	bucketFrom int
 	buckets    [][]uint64
 	small      []smallRoot // primes below bucketCut not dividing a
-	hits       []int32     // bucket primes hitting the current candidate
+
+	// The current block's candidates, and the bucket primes hitting each.
+	cands    []int
+	candHits [][]int32
+	candBits [blockSize / 64]uint64
+	candSlot [blockSize]uint16 // index in cands of each candidate's offset
 
 	// For progress logging.
-	combined int // relations made from two partials
-	polys    int // polynomials sieved
-	start    time.Time
-	lastLog  time.Time
+	polys   int // polynomials sieved
+	start   time.Time
+	lastLog time.Time
 }
 
 func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 	s := &sieve{
-		n:        n,
-		kn:       kn,
-		log2KN:   log2Big(kn),
-		roots:    make([]root, len(factorBase)),
-		numCols:  len(factorBase) + 1, // +1 for the sign of Y
-		partials: make(map[uint64]relation),
-		seenX:    make(map[string]bool),
-		start:    time.Now(),
+		n:       n,
+		kn:      kn,
+		log2KN:  log2Big(kn),
+		roots:   make([]root, len(factorBase)),
+		numCols: len(factorBase) + 1, // +1 for the sign of Y
+		seenX:   make(map[string]bool),
+		start:   time.Now(),
 	}
 	s.want = s.numCols + extraRelations
 
@@ -449,10 +461,18 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 	}
 
 	pMax := uint64(s.roots[len(s.roots)-1].p)
+	s.pMax = pMax
 	s.slack = singleSlack*math.Log2(float64(pMax)) + smallSlack
 	if siqs {
 		s.lpBound = largePrimeMult * pMax
 		s.slack = siqsSlack*math.Log2(float64(pMax)) + math.Log2(float64(s.lpBound))/2 + smallSlack
+		if n.BitLen() >= dlpMinBits {
+			s.dlpCap = s.lpBound * s.lpBound
+			if s.dlpCap > dlpMaxCofactor {
+				s.dlpCap = dlpMaxCofactor
+			}
+			s.slack = siqsSlack*math.Log2(float64(pMax)) + dlpSlackFrac*math.Log2(float64(s.dlpCap)) + smallSlack
+		}
 	}
 	return s
 }
@@ -496,7 +516,7 @@ func (s *sieve) siqs(sieveRange int64) *big.Int {
 	aInv := make([]uint32, len(s.roots))
 	var deltas [][]uint32
 
-	for len(s.relations) < s.want {
+	for !s.done() {
 		a, aIdx := chooseA(rng, s.roots, pool, log2Target, seen)
 		if a == nil {
 			logf("qs: ran out of polynomials")
@@ -550,7 +570,7 @@ func (s *sieve) siqs(sieveRange int64) *big.Int {
 				s.logProgress()
 				s.lastLog = time.Now()
 			}
-			if poly == 1<<uint(len(aIdx)-1) || len(s.relations) >= s.want {
+			if poly == 1<<uint(len(aIdx)-1) || s.done() {
 				break
 			}
 
@@ -728,7 +748,7 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 	s.fillBuckets(lo, hi)
 
 	var x, y big.Int
-	for blockStart, bi := lo, 0; blockStart < hi && len(s.relations) < s.want; blockStart, bi = blockStart+blockSize, bi+1 {
+	for blockStart, bi := lo, 0; blockStart < hi && !s.done(); blockStart, bi = blockStart+blockSize, bi+1 {
 		blockLen := int64(blockSize)
 		if hi-blockStart < blockLen {
 			blockLen = hi - blockStart
@@ -763,10 +783,18 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 		}
 
 		threshold := s.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack
+		s.cands = s.cands[:0]
 		for i, score := range block {
-			if float64(score) < threshold {
-				continue
+			if float64(score) >= threshold {
+				s.cands = append(s.cands, i)
 			}
+		}
+		if len(s.cands) == 0 {
+			continue
+		}
+		s.bucketHits(bucket)
+
+		for k, i := range s.cands {
 			off := blockStart + int64(i)
 			x.SetInt64(off)
 			x.Mul(&x, a)
@@ -777,25 +805,40 @@ func (s *sieve) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) *big.Int {
 			if y.Sign() == 0 {
 				continue
 			}
-			s.hits = s.hits[:0]
-			for _, e := range bucket {
-				if uint16(e) == uint16(i) {
-					s.hits = append(s.hits, int32(uint32(e>>16)))
-				}
-			}
-			factors, lp, ok := s.tryFactorize(off, &y, aIdx, s.hits)
+			factors, lp1, lp2, ok := s.tryFactorize(off, &y, aIdx, s.candHits[k])
 			if !ok {
 				continue
 			}
-			if f := s.addRelation(new(big.Int).Mod(&x, s.n), factors, lp); f != nil {
+			if f := s.addRelation(new(big.Int).Mod(&x, s.n), factors, lp1, lp2); f != nil {
 				return f
 			}
-			if len(s.relations) >= s.want {
+			if s.done() {
 				break
 			}
 		}
 	}
 	return nil
+}
+
+// bucketHits sets s.candHits to the bucket primes hitting each candidate.
+func (s *sieve) bucketHits(bucket []uint64) {
+	for len(s.candHits) < len(s.cands) {
+		s.candHits = append(s.candHits, nil)
+	}
+	for k, i := range s.cands {
+		s.candBits[i/64] |= 1 << (uint(i) % 64)
+		s.candSlot[i] = uint16(k)
+		s.candHits[k] = s.candHits[k][:0]
+	}
+	for _, e := range bucket {
+		if j := uint16(e); s.candBits[j/64]&(1<<(j%64)) != 0 {
+			k := s.candSlot[j]
+			s.candHits[k] = append(s.candHits[k], int32(uint32(e>>16)))
+		}
+	}
+	for _, i := range s.cands {
+		s.candBits[i/64] = 0
+	}
 }
 
 // fillBuckets files every hit in [lo, hi) of the primes from s.bucketFrom up
@@ -863,8 +906,8 @@ func nextOffset(start int64, root, p uint32) uint32 {
 // tryFactorize attempts to factor y = Y(x) over the factor base. It divides
 // by the small primes whose roots match x and by the bucket primes in hits.
 // A relation's Y is a·Y(x), so each prime of a is counted once more. A
-// cofactor that is a prime up to the large prime bound is returned as lp.
-func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp uint64, ok bool) {
+// cofactor made of one or two primes up to lpBound is returned as lp1, lp2.
+func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp1, lp2 uint64, ok bool) {
 	factors = s.scratch[:0]
 	temp := new(big.Int).Abs(y)
 	if y.Sign() < 0 {
@@ -906,12 +949,22 @@ func (s *sieve) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fac
 	// Every prime up to the largest base prime has been divided out, so a
 	// cofactor below its square is prime.
 	if temp.Cmp(one) != 0 {
-		if !temp.IsUint64() || temp.Uint64() > s.lpBound {
-			return nil, 0, false
+		if !temp.IsUint64() {
+			return nil, 0, 0, false
 		}
-		lp = temp.Uint64()
+		c := temp.Uint64()
+		switch {
+		case c <= s.lpBound:
+			lp1 = c
+		case c <= s.dlpCap:
+			if lp1, lp2, ok = splitCofactor(c, s.pMax, s.lpBound); !ok {
+				return nil, 0, 0, false
+			}
+		default:
+			return nil, 0, 0, false
+		}
 	}
-	return append([]int32(nil), factors...), lp, true
+	return append([]int32(nil), factors...), lp1, lp2, true
 }
 
 // smallRoot packs what tryFactorize needs to test a small prime.
@@ -920,10 +973,10 @@ type smallRoot struct {
 	p, r1, r2 uint32
 }
 
-// addRelation records a relation, combining it with an earlier partial
-// relation if it has the same large prime lp. It returns a factor of n if lp
+// addRelation records a full relation, or a partial one with large primes
+// lp1 and lp2 (0 if absent). It returns a factor of n if a large prime
 // divides n.
-func (s *sieve) addRelation(x *big.Int, factors []int32, lp uint64) *big.Int {
+func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.Int {
 	// Every polynomial gives Y = X² − kN, so different polynomials can find
 	// the same X, and −X gives the same Y. Either way the copy only adds a
 	// trivial dependency.
@@ -939,29 +992,134 @@ func (s *sieve) addRelation(x *big.Int, factors []int32, lp uint64) *big.Int {
 		s.seenX[k] = true
 	}
 
-	if lp == 0 {
+	var r, l big.Int
+	for _, lp := range [2]uint64{lp1, lp2} {
+		if lp != 0 && r.Mod(s.n, l.SetUint64(lp)).Sign() == 0 {
+			return new(big.Int).SetUint64(lp)
+		}
+	}
+	if lp1 != 0 && lp1 == lp2 {
+		// X² ≡ Y·L² gives (X/L)² ≡ Y.
+		x.Mul(x, new(big.Int).ModInverse(l.SetUint64(lp1), s.n))
+		x.Mod(x, s.n)
+		lp1, lp2 = 0, 0
+	}
+	if lp1 == 0 {
 		s.relations = append(s.relations, relation{X: x, Factors: factors})
 		return nil
 	}
-
-	prev, ok := s.partials[lp]
-	if !ok {
-		s.partials[lp] = relation{X: x, Factors: factors}
-		return nil
+	s.partials = append(s.partials, partial{relation{X: x, Factors: factors}, lp1, lp2})
+	if len(s.partials) >= s.nextCount {
+		s.partialExcess, _, _ = s.countPartials()
+		s.nextCount = len(s.partials) + len(s.partials)/20 + 1000
 	}
-	// X1² ≡ Y1·L and X2² ≡ Y2·L give (X1·X2/L)² ≡ Y1·Y2.
-	l := new(big.Int).SetUint64(lp)
-	lInv := new(big.Int).ModInverse(l, s.n)
-	if lInv == nil {
-		return l // a prime that isn't invertible divides n
-	}
-	x.Mul(x, prev.X)
-	x.Mul(x, lInv)
-	x.Mod(x, s.n)
-	combined := append(append([]int32(nil), prev.Factors...), factors...)
-	s.relations = append(s.relations, relation{X: x, Factors: combined})
-	s.combined++
 	return nil
+}
+
+// done reports whether the relations found so far, counting the partials
+// that survive pruning, give a matrix with at least s.want surplus rows.
+func (s *sieve) done() bool {
+	return len(s.relations)+s.partialExcess >= s.want
+}
+
+// partial is a relation X² ≡ Y·lp1·lp2 (mod n), with lp2 = 0 if absent.
+type partial struct {
+	relation
+	lp1, lp2 uint64
+}
+
+// countPartials repeatedly drops the partials containing a large prime that
+// no other surviving partial has, since they can't be in any dependency. It
+// returns the surviving partials minus the large primes they use, which
+// partials survive, and the column of each surviving large prime counted
+// from 0.
+func (s *sieve) countPartials() (excess int, alive []bool, cols map[uint64]int32) {
+	degree := make(map[uint64]int, len(s.partials))
+	byPrime := make(map[uint64][]int32, len(s.partials))
+	for i, p := range s.partials {
+		for _, lp := range [2]uint64{p.lp1, p.lp2} {
+			if lp != 0 {
+				degree[lp]++
+				byPrime[lp] = append(byPrime[lp], int32(i))
+			}
+		}
+	}
+	alive = make([]bool, len(s.partials))
+	for i := range alive {
+		alive[i] = true
+	}
+	var queue []uint64
+	for lp, d := range degree {
+		if d == 1 {
+			queue = append(queue, lp)
+		}
+	}
+	for len(queue) > 0 {
+		lp := queue[len(queue)-1]
+		queue = queue[:len(queue)-1]
+		if degree[lp] != 1 {
+			continue
+		}
+		for _, i := range byPrime[lp] {
+			if !alive[i] {
+				continue
+			}
+			alive[i] = false
+			for _, q := range [2]uint64{s.partials[i].lp1, s.partials[i].lp2} {
+				if q != 0 {
+					if degree[q]--; degree[q] == 1 {
+						queue = append(queue, q)
+					}
+				}
+			}
+		}
+	}
+	cols = make(map[uint64]int32)
+	for _, lp := range sortedKeys(degree) {
+		if degree[lp] > 0 {
+			cols[lp] = int32(len(cols))
+		}
+	}
+	for _, a := range alive {
+		if a {
+			excess++
+		}
+	}
+	return excess - len(cols), alive, cols
+}
+
+func sortedKeys(m map[uint64]int) []uint64 {
+	keys := make([]uint64, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	return keys
+}
+
+// finish adds the surviving partials to s.relations, with a column for each
+// large prime they use, and returns the prime of each column after the sign:
+// the factor base, then the large primes.
+func (s *sieve) finish(factorBase []int64) []int64 {
+	_, alive, cols := s.countPartials()
+	primes := make([]int64, len(factorBase)+len(cols))
+	copy(primes, factorBase)
+	for lp, c := range cols {
+		primes[len(factorBase)+int(c)] = int64(lp)
+	}
+	base := int32(len(factorBase) + 1)
+	for i, p := range s.partials {
+		if !alive[i] {
+			continue
+		}
+		f := append(p.Factors, base+cols[p.lp1])
+		if p.lp2 != 0 {
+			f = append(f, base+cols[p.lp2])
+		}
+		s.relations = append(s.relations, relation{X: p.X, Factors: f})
+	}
+	s.partials = nil
+	return primes
 }
 
 // tryDependency combines the relations selected by dep into a congruence of
@@ -1005,3 +1163,11 @@ func tryDependency(n *big.Int, factorBase []int64, relations []relation, dep []u
 	}
 	return nil
 }
+
+// Double large primes are still being tuned, so they're off by default. Set
+// dlpMinBits to turn them on for inputs of at least that many bits.
+var (
+	dlpMinBits            = 1 << 30
+	dlpSlackFrac          = 0.5 // threshold allowance, as a fraction of log2(dlpCap)
+	dlpMaxCofactor uint64 = 1 << 50
+)

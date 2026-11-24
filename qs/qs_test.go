@@ -81,7 +81,7 @@ func TestSqrtModPrime(t *testing.T) {
 // these semiprimes are all far above the factor base.
 func TestRelations(t *testing.T) {
 	rnd := rand.New(rand.NewSource(2))
-	for _, bits := range []int{30, 45, 60} {
+	for _, bits := range []int{30, 45, 60, 80} {
 		n := new(big.Int).Mul(testutil.RandomPrime(rnd, bits), testutil.RandomPrime(rnd, bits))
 		b, siqs, sieveRange := params(n)
 		kn := new(big.Int).Mul(n, big.NewInt(knuthSchroeppel(n)))
@@ -92,16 +92,17 @@ func TestRelations(t *testing.T) {
 		} else {
 			sv.singlePoly(sieveRange)
 		}
-		if len(sv.relations) < sv.want {
-			t.Errorf("%v: found %d relations, want %d", n, len(sv.relations), sv.want)
+		if !sv.done() {
+			t.Errorf("%v: found %d relations and %d partials, want %d", n, len(sv.relations), len(sv.partials), sv.want)
 		}
+		primes := sv.finish(factorBase)
 		for _, rel := range sv.relations {
 			y := big.NewInt(1)
 			for _, c := range rel.Factors {
 				if c == 0 {
 					y.Neg(y)
 				} else {
-					y.Mul(y, big.NewInt(factorBase[c-1]))
+					y.Mul(y, big.NewInt(primes[c-1]))
 				}
 			}
 			lhs := new(big.Int).Mul(rel.X, rel.X)

@@ -261,17 +261,81 @@ block Lanczos alone on the unreduced matrix.
 iteration on a random 450×400 matrix, and they agree. That supports the
 simpler form but doesn't prove it in general.
 
+## Double large primes (in progress, uncommitted, 2026-11-24)
+
+Started from `notes/_qs-drafts6/`. The code is committed, with double large
+primes off by default (`dlpMinBits = 1 << 30`), because no setting measured
+so far is faster. Tuning was stopped part way.
+
+**Changes:**
+- **`qs/dlp.go`:** `isPrime64`, exact Miller–Rabin for `uint64` with the
+  7-base set from https://miller-rabin.appspot.com; `rho64`, Brent's rho; and
+  `splitCofactor`.
+  - Both use Montgomery arithmetic (`mont`), because `bits.Div64` is software
+    on arm64. With `bits.Div64`, splitting took 36% of a 240-bit run.
+- **`qs/dlp_test.go`:** `isPrime64` against a sieve below 200,000 and known
+  strong pseudoprimes; `splitCofactor` on random products of two large primes.
+- **`qs/qs.go`:**
+  - `tryFactorize` returns up to two large primes. Cofactors from lpBound up to
+    `dlpCap` (lpBound², at most 2⁵⁰) go to `splitCofactor`.
+  - Partials are kept in a list, not combined on the second hit.
+    `countPartials` repeatedly drops partials with a large prime that no other
+    partial has. `finish` gives each surviving large prime a matrix column, so
+    the structured elimination does the combining. This applies to
+    single-large-prime partials too.
+  - `done` stops sieving once full relations plus surviving partials, minus
+    their large primes, reach `want`. The count is redone each time the
+    partials grow by 5% plus 1000, so runs overshoot by up to about 6%.
+  - `finish` returns the column primes, the factor base followed by the large
+    primes. `tryDependency` and the relation file work unchanged with it.
+  - A cofactor L·L becomes a full relation with X·L⁻¹. A large prime that
+    divides n is returned as a factor.
+  - Bucket hits are collected once per block with a candidate bitmask
+    (`bucketHits`) instead of scanning the bucket for each candidate. This
+    went in just before tuning was stopped and hasn't been timed.
+- **`qs/dlptune_test.go`:** the sweep, skipped unless run with
+  `go test ./qs -run DLPTune -v -tune`.
+
+**Tuning variables, still `var`s at the end of `qs/qs.go`:**
+- `dlpMinBits` is 1 << 30, which turns double large primes off. The sweep
+  sets it to 0.
+- `dlpSlackFrac` is 0.5. The threshold allowance is that fraction of
+  log₂(dlpCap), replacing half of log₂(lpBound).
+- `dlpMaxCofactor` is 2⁵⁰.
+
+**Measured, with Montgomery arithmetic but before `bucketHits`, on fixed
+semiprimes (seed 7):**
+
+| bits | off | 0.3 | 0.35 | 0.4 | 0.45 | 0.55 |
+|---|---|---|---|---|---|---|
+| 219 | 6.43 s | 6.37 s | 6.73 s | 7.14 s | 7.95 s | 11.0 s |
+| 240 | 23.2 s | 23.0 s | 23.7 s | 24.3 s | 26.2 s | 33.0 s |
+
+At 240 bits, 0.55 needs 27,113 polynomials against 40,332 with double large
+primes off, but each polynomial costs more. The best setting only breaks even
+at 240 bits. Off, the column approach matches the old combining code: 23.2 s
+against 21.6 s committed, with the difference from the overshoot.
+
+**Profile at 240 bits with 0.45, before `bucketHits`:**
+- `sievePoly` was 34% of the time by itself, and `fillBuckets` 25%.
+- `tryFactorize` was 13%, `splitCofactor` 6%, and `runtime.madvise` 6%.
+- Much of `sievePoly`'s own time was likely the per-candidate bucket scan,
+  which costs the bucket size times the number of candidates. That's what
+  `bucketHits` replaces.
+
+**Not done:**
+- Timing `bucketHits`, then rerunning the sweep at 219 and 240 bits and at 80
+  digits.
+- Choosing `dlpMinBits` and the slack fraction, then making the variables
+  constants.
+- A full 80-digit run with double large primes.
+- Trying resieving for primes below `bucketCut` again, if candidate counts
+  stay high.
+- Tightening the recount near the end, so runs overshoot less than 6%.
+
 ## Next steps
 
-1. **Double large primes** (`notes/_qs-drafts6/`).
-   - `classifyCofactor` splits cofactors up to about 2⁵⁰ with `uint64`
-     Miller–Rabin and Brent's rho.
-   - Large primes become extra matrix columns after pruning those that appear
-     only once, so the structured elimination merges their chains.
-   - Still needed: a periodic recount on the large-prime graph to know when
-     to stop sieving, and `tryDependency` support for large-prime columns.
-   - Then retune slack and the large-prime multiplier upward, and try
-     resieving again.
+1. **Finish double large primes** (above).
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
 3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile.
 4. **`factor` defaults.** Raise `qsMaxBits`, since 80 digits now takes under

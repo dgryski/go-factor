@@ -55,6 +55,7 @@ func TestRelationsRoundTrip(t *testing.T) {
 	factorBase := buildFactorBase(kn, primesUpTo(b))
 	s := newSieve(n, kn, factorBase, siqs)
 	s.siqs(sieveRange)
+	factorBase = s.finish(factorBase)
 
 	var buf bytes.Buffer
 	if err := writeRelations(&buf, n, factorBase, s.relations); err != nil {
