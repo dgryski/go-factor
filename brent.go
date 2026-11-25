@@ -3,6 +3,7 @@ package factor
 import (
 	"context"
 	"math/big"
+	"time"
 )
 
 func checkGCD(n, g *big.Int) (newN, newG *big.Int, ok bool) {
@@ -28,6 +29,9 @@ func BrentContext(ctx context.Context, n *big.Int, start, c int64) (primes, comp
 	if n.ProbablyPrime(10) {
 		return []*big.Int{n}, nil
 	}
+
+	t0 := time.Now()
+	logf("brent: x^2%+d from %d on %d bits", c, start, n.BitLen())
 
 	bigc := big.NewInt(c)
 	f := func(x *big.Int) {
@@ -82,16 +86,19 @@ func BrentContext(ctx context.Context, n *big.Int, start, c int64) (primes, comp
 		return g
 	}
 
+	terms, batch := 0, 0
+
 	// found splits n by g, or gives up if g is n.
 	found := func(g *big.Int) (primes, composites []*big.Int) {
 		if g.Cmp(n) == 0 {
+			logf("brent: x^2%+d found only n after %d terms in %v", c, terms, since(t0))
 			return nil, []*big.Int{n}
 		}
+		logf("brent: x^2%+d found %v after %d terms in %v", c, g, terms, since(t0))
 		return split(new(big.Int).Div(n, g), g)
 	}
 
 	// A batch never spans two rounds, since x1 changes between them.
-	terms, batch := 0, 0
 loop:
 	for terms < (1 << 16) {
 		for j := 0; j < limit; j++ {
@@ -102,6 +109,7 @@ loop:
 
 			if x1.Cmp(x2) == 0 {
 				// The sequence cycled mod n without finding a factor.
+				logf("brent: x^2%+d cycled after %d terms", c, terms)
 				break loop
 			}
 
@@ -116,6 +124,7 @@ loop:
 					return found(g)
 				}
 				if ctx.Err() != nil {
+					logf("brent: x^2%+d stopped after %d terms in %v", c, terms, since(t0))
 					return nil, []*big.Int{n}
 				}
 				product.SetInt64(1)
@@ -139,5 +148,6 @@ loop:
 		}
 	}
 
+	logf("brent: x^2%+d found nothing in %d terms in %v", c, terms, since(t0))
 	return nil, []*big.Int{n}
 }

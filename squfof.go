@@ -68,7 +68,8 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 	t := big.NewInt(0)
 
 	var foundSquare bool
-	for i := uint64(0); i < B64; i++ {
+	var i uint64
+	for ; i < B64; i++ {
 
 		/* q = (s + P) / Q */
 		q.Add(s, P)
@@ -107,8 +108,10 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 	}
 
 	if !foundSquare {
+		logf("squfof: k=%d found no square in %d iterations on %d bits", k, B64, n.BitLen())
 		return primes, []*big.Int{n}
 	}
+	logf("squfof: k=%d found square %v^2 after %d iterations", k, Qprev, i)
 
 	// alias so the formulas stay correct
 	r := Qprev
@@ -148,6 +151,7 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 	}
 
 	if newN, newG, ok := checkGCD(n, Q); ok {
+		logf("squfof: k=%d found %v", k, newG)
 		pr, co := Squfof(newN, k)
 		primes, composites = append(primes, pr...), append(composites, co...)
 		pr, co = Squfof(newG, k)
@@ -155,6 +159,7 @@ func Squfof(n *big.Int, k int64) (primes, composites []*big.Int) {
 		return primes, composites
 	}
 
+	logf("squfof: k=%d square gave a trivial factor", k)
 	return nil, []*big.Int{n}
 }
 

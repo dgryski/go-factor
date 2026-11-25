@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"math/bits"
 	"math/rand"
+	"time"
 )
 
 // PPlus1 factors n with Williams' p+1 method, trying up to tries starting values.
@@ -56,6 +57,7 @@ func (e *pplus1) factor(n *big.Int) (primes, composites []*big.Int) {
 
 	for e.tries > 0 && e.ctx.Err() == nil {
 		e.tries--
+		logf("p+1: try with B1=%d, B2=%d on %d bits, %d tries left", e.b1, e.b2, n.BitLen(), e.tries)
 		g := e.try(n)
 		if g == nil {
 			continue
@@ -93,6 +95,7 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 	}
 
 	// Stage 1 sets v = V_k(P) where k is the product of prime powers up to b1.
+	t0 := time.Now()
 	saved := new(big.Int).Set(&v)
 	start := 0
 	for i, q := range e.primes {
@@ -107,6 +110,7 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 		}
 		if check(&v); g.Cmp(one) == 0 {
 			if e.ctx.Err() != nil {
+				logf("p+1: stage 1 stopped after %d of %d primes in %v", i+1, len(e.primes), since(t0))
 				return nil
 			}
 			saved.Set(&v)
@@ -126,11 +130,14 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 				}
 			}
 			if g.Cmp(n) == 0 {
+				logf("p+1: stage 1 found only n in %v", since(t0))
 				return nil
 			}
 		}
+		logf("p+1: stage 1 found %v in %v", &g, since(t0))
 		return new(big.Int).Set(&g)
 	}
+	logf("p+1: stage 1 found nothing in %v", since(t0))
 
 	return e.stage2(n, &v)
 }
@@ -143,6 +150,7 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 // so the product of V_c - V_m over the baby steps m covers both c-m and c+m.
 // Both sequences step with V_(j+d) = V_j V_d - V_(j-d).
 func (e *pplus1) stage2(n, v *big.Int) *big.Int {
+	start := time.Now()
 	e.sieve()
 	var t, q big.Int
 	mulSub := func(z, x, y, w *big.Int) {
@@ -197,11 +205,18 @@ func (e *pplus1) stage2(n, v *big.Int) *big.Int {
 			g.GCD(nil, nil, acc, n)
 			if g.Cmp(one) != 0 {
 				if g.Cmp(n) == 0 {
+					logf("p+1: stage 2 found only n in %v", since(start))
 					return nil
 				}
+				logf("p+1: stage 2 found %v in %v", &g, since(start))
 				return &g
 			}
-			if last || e.ctx.Err() != nil {
+			if last {
+				logf("p+1: stage 2 found nothing in %v", since(start))
+				return nil
+			}
+			if e.ctx.Err() != nil {
+				logf("p+1: stage 2 stopped at %d of %d in %v", base, e.b2, since(start))
 				return nil
 			}
 		}

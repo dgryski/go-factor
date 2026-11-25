@@ -20,7 +20,7 @@ var allMethods = []string{"trial", "brent", "p-1", "p+1", "squfof", "ecm", "qs"}
 func main() {
 	// 21251589199163473368424683523876245871651712859289
 
-	verbose := flag.Bool("v", false, "log progress during the quadratic sieve")
+	verbose := flag.Bool("v", false, "log the progress of each method's stages")
 	qsSave := flag.String("qs-save", "", "directory to save the quadratic sieve's relations in, as <n>.rel")
 	workers := flag.Int("workers", 0, "goroutines for ECM curves and quadratic sieving (0 means GOMAXPROCS)")
 	methods := flag.String("methods", strings.Join(allMethods, ","), "comma-separated methods to run, always in the order "+strings.Join(allMethods, ","))
@@ -28,6 +28,7 @@ func main() {
 
 	if *verbose {
 		qs.Logf = log.Printf
+		factor.Logf = log.Printf
 	}
 	qs.SaveDir = *qsSave
 	qs.Workers = *workers

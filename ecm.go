@@ -2,10 +2,13 @@ package factor
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"math/rand"
 	"runtime"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // ECMWorkers is the most goroutines ECM runs curves on. 0 means
@@ -97,17 +100,26 @@ func (e *ecm) search(n *big.Int) *big.Int {
 	ctx, cancel := context.WithCancel(e.ctx)
 	defer cancel()
 
+	type result struct {
+		g     *big.Int
+		sigma int64
+		stage int
+	}
+
+	t0 := time.Now()
+	curves := e.curves
+	var st curveStats
 	sigmas := make(chan int64)
-	found := make(chan *big.Int, 1)
+	found := make(chan result, 1)
 	var wg sync.WaitGroup
 	for w := 0; w < e.workers && w < e.curves; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for sigma := range sigmas {
-				if g := e.curve(ctx, n, sigma); g != nil {
+				if g, stage := e.curve(ctx, n, sigma, &st); g != nil {
 					select {
-					case found <- g:
+					case found <- result{g, sigma, stage}:
 						cancel()
 					default:
 					}
@@ -130,34 +142,82 @@ send:
 	close(sigmas)
 	wg.Wait()
 
+	var res result
 	select {
-	case g := <-found:
-		return g
+	case res = <-found:
 	default:
-		return nil
 	}
+	if Logf != nil {
+		what := "found nothing"
+		switch {
+		case res.g != nil:
+			what = fmt.Sprintf("sigma=%d found %v in stage %d", res.sigma, res.g, res.stage)
+		case e.ctx.Err() != nil:
+			what = "stopped"
+		}
+		logf("ecm: %s after %d of %d curves (%d reached stage 2) on %d bits in %v; %v",
+			what, curves-e.curves, curves, st.curves2.Load(), n.BitLen(), since(t0), &st)
+	}
+	return res.g
+}
+
+// curveStats adds up the time curves spend in each stage.
+type curveStats struct {
+	curves1, curves2 atomic.Int64 // curves that finished each stage
+	time1, time2     atomic.Int64 // nanoseconds in each stage
+}
+
+func (s *curveStats) String() string {
+	avg := func(t, n int64) time.Duration {
+		if n == 0 {
+			return 0
+		}
+		return time.Duration(t / n).Round(time.Microsecond)
+	}
+	return fmt.Sprintf("stage 1 %v/curve, stage 2 %v/curve",
+		avg(s.time1.Load(), s.curves1.Load()), avg(s.time2.Load(), s.curves2.Load()))
 }
 
 // curve runs both stages on the curve for sigma and returns a proper factor
-// of n or nil. It gives up when ctx is done.
-func (e *ecm) curve(ctx context.Context, n *big.Int, sigma int64) *big.Int {
+// of n or nil, and the stage it stopped in. It gives up when ctx is done.
+func (e *ecm) curve(ctx context.Context, n *big.Int, sigma int64, st *curveStats) (*big.Int, int) {
 	c := &ecCurve{n: n}
 	var p xzPoint
-	if g := c.torsion12(&p, sigma); g != nil {
-		return c.proper(g)
+	t0 := time.Now()
+	g, more := e.stage1(ctx, c, &p, sigma)
+	st.curves1.Add(1)
+	st.time1.Add(int64(time.Since(t0)))
+	if !more {
+		return g, 1
+	}
+
+	t0 = time.Now()
+	g = e.stage2(ctx, c, &p)
+	st.curves2.Add(1)
+	st.time2.Add(int64(time.Since(t0)))
+	return g, 2
+}
+
+// stage1 sets p to the starting point for sigma times every prime power up
+// to b1. It returns a proper factor of n or nil, and whether stage 2 should
+// run.
+func (e *ecm) stage1(ctx context.Context, c *ecCurve, p *xzPoint, sigma int64) (*big.Int, bool) {
+	n := c.n
+	if g := c.torsion12(p, sigma); g != nil {
+		return c.proper(g), false
 	}
 
 	// Stage 1 multiplies P by every prime power up to b1. A prime of n shows
 	// up in gcd(Z, n) once P = O mod that prime.
 	saved := new(xzPoint)
-	saved.set(&p)
+	saved.set(p)
 	start := 0
 	for i, q := range e.primes {
 		k := uint64(q)
 		for k*uint64(q) <= uint64(e.b1) {
 			k *= uint64(q)
 		}
-		c.mul(&p, &p, k)
+		c.mul(p, p, k)
 
 		if (i+1)%ecmStage1Batch != 0 && i+1 != len(e.primes) {
 			continue
@@ -165,29 +225,29 @@ func (e *ecm) curve(ctx context.Context, n *big.Int, sigma int64) *big.Int {
 		g, _ := c.split(&p.z)
 		if g == nil {
 			if ctx.Err() != nil {
-				return nil
+				return nil, false
 			}
-			saved.set(&p)
+			saved.set(p)
 			start = i + 1
 			continue
 		}
 		if g != n {
-			return g
+			return g, false
 		}
 		// Every prime of n was found in this batch. Redo it one prime at a time.
 		p.set(saved)
 		for _, q := range e.primes[start : i+1] {
 			for k := uint64(q); k <= uint64(e.b1); k *= uint64(q) {
-				c.mul(&p, &p, uint64(q))
+				c.mul(p, p, uint64(q))
 				if g, _ := c.split(&p.z); g != nil {
-					return c.proper(g)
+					return c.proper(g), false
 				}
 			}
 		}
-		return nil
+		return nil, false
 	}
 
-	return e.stage2(ctx, c, &p)
+	return nil, true
 }
 
 // stage2 looks for one more prime q in (b1, b2] with q*P = O mod a prime of n.
