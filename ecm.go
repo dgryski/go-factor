@@ -1,17 +1,25 @@
 package factor
 
 import (
+	"context"
 	"math/big"
 	"math/rand"
 )
 
-// ECM factors n with Lenstra's elliptic curve method, trying up to curves curves.
+// ECM factors n with Lenstra's elliptic curve method, trying up to curves
+// curves with stage 2 bound 100*b1.
 // See https://en.wikipedia.org/wiki/Lenstra_elliptic-curve_factorization
 //
 // It uses Montgomery curves with torsion Z/12 and x-only arithmetic, so stage
 // 1 needs no inversions, and a baby-step giant-step stage 2 as in MIRACL's
 // factor.c.
 func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
+	return ECMContext(context.Background(), n, b1, ecmB2Multiplier*b1, curves)
+}
+
+// ECMContext is ECM with stage 2 bound b2. It stops early when ctx is done,
+// abandoning the curve in progress, and returns what it has found so far.
+func ECMContext(ctx context.Context, n *big.Int, b1, b2, curves int) (primes, composites []*big.Int) {
 	if n.Cmp(one) <= 0 {
 		return nil, nil
 	}
@@ -19,17 +27,17 @@ func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
 		return []*big.Int{n}, nil
 	}
 
-	b2 := ecmB2Multiplier * b1
+	if b2 < b1 {
+		b2 = b1
+	}
 	e := &ecm{
+		ctx:     ctx,
 		rnd:     rand.New(rand.NewSource(1)),
 		b1:      b1,
 		b2:      b2,
 		primes:  sievePrimes(b1),
-		isPrime: make([]uint64, (b2+ecmD)/64+1),
+		isPrime: primeBits(b2 + ecmD),
 		curves:  curves,
-	}
-	for _, p := range sievePrimes(b2) {
-		e.isPrime[p/64] |= 1 << (p % 64)
 	}
 	for m := 1; m <= ecmD/2; m += 2 {
 		if gcdInt(m, ecmD) == 1 {
@@ -53,6 +61,7 @@ const (
 )
 
 type ecm struct {
+	ctx     context.Context
 	rnd     *rand.Rand
 	b1, b2  int
 	primes  []int    // primes <= b1
@@ -74,7 +83,7 @@ func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
 		return []*big.Int{n}, nil
 	}
 
-	for e.curves > 0 {
+	for e.curves > 0 && e.ctx.Err() == nil {
 		e.curves--
 		g := e.curve(n)
 		if g == nil {
@@ -117,6 +126,9 @@ func (e *ecm) curve(n *big.Int) *big.Int {
 		}
 		g, _ := c.split(&p.z)
 		if g == nil {
+			if e.ctx.Err() != nil {
+				return nil
+			}
 			saved.set(&p)
 			start = i + 1
 			continue
@@ -203,7 +215,7 @@ func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
 				return &g
 			}
 		}
-		if last {
+		if last || steps%ecmStage2Batch == 0 && e.ctx.Err() != nil {
 			return nil
 		}
 
@@ -510,6 +522,29 @@ func gcdInt(a, b int) int {
 		a, b = b, a%b
 	}
 	return a
+}
+
+// primeBits returns a bitset with bit p set for each prime p <= max.
+func primeBits(max int) []uint64 {
+	bits := make([]uint64, max/64+1)
+	if max < 2 {
+		return bits
+	}
+	// Mark the odd numbers >= 3, then clear the odd composites.
+	for i := range bits {
+		bits[i] = 0xAAAAAAAAAAAAAAAA
+	}
+	bits[0] = bits[0]&^(1<<1) | 1<<2
+	bits[len(bits)-1] &= 1<<(max%64+1) - 1
+	for i := 3; i*i <= max; i += 2 {
+		if bits[i/64]&(1<<(i%64)) == 0 {
+			continue
+		}
+		for j := i * i; j <= max; j += 2 * i {
+			bits[j/64] &^= 1 << (j % 64)
+		}
+	}
+	return bits
 }
 
 // sievePrimes returns the primes <= max.

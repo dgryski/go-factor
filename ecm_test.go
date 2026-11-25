@@ -1,8 +1,10 @@
 package factor
 
 import (
+	"context"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/dgryski/go-factor/internal/testutil"
 )
@@ -101,5 +103,35 @@ func TestECMTorsion12(t *testing.T) {
 				t.Errorf("p=%d k=%d: order*P is not O", p, k)
 			}
 		}
+	}
+}
+
+func TestPrimeBits(t *testing.T) {
+	for _, max := range []int{0, 1, 2, 3, 63, 64, 65, 127, 128, 1000, 100003} {
+		bits := primeBits(max)
+		want := make(map[int]bool)
+		for _, p := range sievePrimes(max) {
+			want[p] = true
+		}
+		for i := 0; i < len(bits)*64; i++ {
+			if got := bits[i/64]&(1<<(i%64)) != 0; got != want[i] {
+				t.Errorf("primeBits(%d): bit %d = %v, want %v", max, i, got, want[i])
+			}
+		}
+	}
+}
+
+func TestECMContextCancel(t *testing.T) {
+	// A 30 digit prime times a 40 digit prime, which ECM at this B1 will not split.
+	n := product(nextPrime("314159265358979323846264338327"), nextPrime("2718281828459045235360287471352662497757"))
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	p, c := ECMContext(ctx, n, 1000000, 100000000, 1000)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("ECMContext took %v after a 50ms deadline", elapsed)
+	}
+	if len(p) != 0 || len(c) != 1 || c[0].Cmp(n) != 0 {
+		t.Errorf("ECMContext = %v, %v, want n back", p, c)
 	}
 }
