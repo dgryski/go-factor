@@ -597,6 +597,35 @@ prime powers is now one exponent:
 | 60 | 48 ms | 5 ms | 86 ms |
 | 80 | 83 ms | 6 ms | 109 ms |
 
+**p+1.** Stage 2 ran a full Lucas chain, about 40 multiplies, for every
+prime up to B2. It now uses the same baby steps and giant steps as ECM.
+With v = a + 1/a and Q = 1,
+
+    V_c − V_m = (a^(c+m) − 1)(a^(c−m) − 1) / a^c,
+
+so one product term covers both c − m and c + m, and both sequences step
+with V_(j+d) = V_j·V_d − V_(j−d). That's about one multiply per prime.
+- `stage2.go` holds what ECM and p+1 share: the prime bitset, the baby
+  steps, and the first and last giant steps. The bitset is built when stage
+  2 starts, so a deadline that passes in stage 1 doesn't pay for it. That
+  matters for p+1: sieving to B2 = 2.5×10⁷ takes 32 ms, more than p+1's whole
+  share at 60 digits.
+- `TestPPlus1Stage2Edges` puts the large prime of p + 1 just above B1,
+  either side of a giant step, either side of the boundary between giant
+  steps, and in the last giant step below B2. It fails with stage 2 stubbed
+  out, and when only c + m is tested.
+- `factor` now runs p+1 three times with B1 = 2.5×10⁵, five times the B1 of
+  the last ECM level, as GMP-ECM suggests. With no deadline that takes about
+  1 s on a 60-digit number.
+
+One try:
+
+| digits | before, B1=10⁴ | B1=10⁴ | B1=5×10⁴ | B1=2.5×10⁵ |
+|---|---|---|---|---|
+| 40 | 382 ms | 25 ms | 69 ms | 269 ms |
+| 60 | 452 ms | 15 ms | 71 ms | 337 ms |
+| 80 | 489 ms | 16 ms | 74 ms | 349 ms |
+
 End to end with default methods:
 
 | composite | at the start | ECM sized | everything sized | found by |
@@ -608,9 +637,10 @@ End to end with default methods:
 | 40 + 40 digits, qs in `-methods` | 87.7 s | 36.7 s | – | QS |
 
 **Not done:**
-- p+1 stage 2 runs a full Lucas chain for each prime, so one try at
-  B1 = 10⁴ takes about 450 ms. The baby-step giant-step stage 2 from ECM
-  would make it about one multiply per prime.
+- The deadlines are wall-clock time, so which method finds a factor can vary
+  between runs. The 12 + 48 digit number needs p−1 to reach B1 = 35407
+  within about 18 ms. It usually does, but the first run of a freshly built
+  binary is slower on macOS, and then ECM found it instead.
 - ECM curves run on one goroutine while QS uses all the cores. Running
   curves in parallel would give ECM much more within the same budget.
 - ECM still uses math/big multiply and reduce. PRAC chains for stage 1, an
@@ -624,5 +654,6 @@ End to end with default methods:
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
 3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
    hot-path big.Int allocations are gone; profile again.
-4. **p+1 stage 2** with baby steps and giant steps (see "The `factor`
+4. **Parallel ECM curves.** QS uses all the cores but ECM uses one, so
+   ECM gets far less work done within its budget (see "The `factor`
    pipeline").
