@@ -87,7 +87,9 @@ drafts" below for what was wrong in them.
 - **`factor` command:**
   - `-methods=trial,qs` runs only the listed methods, in the fixed order.
   - `-v` turns on QS logging.
-  - QS is skipped above 220 bits unless `-methods` names it.
+  - QS is skipped above 266 bits (80 digits) unless `-methods` names it.
+  - ECM's effort and squfof depend on the composite's size. See "The
+    `factor` pipeline" below.
 - **Tests:**
   - Tonelli–Shanks against brute force.
   - `TestRelations`, which checks X² ≡ Y (mod n) for every relation from both
@@ -503,11 +505,91 @@ primes on. `go test -race` is clean on `TestWorkers`, `TestRelations`,
 - The 219- and 240-bit double large prime sweeps above were single-threaded.
   `TestDLPTune` now uses all the workers, so set `Workers = 1` to compare.
 
+## The `factor` pipeline (done, 2026-11-24)
+
+With QS this fast, the methods that run before it were the slow part. A
+60-digit semiprime with no small factors took about 60 s: about 45 s of ECM
+and 3–4 s of squfof, before a 0.3 s QS run.
+
+**ECM** (`ecm.go`), rewritten after MIRACL's `factor.c`:
+- Montgomery curves with x-only (X:Z) arithmetic and the Montgomery ladder,
+  so stage 1 has no inversions. It takes gcd(Z, n) every 50 primes, and
+  redoes a batch one prime at a time if the gcd is n.
+- Stage 2 steps by multiples of D = 2310 with baby steps m < D/2 coprime to
+  D. Each prime costs one multiply into a running product, since x(cP) −
+  x(mP) covers both c − m and c + m. There's a gcd every 16 giant steps.
+- Curves are Montgomery's torsion Z/12 family, from k·(−2, 4) on
+  v² = u³ − 12u, in place of Suyama's. Over 1000 15-digit factors at B1=2000
+  they need 25.9 curves on average against 28.1, at the same time per curve.
+  `TestECMTorsion12` counts points over small primes and checks that 12
+  divides the order and that order·P = O.
+- `ECMContext(ctx, n, b1, b2, curves)` takes B2 and a context, checked at
+  the gcd points. `ECM` keeps B2 = 100·B1.
+- The stage 2 prime table is a bitset (`primeBits`): 16 MB at B2 = 1.3e8.
+
+A curve at B1=11000 went from 211 ms to 43 ms. The old code did a
+`ModInverse` (7–11× a multiply and reduce) in every point operation, and one
+point addition per stage 2 prime.
+
+**ECM schedule** (`factor/ecm.go`):
+- Levels for 15, 20, 25 and 30-digit factors, with B1, B2 and curves from
+  Table 1 of the GMP-ECM README.
+- ECM stops once it has used a third of the estimated QS time for what's
+  left. `qsTime` interpolates single-worker QS times measured from 30 to 79
+  digits, and counts each extra worker as 0.55 of one. That predicted the
+  23 s QS run at 80 digits.
+- Without QS to follow, ECM runs every level up to 25 digits.
+
+Measured times on this laptop, one ECM curve, 70-digit composite:
+
+| level | B1 | B2 | per curve | whole level |
+|---|---|---|---|---|
+| 15 digits | 2000 | 147396 | 11 ms | 0.3 s |
+| 20 digits | 11000 | 1.9e6 | 54 ms | 4 s |
+| 25 digits | 50000 | 1.3e7 | 0.28 s | 61 s |
+| 30 digits | 250000 | 1.3e8 | 1.7 s | 13 min |
+
+QS with one worker and with 15:
+
+| digits | 1 worker | 15 workers |
+|---|---|---|
+| 50 | 0.24 s | 0.05 s |
+| 60 | 1.5 s | 0.27 s |
+| 64 | 4.9 s | 0.57 s |
+| 71 | 20 s | 2.3 s |
+| 74 | 52 s | 5.8 s |
+| 79–80 | 159 s | 13–23 s |
+
+**squfof** is skipped above 64 bits. QS factors 14–26 digit numbers in
+1–2 ms, while squfof takes 4 ms at 18 digits and 284 ms at 26, and past
+about 26 digits it uses up its iterations and finds nothing.
+
+**qsMaxBits** went from 220 to 266 bits. An 80-digit semiprime takes 13 s on
+15 cores and peaks at 544 MB.
+
+End to end with default methods:
+
+| composite | before | after |
+|---|---|---|
+| 30 + 30 digits | 59.8 s | 2.0 s |
+| 33 + 33 digits | 53.6 s | 2.5 s |
+| 36 + 37 digits | not factored (QS skipped) | 6.9 s |
+| 40 + 40 digits, qs in `-methods` | 87.7 s | 36.7 s |
+
+**Not done:**
+- Brent, p−1 and p+1 still take about 1.5 s together on large inputs, and
+  most of the 2 s left at 60 digits. They could be sized the same way.
+- ECM curves run on one goroutine while QS uses all the cores. Running
+  curves in parallel would give ECM much more within the same budget.
+- ECM still uses math/big multiply and reduce. PRAC chains for stage 1, an
+  FFT stage 2 as in GMP-ECM, or Edwards curves would each be faster.
+- The ECM and QS timings are from this laptop. A machine with a different
+  balance between one core and all of them would want a different fraction.
+
 ## Next steps
 
 1. **Finish double large primes** (above).
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
 3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
    hot-path big.Int allocations are gone; profile again.
-4. **`factor` defaults.** Raise `qsMaxBits`, since 80 digits now takes about
-   20 seconds with 15 workers.
+4. **Size brent, p−1 and p+1** like ECM (see "The `factor` pipeline").
