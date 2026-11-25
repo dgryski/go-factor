@@ -126,15 +126,22 @@ func main() {
 		}
 	}
 
-	// B1 and curves for factors up to 15, 20 and 25 digits, from the GMP-ECM README.
-	for _, s := range []struct{ b1, curves int }{{2000, 25}, {11000, 90}, {50000, 300}} {
-		if !run["ecm"] || len(ctmp) == 0 {
-			break
+	// Above about 220 bits (66 digits) the quadratic sieve takes
+	// minutes, and its dense matrix needs gigabytes. Asking for qs by
+	// name with -methods lifts the limit.
+	const qsMaxBits = 220
+	qsRuns := func(n *big.Int) bool {
+		return run["qs"] && (methodsSet || n.BitLen() <= qsMaxBits)
+	}
+
+	if run["ecm"] && len(ctmp) > 0 {
+		qsWorkers := *workers
+		if qsWorkers <= 0 {
+			qsWorkers = runtime.GOMAXPROCS(0)
 		}
-		log.Printf("starting ecm(b1=%v, curves=%v)", s.b1, s.curves)
 		var comps []*big.Int
 		for _, cc := range ctmp {
-			ptmp, c2 := factor.ECM(cc, s.b1, s.curves)
+			ptmp, c2 := ecmPretest(cc, qsRuns(cc), qsWorkers)
 			if len(ptmp) > 0 {
 				log.Printf("ecm=%+v\n", ptmp)
 			}
@@ -144,14 +151,10 @@ func main() {
 	}
 
 	if run["qs"] && len(ctmp) > 0 {
-		// Above about 220 bits (66 digits) the quadratic sieve takes
-		// minutes, and its dense matrix needs gigabytes. Asking for qs by
-		// name with -methods lifts the limit.
-		const qsMaxBits = 220
 		log.Println("starting qs")
 		var comps []*big.Int
 		for _, cc := range ctmp {
-			if !methodsSet && cc.BitLen() > qsMaxBits {
+			if !qsRuns(cc) {
 				log.Printf("skipping qs for %d-bit %v", cc.BitLen(), cc)
 				comps = append(comps, cc)
 				continue
