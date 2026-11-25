@@ -60,3 +60,46 @@ func TestECMPrime(t *testing.T) {
 		t.Errorf("ECM(1) = %v, %v", p, c)
 	}
 }
+
+func TestECMTorsion12(t *testing.T) {
+	for _, p := range []int64{1009, 1013, 2003, 4001} {
+		n := big.NewInt(p)
+		for k := int64(2); k < 10; k++ {
+			c := &ecCurve{n: n}
+			var pt xzPoint
+			if g := c.torsion12(&pt, k); g != nil {
+				continue
+			}
+
+			// Count points on By^2 = x^3 + Ax^2 + x with B chosen so pt is on it.
+			var A, f0, f, x big.Int
+			A.Lsh(&c.a24, 2)
+			A.Sub(&A, two)
+			cubic := func(r, x *big.Int) {
+				var t big.Int
+				t.Add(x, &A)
+				t.Mul(&t, x)
+				t.Add(&t, one)
+				t.Mul(&t, x)
+				r.Mod(&t, n)
+			}
+			cubic(&f0, &pt.x)
+			order := int64(1)
+			for i := int64(0); i < p; i++ {
+				x.SetInt64(i)
+				cubic(&f, &x)
+				f.Mul(&f, &f0)
+				order += int64(1 + big.Jacobi(f.Mod(&f, n), n))
+			}
+
+			if order%12 != 0 {
+				t.Errorf("p=%d k=%d: order %d not divisible by 12", p, k, order)
+			}
+			var q xzPoint
+			c.mul(&q, &pt, uint64(order))
+			if q.z.Sign() != 0 {
+				t.Errorf("p=%d k=%d: order*P is not O", p, k)
+			}
+		}
+	}
+}

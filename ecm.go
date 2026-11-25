@@ -8,8 +8,8 @@ import (
 // ECM factors n with Lenstra's elliptic curve method, trying up to curves curves.
 // See https://en.wikipedia.org/wiki/Lenstra_elliptic-curve_factorization
 //
-// It uses Suyama curves in Montgomery form with x-only arithmetic, so stage 1
-// needs no inversions, and a baby-step giant-step stage 2 as in MIRACL's
+// It uses Montgomery curves with torsion Z/12 and x-only arithmetic, so stage
+// 1 needs no inversions, and a baby-step giant-step stage 2 as in MIRACL's
 // factor.c.
 func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
 	if n.Cmp(one) <= 0 {
@@ -96,7 +96,7 @@ func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
 func (e *ecm) curve(n *big.Int) *big.Int {
 	c := &ecCurve{n: n}
 	var p xzPoint
-	if g := c.suyama(&p, 6+e.rnd.Int63n(1<<32)); g != nil {
+	if g := c.torsion12(&p, 2+e.rnd.Int63n(1<<32)); g != nil {
 		return c.proper(g)
 	}
 
@@ -238,46 +238,160 @@ type ecCurve struct {
 	l1, l2         xzPoint // ladder scratch
 }
 
-// suyama sets p to the starting point of Suyama's curve for sigma. These
-// curves have group order divisible by 12. If 16u^3v is not invertible it
-// returns its gcd with n.
-func (c *ecCurve) suyama(p *xzPoint, sigma int64) *big.Int {
+// torsion12 sets p to the starting point of Montgomery's curve with torsion
+// Z/12 for k >= 2. With (u, v) = k*(-2, 4) on v^2 = u^3 - 12u it uses
+//
+//	t^2 = (u^2-12)/4u, a = (t^2-1)/(t^2+3),
+//	A = (-3a^4-6a^2+1)/4a^3, x = (3a^2+1)/4a.
+//
+// Compared with Suyama's curves the group order has more factors of 2 on
+// average. If a denominator is not invertible it returns its gcd with n.
+func (c *ecCurve) torsion12(p *xzPoint, k int64) *big.Int {
 	n := c.n
-	var u, v, t, a, inv big.Int
-	s := big.NewInt(sigma)
-	u.Mul(s, s)
-	u.Sub(&u, big.NewInt(5))
-	u.Mod(&u, n)
-	v.Lsh(s, 2)
-	v.Mod(&v, n)
-
-	// x = u^3, z = v^3
-	c.mulMod(&p.x, &u, &u)
-	c.mulMod(&p.x, &p.x, &u)
-	c.mulMod(&p.z, &v, &v)
-	c.mulMod(&p.z, &p.z, &v)
-
-	// a24 = (v-u)^3 (3u+v) / 16u^3v
-	c.sub(&t, &v, &u)
-	c.mulMod(&a, &t, &t)
-	c.mulMod(&a, &a, &t)
-	t.Mul(&u, big.NewInt(3))
-	t.Add(&t, &v)
-	t.Mod(&t, n)
-	c.mulMod(&a, &a, &t)
-
-	c.mulMod(&t, &p.x, &v)
-	t.Lsh(&t, 4)
-	t.Mod(&t, n)
-	if inv.ModInverse(&t, n) == nil {
-		g, _ := c.split(&t)
-		if g == nil {
-			return n
-		}
+	var w xyPoint
+	if g := c.w12Mul(&w, k); g != nil {
 		return g
 	}
-	c.mulMod(&c.a24, &a, &inv)
+
+	var t, d, inv, a, num big.Int
+	reduce := func(z *big.Int) *big.Int { return z.Mod(z, n) }
+
+	// t^2 = (u^2-12)/4u
+	t.Mul(&w.x, &w.x)
+	reduce(t.Sub(&t, big.NewInt(12)))
+	reduce(d.Lsh(&w.x, 2))
+	if g := c.inverse(&inv, &d); g != nil {
+		return g
+	}
+	c.mulMod(&t, &t, &inv)
+
+	// a = (t^2-1)/(t^2+3)
+	reduce(d.Add(&t, big.NewInt(3)))
+	if g := c.inverse(&inv, &d); g != nil {
+		return g
+	}
+	reduce(a.Sub(&t, one))
+	c.mulMod(&a, &a, &inv)
+
+	// x = (3a^2+1)/4a, z = 1
+	reduce(d.Lsh(&a, 2))
+	if g := c.inverse(&inv, &d); g != nil {
+		return g
+	}
+	c.mulMod(&num, &a, &a)
+	reduce(num.Add(num.Mul(&num, big.NewInt(3)), one))
+	c.mulMod(&p.x, &num, &inv)
+	p.z.SetInt64(1)
+
+	// a24 = (A+2)/4 = -(a-1)^3 (3a+1) / 16a^3
+	c.mulMod(&d, &a, &a)
+	c.mulMod(&d, &d, &a)
+	reduce(d.Lsh(&d, 4))
+	if g := c.inverse(&inv, &d); g != nil {
+		return g
+	}
+	c.sub(&t, &a, one)
+	c.mulMod(&num, &t, &t)
+	c.mulMod(&num, &num, &t)
+	reduce(t.Add(t.Mul(&a, big.NewInt(3)), one))
+	c.mulMod(&num, &num, &t)
+	c.mulMod(&num, &num, &inv)
+	c.sub(&c.a24, big.NewInt(0), &num)
 	return nil
+}
+
+// xyPoint is an affine point on v^2 = u^3 - 12u, used to pick a curve.
+type xyPoint struct {
+	x, y big.Int
+	inf  bool
+}
+
+// w12Mul sets r = k*(-2, 4) on v^2 = u^3 - 12u for k >= 1. If a
+// denominator is not invertible it returns its gcd with n, and it returns n
+// if r is the point at infinity.
+func (c *ecCurve) w12Mul(r *xyPoint, k int64) *big.Int {
+	var base xyPoint
+	base.x.Sub(c.n, big.NewInt(2))
+	base.y.SetInt64(4)
+	r.x.Set(&base.x)
+	r.y.Set(&base.y)
+	top := 62
+	for k>>uint(top)&1 == 0 {
+		top--
+	}
+	for bit := top - 1; bit >= 0; bit-- {
+		if g := c.w12Add(r, r, r); g != nil {
+			return g
+		}
+		if k>>uint(bit)&1 == 1 {
+			if g := c.w12Add(r, r, &base); g != nil {
+				return g
+			}
+		}
+	}
+	if r.inf {
+		return c.n
+	}
+	return nil
+}
+
+// w12Add sets r = p+q on v^2 = u^3 - 12u. r may alias p or q.
+func (c *ecCurve) w12Add(r, p, q *xyPoint) *big.Int {
+	switch {
+	case p.inf:
+		p, q = q, p
+		fallthrough
+	case q.inf:
+		r.x.Set(&p.x)
+		r.y.Set(&p.y)
+		r.inf = p.inf
+		return nil
+	}
+	var l, d, inv, x3 big.Int
+	if p.x.Cmp(&q.x) == 0 {
+		c.addMod(&d, &p.y, &q.y)
+		if d.Sign() == 0 {
+			r.inf = true
+			return nil
+		}
+		// l = (3u^2 - 12) / 2v
+		c.mulMod(&l, &p.x, &p.x)
+		l.Mul(&l, big.NewInt(3))
+		l.Sub(&l, big.NewInt(12))
+		l.Mod(&l, c.n)
+		c.addMod(&d, &p.y, &p.y)
+	} else {
+		// l = (v2 - v1) / (u2 - u1)
+		c.sub(&l, &q.y, &p.y)
+		c.sub(&d, &q.x, &p.x)
+	}
+	if g := c.inverse(&inv, &d); g != nil {
+		return g
+	}
+	c.mulMod(&l, &l, &inv)
+
+	// u3 = l^2 - u1 - u2, v3 = l(u1 - u3) - v1
+	c.mulMod(&x3, &l, &l)
+	c.sub(&x3, &x3, &p.x)
+	c.sub(&x3, &x3, &q.x)
+	c.sub(&d, &p.x, &x3)
+	c.mulMod(&d, &d, &l)
+	c.sub(&r.y, &d, &p.y)
+	r.x.Set(&x3)
+	r.inf = false
+	return nil
+}
+
+// inverse sets z = 1/x mod n for x in [0, n). If x is not invertible it
+// returns gcd(x, n).
+func (c *ecCurve) inverse(z, x *big.Int) *big.Int {
+	if z.ModInverse(x, c.n) != nil {
+		return nil
+	}
+	if g, _ := c.split(x); g != nil {
+		return g
+	}
+	return c.n // x = 0
 }
 
 // mulMod sets z = x*y mod n for x, y in [0, n).
@@ -361,11 +475,8 @@ func (c *ecCurve) mul(r, p *xzPoint, k uint64) {
 // with n.
 func (c *ecCurve) normalise(x *big.Int, p *xzPoint) *big.Int {
 	var inv big.Int
-	if inv.ModInverse(&p.z, c.n) == nil {
-		if g, _ := c.split(&p.z); g != nil {
-			return g
-		}
-		return c.n
+	if g := c.inverse(&inv, &p.z); g != nil {
+		return g
 	}
 	c.mulMod(x, &p.x, &inv)
 	return nil
