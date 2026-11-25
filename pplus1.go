@@ -1,6 +1,7 @@
 package factor
 
 import (
+	"context"
 	"math/big"
 	"math/bits"
 	"math/rand"
@@ -9,7 +10,14 @@ import (
 // PPlus1 factors n with Williams' p+1 method, trying up to tries starting values.
 // See https://en.wikipedia.org/wiki/Williams%27s_p_%2B_1_algorithm
 func PPlus1(n *big.Int, b1, tries int) (primes, composites []*big.Int) {
+	return PPlus1Context(context.Background(), n, b1, tries)
+}
+
+// PPlus1Context is PPlus1 that stops early when ctx is done, after a last
+// gcd, and returns what it has found so far.
+func PPlus1Context(ctx context.Context, n *big.Int, b1, tries int) (primes, composites []*big.Int) {
 	e := &pplus1{
+		ctx:    ctx,
 		rnd:    rand.New(rand.NewSource(1)),
 		b1:     b1,
 		primes: sievePrimes(pplus1B2Multiplier * b1),
@@ -24,6 +32,7 @@ const (
 )
 
 type pplus1 struct {
+	ctx    context.Context
 	rnd    *rand.Rand
 	b1     int
 	primes []int
@@ -42,7 +51,7 @@ func (e *pplus1) factor(n *big.Int) (primes, composites []*big.Int) {
 		return append([]*big.Int{big.NewInt(2)}, pr...), co
 	}
 
-	for e.tries > 0 {
+	for e.tries > 0 && e.ctx.Err() == nil {
 		e.tries--
 		g := e.try(n)
 		if g == nil {
@@ -98,6 +107,9 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 			continue
 		}
 		if check(&v); g.Cmp(one) == 0 {
+			if e.ctx.Err() != nil {
+				return nil
+			}
 			saved.Set(&v)
 			start = i + 1
 			continue
@@ -152,6 +164,9 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 		}
 		if g.Cmp(one) != 0 {
 			return new(big.Int).Set(&g)
+		}
+		if e.ctx.Err() != nil {
+			return nil
 		}
 		product.SetInt64(1)
 		batch = 0

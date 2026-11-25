@@ -4,6 +4,7 @@ import (
 	"context"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/dgryski/go-factor/internal/testutil"
 )
@@ -98,3 +99,28 @@ func TestPMinus1Context(t *testing.T) {
 	}
 }
 
+// TestContextCancel checks that each method returns soon after its deadline
+// on a 60 digit semiprime it cannot split.
+func TestContextCancel(t *testing.T) {
+	n := product(nextPrime("314159265358979323846264338327"), nextPrime("271828182845904523536028747135"))
+	methods := []struct {
+		name string
+		f    func(ctx context.Context) ([]*big.Int, []*big.Int)
+	}{
+		{"brent", func(ctx context.Context) ([]*big.Int, []*big.Int) { return BrentContext(ctx, n, 2, 1) }},
+		{"p-1", func(ctx context.Context) ([]*big.Int, []*big.Int) { return PMinus1Context(ctx, n, 10000000) }},
+		{"p+1", func(ctx context.Context) ([]*big.Int, []*big.Int) { return PPlus1Context(ctx, n, 1000000, 10) }},
+	}
+	for _, m := range methods {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		start := time.Now()
+		p, c := m.f(ctx)
+		cancel()
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Errorf("%s took %v after a 20ms deadline", m.name, elapsed)
+		}
+		if len(p) != 0 || len(c) != 1 || c[0].Cmp(n) != 0 {
+			t.Errorf("%s = %v, %v, want n back", m.name, p, c)
+		}
+	}
+}

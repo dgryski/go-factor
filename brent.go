@@ -1,6 +1,7 @@
 package factor
 
 import (
+	"context"
 	"math/big"
 )
 
@@ -14,7 +15,15 @@ func checkGCD(n, g *big.Int) (newN, newG *big.Int, ok bool) {
 	return new(big.Int).Div(n, z), z, true
 }
 
+// Brent factors n with Brent's variant of Pollard's rho, iterating
+// x^2 + c from start for up to 65536 terms.
 func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
+	return BrentContext(context.Background(), n, start, c)
+}
+
+// BrentContext is Brent that stops early when ctx is done, after a last gcd,
+// and returns what it has found so far.
+func BrentContext(ctx context.Context, n *big.Int, start, c int64) (primes, composites []*big.Int) {
 
 	if n.ProbablyPrime(10) {
 		return []*big.Int{n}, nil
@@ -38,9 +47,9 @@ func Brent(n *big.Int, start, c int64) (primes, composites []*big.Int) {
 	}
 
 	split := func(newN, newG *big.Int) (primes, composites []*big.Int) {
-		pr, co := Brent(newN, start, c)
+		pr, co := BrentContext(ctx, newN, start, c)
 		primes, composites = append(primes, pr...), append(composites, co...)
-		pr, co = Brent(newG, start, c)
+		pr, co = BrentContext(ctx, newG, start, c)
 		primes, composites = append(primes, pr...), append(composites, co...)
 		return primes, composites
 	}
@@ -105,6 +114,9 @@ loop:
 			if batch == 16 || j == limit-1 {
 				if g := batchGCD(batch); g != nil {
 					return found(g)
+				}
+				if ctx.Err() != nil {
+					return nil, []*big.Int{n}
 				}
 				product.SetInt64(1)
 				batch = 0
