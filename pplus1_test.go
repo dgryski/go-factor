@@ -89,3 +89,21 @@ func TestPPlus1Small(t *testing.T) {
 		}
 	}
 }
+
+func TestPPlus1Stage2Edges(t *testing.T) {
+	// With B1=2000 and B2=200000 the giant steps are multiples of 2310.
+	// Each q is the one large prime in p+1, and sits at an edge of the
+	// stage 2 range: just above B1, either side of a giant step, either
+	// side of the boundary between the first two giant steps at 3465, and
+	// in the last giant step below B2.
+	big1 := nextPrime("1000000000000000003")
+	for _, q := range []int64{2003, 2309, 2311, 3463, 3467, 199999} {
+		p := smoothPlus1(q, 0)
+		n := new(big.Int).Mul(p, big1)
+		pr, c := PPlus1(n, 2000, 10)
+		testutil.VerifyFactoring(t, n, pr, c)
+		if len(c) != 0 {
+			t.Errorf("q=%d: PPlus1(%v) left composites %v", q, n, c)
+		}
+	}
+}

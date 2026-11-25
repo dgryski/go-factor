@@ -27,22 +27,12 @@ func ECMContext(ctx context.Context, n *big.Int, b1, b2, curves int) (primes, co
 		return []*big.Int{n}, nil
 	}
 
-	if b2 < b1 {
-		b2 = b1
-	}
 	e := &ecm{
-		ctx:     ctx,
-		rnd:     rand.New(rand.NewSource(1)),
-		b1:      b1,
-		b2:      b2,
-		primes:  sievePrimes(b1),
-		isPrime: primeBits(b2 + ecmD),
-		curves:  curves,
-	}
-	for m := 1; m <= ecmD/2; m += 2 {
-		if gcdInt(m, ecmD) == 1 {
-			e.babies = append(e.babies, m)
-		}
+		ctx:        ctx,
+		rnd:        rand.New(rand.NewSource(1)),
+		stage2Plan: newStage2Plan(b1, b2),
+		primes:     sievePrimes(b1),
+		curves:     curves,
 	}
 	return e.factor(n)
 }
@@ -53,26 +43,16 @@ const (
 	// Stage 1 takes a gcd after this many primes.
 	ecmStage1Batch = 50
 
-	// Stage 2 giant steps are multiples of ecmD = 2*3*5*7*11.
-	ecmD = 2310
-
 	// Stage 2 takes a gcd after this many giant steps.
 	ecmStage2Batch = 16
 )
 
 type ecm struct {
-	ctx     context.Context
-	rnd     *rand.Rand
-	b1, b2  int
-	primes  []int    // primes <= b1
-	isPrime []uint64 // bitset of primes <= b2
-	babies  []int    // odd m <= ecmD/2 coprime to ecmD
-	curves  int      // left to try, shared by recursive calls
-}
-
-// prime reports whether q is a prime in (b1, b2].
-func (e *ecm) prime(q int) bool {
-	return q > e.b1 && q <= e.b2 && e.isPrime[q/64]&(1<<(q%64)) != 0
+	*stage2Plan
+	ctx    context.Context
+	rnd    *rand.Rand
+	primes []int // primes <= b1
+	curves int   // left to try, shared by recursive calls
 }
 
 func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
@@ -153,14 +133,15 @@ func (e *ecm) curve(n *big.Int) *big.Int {
 }
 
 // stage2 looks for one more prime q in (b1, b2] with q*P = O mod a prime of n.
-// It writes q = c±m with c a multiple of ecmD and m a baby step. x(c*P) and
+// It writes q = c±m with c a multiple of stage2D and m a baby step. x(c*P) and
 // x(m*P) agree mod p exactly when (c-m)*P or (c+m)*P is O mod p, so one
 // product term covers both.
 func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
 	n := c.n
+	e.sieve()
 
 	// Baby steps: fu[m] = x(m*P) for m in e.babies.
-	fu := make([]big.Int, ecmD/2+1)
+	fu := make([]big.Int, stage2D/2+1)
 	if g := c.normalise(&fu[1], p); g != nil {
 		return c.proper(g)
 	}
@@ -168,8 +149,8 @@ func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
 	c.double(&p2, p)
 	prev.set(p)
 	c.add(&cur, &p2, p, p) // 3P
-	for m := 3; m <= ecmD/2; m += 2 {
-		if gcdInt(m, ecmD) == 1 {
+	for m := 3; m <= stage2D/2; m += 2 {
+		if gcdInt(m, stage2D) == 1 {
 			if g := c.normalise(&fu[m], &cur); g != nil {
 				return c.proper(g)
 			}
@@ -180,20 +161,17 @@ func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
 		cur.set(&next)
 	}
 
-	// Giant steps: cur = iv*G and next = (iv+1)*G for G = ecmD*P, starting at
-	// the multiple of ecmD nearest b1.
+	// Giant steps: cur = iv*G and next = (iv+1)*G for G = stage2D*P, starting at
+	// the multiple of stage2D nearest b1.
 	var giant xzPoint
-	c.mul(&giant, p, ecmD)
-	iv := (e.b1 + ecmD/2) / ecmD
-	if iv < 1 {
-		iv = 1
-	}
+	c.mul(&giant, p, stage2D)
+	iv := e.first()
 	c.ladder(&cur, &next, &giant, uint64(iv))
 
 	var x, t, g big.Int
 	acc := big.NewInt(1)
 	for steps := 1; ; steps++ {
-		base := iv * ecmD
+		base := iv * stage2D
 		if gg := c.normalise(&x, &cur); gg != nil {
 			return c.proper(gg)
 		}
@@ -205,7 +183,7 @@ func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
 			c.mulMod(acc, acc, &t)
 		}
 
-		last := base+ecmD/2 >= e.b2
+		last := e.last(iv)
 		if steps%ecmStage2Batch == 0 || last {
 			g.GCD(nil, nil, acc, n)
 			if g.Cmp(one) != 0 {

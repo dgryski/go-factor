@@ -17,26 +17,29 @@ func PPlus1(n *big.Int, b1, tries int) (primes, composites []*big.Int) {
 // gcd, and returns what it has found so far.
 func PPlus1Context(ctx context.Context, n *big.Int, b1, tries int) (primes, composites []*big.Int) {
 	e := &pplus1{
-		ctx:    ctx,
-		rnd:    rand.New(rand.NewSource(1)),
-		b1:     b1,
-		primes: sievePrimes(pplus1B2Multiplier * b1),
-		tries:  tries,
+		stage2Plan: newStage2Plan(b1, pplus1B2Multiplier*b1),
+		ctx:        ctx,
+		rnd:        rand.New(rand.NewSource(1)),
+		primes:     sievePrimes(b1),
+		tries:      tries,
 	}
 	return e.factor(n)
 }
 
 const (
 	pplus1B2Multiplier = 100
-	pplus1Batch        = 16
+
+	// Stage 1 takes a gcd after this many primes, and stage 2 after this
+	// many giant steps.
+	pplus1Batch = 16
 )
 
 type pplus1 struct {
+	*stage2Plan
 	ctx    context.Context
 	rnd    *rand.Rand
-	b1     int
-	primes []int
-	tries  int // left to try, shared by recursive calls
+	primes []int // primes <= b1
+	tries  int   // left to try, shared by recursive calls
 }
 
 func (e *pplus1) factor(n *big.Int) (primes, composites []*big.Int) {
@@ -93,17 +96,13 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 	saved := new(big.Int).Set(&v)
 	start := 0
 	for i, q := range e.primes {
-		if q > e.b1 {
-			break
-		}
 		k := uint64(q)
 		for k*uint64(q) <= uint64(e.b1) {
 			k *= uint64(q)
 		}
 		lucasV(&v, &v, k, n)
 
-		last := i+1 == len(e.primes) || e.primes[i+1] > e.b1
-		if (i+1)%pplus1Batch != 0 && !last {
+		if (i+1)%pplus1Batch != 0 && i+1 != len(e.primes) {
 			continue
 		}
 		if check(&v); g.Cmp(one) == 0 {
@@ -133,46 +132,85 @@ func (e *pplus1) try(n *big.Int) *big.Int {
 		return new(big.Int).Set(&g)
 	}
 
-	// Stage 2 looks for one more prime q up to b2 using V_q(v) = V_kq(P).
-	var w big.Int
-	product := big.NewInt(1)
-	batch := 0
-	for i, q := range e.primes {
-		if q <= e.b1 {
-			continue
-		}
-		lucasV(&w, &v, uint64(q), n)
-		t.Sub(&w, two)
-		product.Mul(product, &t)
-		product.Mod(product, n)
-		batch++
+	return e.stage2(n, &v)
+}
 
-		if batch < pplus1Batch && i+1 < len(e.primes) {
-			continue
+// stage2 looks for one more prime q in (b1, b2] with V_q(v) = 2 mod a prime
+// of n. With v = a + 1/a,
+//
+//	V_c - V_m = (a^(c+m) - 1)(a^(c-m) - 1) / a^c,
+//
+// so the product of V_c - V_m over the baby steps m covers both c-m and c+m.
+// Both sequences step with V_(j+d) = V_j V_d - V_(j-d).
+func (e *pplus1) stage2(n, v *big.Int) *big.Int {
+	e.sieve()
+	var t, q big.Int
+	mulSub := func(z, x, y, w *big.Int) {
+		// z = x*y - w mod n
+		t.Mul(x, y)
+		t.Sub(&t, w)
+		q.QuoRem(&t, n, z)
+		if z.Sign() < 0 {
+			z.Add(z, n)
 		}
-		g.GCD(nil, nil, product, n)
-		if g.Cmp(n) == 0 {
-			for _, q := range e.primes[i+1-batch : i+1] {
-				lucasV(&w, &v, uint64(q), n)
-				if check(&w); g.Cmp(one) != 0 {
-					break
-				}
-			}
-		}
-		if g.Cmp(n) == 0 {
-			return nil
-		}
-		if g.Cmp(one) != 0 {
-			return new(big.Int).Set(&g)
-		}
-		if e.ctx.Err() != nil {
-			return nil
-		}
-		product.SetInt64(1)
-		batch = 0
 	}
 
-	return nil
+	// Baby steps: vm[m] = V_m(v) for odd m <= stage2D/2.
+	vm := make([]big.Int, stage2D/2+1)
+	var v2 big.Int
+	mulSub(&v2, v, v, two)
+	vm[1].Set(v)
+	mulSub(&vm[3], v, &v2, v)
+	for m := 5; m <= stage2D/2; m += 2 {
+		mulSub(&vm[m], &vm[m-2], &v2, &vm[m-4])
+	}
+
+	// Giant steps: cur = V_(iv*D) and prev = V_((iv-1)*D), from V_ab = V_a(V_b).
+	var vd, cur, prev, next big.Int
+	lucasV(&vd, v, stage2D, n)
+	iv := e.first()
+	lucasV(&cur, &vd, uint64(iv), n)
+	if iv == 1 {
+		prev.Set(two)
+	} else {
+		lucasV(&prev, &vd, uint64(iv-1), n)
+	}
+
+	var g big.Int
+	acc := big.NewInt(1)
+	for steps := 1; ; steps++ {
+		base := iv * stage2D
+		for _, m := range e.babies {
+			if !e.prime(base-m) && !e.prime(base+m) {
+				continue
+			}
+			t.Sub(&cur, &vm[m])
+			t.Mul(&t, acc)
+			q.QuoRem(&t, n, acc)
+			if acc.Sign() < 0 {
+				acc.Add(acc, n)
+			}
+		}
+
+		last := e.last(iv)
+		if steps%pplus1Batch == 0 || last {
+			g.GCD(nil, nil, acc, n)
+			if g.Cmp(one) != 0 {
+				if g.Cmp(n) == 0 {
+					return nil
+				}
+				return &g
+			}
+			if last || e.ctx.Err() != nil {
+				return nil
+			}
+		}
+
+		mulSub(&next, &cur, &vd, &prev)
+		prev.Set(&cur)
+		cur.Set(&next)
+		iv++
+	}
 }
 
 // lucasV sets r = V_k(p) mod n for the Lucas sequence with Q = 1, for k >= 1.
