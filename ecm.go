@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/dgryski/go-factor/internal/progress"
 )
 
 // ECMWorkers is the most goroutines ECM runs curves on. 0 means
@@ -60,6 +62,9 @@ const (
 
 	// Stage 2 takes a gcd after this many giant steps.
 	ecmStage2Batch = 16
+
+	// A search logs its progress this often.
+	ecmLogInterval = 5 * time.Second
 )
 
 type ecm struct {
@@ -129,6 +134,16 @@ func (e *ecm) search(n *big.Int) *big.Int {
 		}()
 	}
 
+	stopLog := make(chan struct{})
+	var logWG sync.WaitGroup
+	if Logf != nil {
+		logWG.Add(1)
+		go func() {
+			defer logWG.Done()
+			e.logProgress(stopLog, n, t0, curves, &st)
+		}()
+	}
+
 send:
 	for e.curves > 0 {
 		sigma := 2 + e.rnd.Int63n(1<<32)
@@ -141,6 +156,8 @@ send:
 	}
 	close(sigmas)
 	wg.Wait()
+	close(stopLog)
+	logWG.Wait()
 
 	var res result
 	select {
@@ -161,20 +178,41 @@ send:
 	return res.g
 }
 
+// logProgress logs how many of the search's curves have finished and how
+// long the rest should take, every ecmLogInterval until stop is closed.
+func (e *ecm) logProgress(stop <-chan struct{}, n *big.Int, t0 time.Time, curves int, st *curveStats) {
+	var rate progress.Rate
+	rate.Sample(t0, 0)
+	tick := time.NewTicker(ecmLogInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case now := <-tick.C:
+			done := int(st.done.Load())
+			rate.Sample(now, done)
+			logf("ecm: %d/%d curves (%d reached stage 2) with B1=%d, B2=%d on %d bits, %v, %s; %v",
+				done, curves, st.curves2.Load(), e.b1, e.b2, n.BitLen(), since(t0), rate.Left(done, curves), st)
+		}
+	}
+}
+
 // curveStats adds up the time curves spend in each stage.
 type curveStats struct {
 	curves1, curves2 atomic.Int64 // curves that finished each stage
 	time1, time2     atomic.Int64 // nanoseconds in each stage
+	done             atomic.Int64 // curves that finished or gave up
 }
 
 func (s *curveStats) String() string {
-	avg := func(t, n int64) time.Duration {
+	avg := func(t, n int64) string {
 		if n == 0 {
-			return 0
+			return "-"
 		}
-		return time.Duration(t / n).Round(time.Microsecond)
+		return time.Duration(t / n).Round(time.Millisecond).String()
 	}
-	return fmt.Sprintf("stage 1 %v/curve, stage 2 %v/curve",
+	return fmt.Sprintf("stage 1 %s/curve, stage 2 %s/curve",
 		avg(s.time1.Load(), s.curves1.Load()), avg(s.time2.Load(), s.curves2.Load()))
 }
 
@@ -188,6 +226,7 @@ func (e *ecm) curve(ctx context.Context, n *big.Int, sigma int64, st *curveStats
 	st.curves1.Add(1)
 	st.time1.Add(int64(time.Since(t0)))
 	if !more {
+		st.done.Add(1)
 		return g, 1
 	}
 
@@ -195,6 +234,7 @@ func (e *ecm) curve(ctx context.Context, n *big.Int, sigma int64, st *curveStats
 	g = e.stage2(ctx, c, &p)
 	st.curves2.Add(1)
 	st.time2.Add(int64(time.Since(t0)))
+	st.done.Add(1)
 	return g, 2
 }
 
