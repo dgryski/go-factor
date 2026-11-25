@@ -83,10 +83,12 @@ func split(n *big.Int) (*big.Int, *big.Int) {
 	}
 
 	b, siqs, sieveRange := params(n)
+	setup := newSetupLog()
 
 	// Remove small factors first: primes that divide n would otherwise be
 	// silently dropped from the base, and the multiplier must be coprime to n.
 	primes := primesUpTo(b)
+	setup.step("found %d primes up to %d", len(primes), b)
 	var r, bigP big.Int
 	for _, p := range primes {
 		bigP.SetInt64(p)
@@ -94,11 +96,14 @@ func split(n *big.Int) (*big.Int, *big.Int) {
 			return new(big.Int).Set(&bigP), new(big.Int).Div(n, &bigP)
 		}
 	}
+	setup.step("trial divided by them")
 
 	k := knuthSchroeppel(n)
 	kn := new(big.Int).Mul(n, big.NewInt(k))
 	factorBase := buildFactorBase(kn, primes)
+	setup.step("built a factor base of %d primes", len(factorBase))
 	s := newSieve(n, kn, factorBase, siqs)
+	setup.step("found the square roots of kN mod each prime")
 
 	method := "single polynomial"
 	if siqs {
@@ -149,6 +154,25 @@ func logf(format string, args ...interface{}) {
 	if Logf != nil {
 		Logf(format, args...)
 	}
+}
+
+// setupLog times the steps before sieving. Small inputs set up in well
+// under a second, so it only logs once the setup has run for 5 seconds.
+type setupLog struct{ start, last time.Time }
+
+func newSetupLog() *setupLog {
+	now := time.Now()
+	return &setupLog{now, now}
+}
+
+// step logs what the step that just finished did and how long it took.
+func (l *setupLog) step(format string, args ...interface{}) {
+	now := time.Now()
+	if Logf != nil && now.Sub(l.start) > 5*time.Second {
+		logf("qs: setup: "+format+" in %v, %v so far", append(args,
+			now.Sub(l.last).Round(time.Millisecond), now.Sub(l.start).Round(time.Millisecond))...)
+	}
+	l.last = now
 }
 
 // logProgress reports how many relations the sieve has collected and how
