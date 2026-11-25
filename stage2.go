@@ -1,5 +1,7 @@
 package factor
 
+import "sync"
+
 // stage2D is the giant step of the baby-step giant-step stage 2 used by ECM
 // and p+1: 2*3*5*7*11.
 const stage2D = 2310
@@ -12,6 +14,7 @@ type stage2Plan struct {
 	b1, b2  int
 	isPrime []uint64 // bitset of primes <= b2 + stage2D, from sieve
 	babies  []int
+	once    sync.Once
 }
 
 func newStage2Plan(b1, b2 int) *stage2Plan {
@@ -30,9 +33,7 @@ func newStage2Plan(b1, b2 int) *stage2Plan {
 // sieve builds the prime bitset. Stage 2 calls it on entry, so a deadline
 // that passes in stage 1 doesn't pay for it.
 func (s *stage2Plan) sieve() {
-	if s.isPrime == nil {
-		s.isPrime = primeBits(s.b2 + stage2D)
-	}
+	s.once.Do(func() { s.isPrime = primeBits(s.b2 + stage2D) })
 }
 
 // prime reports whether q is a prime in (b1, b2]. It needs sieve.

@@ -4,7 +4,13 @@ import (
 	"context"
 	"math/big"
 	"math/rand"
+	"runtime"
+	"sync"
 )
+
+// ECMWorkers is the most goroutines ECM runs curves on. 0 means
+// runtime.GOMAXPROCS(0).
+var ECMWorkers = 0
 
 // ECM factors n with Lenstra's elliptic curve method, trying up to curves
 // curves with stage 2 bound 100*b1.
@@ -18,7 +24,8 @@ func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
 }
 
 // ECMContext is ECM with stage 2 bound b2. It stops early when ctx is done,
-// abandoning the curve in progress, and returns what it has found so far.
+// abandoning the curves in progress, and returns what it has found so far.
+// Curves run on up to ECMWorkers goroutines.
 func ECMContext(ctx context.Context, n *big.Int, b1, b2, curves int) (primes, composites []*big.Int) {
 	if n.Cmp(one) <= 0 {
 		return nil, nil
@@ -27,8 +34,13 @@ func ECMContext(ctx context.Context, n *big.Int, b1, b2, curves int) (primes, co
 		return []*big.Int{n}, nil
 	}
 
+	workers := ECMWorkers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
 	e := &ecm{
 		ctx:        ctx,
+		workers:    workers,
 		rnd:        rand.New(rand.NewSource(1)),
 		stage2Plan: newStage2Plan(b1, b2),
 		primes:     sievePrimes(b1),
@@ -49,10 +61,11 @@ const (
 
 type ecm struct {
 	*stage2Plan
-	ctx    context.Context
-	rnd    *rand.Rand
-	primes []int // primes <= b1
-	curves int   // left to try, shared by recursive calls
+	ctx     context.Context
+	workers int
+	rnd     *rand.Rand // used only by search, to pick each curve
+	primes  []int      // primes <= b1
+	curves  int        // left to try, shared by recursive calls
 }
 
 func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
@@ -63,29 +76,74 @@ func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
 		return []*big.Int{n}, nil
 	}
 
-	for e.curves > 0 && e.ctx.Err() == nil {
-		e.curves--
-		g := e.curve(n)
-		if g == nil {
-			continue
-		}
-		var q big.Int
-		q.Div(n, g)
-		pr, co := e.factor(g)
-		primes, composites = append(primes, pr...), append(composites, co...)
-		pr, co = e.factor(&q)
-		primes, composites = append(primes, pr...), append(composites, co...)
-		return primes, composites
+	g := e.search(n)
+	if g == nil {
+		return nil, []*big.Int{n}
 	}
-
-	return nil, []*big.Int{n}
+	var q big.Int
+	q.Div(n, g)
+	pr, co := e.factor(g)
+	primes, composites = append(primes, pr...), append(composites, co...)
+	pr, co = e.factor(&q)
+	primes, composites = append(primes, pr...), append(composites, co...)
+	return primes, composites
 }
 
-// curve runs both stages on a random curve and returns a proper factor of n or nil.
-func (e *ecm) curve(n *big.Int) *big.Int {
+// search runs curves on e.workers goroutines until one finds a proper
+// factor of n, which it returns, or the curves or e.ctx run out. The curves
+// are picked in order from e.rnd, so the same curves are tried whatever the
+// number of workers, though which finds a factor first can vary.
+func (e *ecm) search(n *big.Int) *big.Int {
+	ctx, cancel := context.WithCancel(e.ctx)
+	defer cancel()
+
+	sigmas := make(chan int64)
+	found := make(chan *big.Int, 1)
+	var wg sync.WaitGroup
+	for w := 0; w < e.workers && w < e.curves; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for sigma := range sigmas {
+				if g := e.curve(ctx, n, sigma); g != nil {
+					select {
+					case found <- g:
+						cancel()
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+send:
+	for e.curves > 0 {
+		sigma := 2 + e.rnd.Int63n(1<<32)
+		select {
+		case sigmas <- sigma:
+			e.curves--
+		case <-ctx.Done():
+			break send
+		}
+	}
+	close(sigmas)
+	wg.Wait()
+
+	select {
+	case g := <-found:
+		return g
+	default:
+		return nil
+	}
+}
+
+// curve runs both stages on the curve for sigma and returns a proper factor
+// of n or nil. It gives up when ctx is done.
+func (e *ecm) curve(ctx context.Context, n *big.Int, sigma int64) *big.Int {
 	c := &ecCurve{n: n}
 	var p xzPoint
-	if g := c.torsion12(&p, 2+e.rnd.Int63n(1<<32)); g != nil {
+	if g := c.torsion12(&p, sigma); g != nil {
 		return c.proper(g)
 	}
 
@@ -106,7 +164,7 @@ func (e *ecm) curve(n *big.Int) *big.Int {
 		}
 		g, _ := c.split(&p.z)
 		if g == nil {
-			if e.ctx.Err() != nil {
+			if ctx.Err() != nil {
 				return nil
 			}
 			saved.set(&p)
@@ -129,14 +187,14 @@ func (e *ecm) curve(n *big.Int) *big.Int {
 		return nil
 	}
 
-	return e.stage2(c, &p)
+	return e.stage2(ctx, c, &p)
 }
 
 // stage2 looks for one more prime q in (b1, b2] with q*P = O mod a prime of n.
 // It writes q = c±m with c a multiple of stage2D and m a baby step. x(c*P) and
 // x(m*P) agree mod p exactly when (c-m)*P or (c+m)*P is O mod p, so one
 // product term covers both.
-func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
+func (e *ecm) stage2(ctx context.Context, c *ecCurve, p *xzPoint) *big.Int {
 	n := c.n
 	e.sieve()
 
@@ -193,7 +251,7 @@ func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
 				return &g
 			}
 		}
-		if last || steps%ecmStage2Batch == 0 && e.ctx.Err() != nil {
+		if last || steps%ecmStage2Batch == 0 && ctx.Err() != nil {
 			return nil
 		}
 

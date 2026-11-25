@@ -2,6 +2,7 @@ package factor
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"testing"
 	"time"
@@ -35,19 +36,23 @@ func TestECM(t *testing.T) {
 		{"repeated", []*big.Int{nextPrime("1000003"), nextPrime("1000003"), nextPrime("99999999977")}},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			n := product(tt.factors...)
-			orig := new(big.Int).Set(n)
-			p, c := ECM(n, 2000, 50)
-			testutil.VerifyFactoring(t, orig, p, c)
-			if len(c) != 0 {
-				t.Errorf("composites left: %v", c)
-			}
-			if len(p) != len(tt.factors) {
-				t.Errorf("got %d primes %v, want %d", len(p), p, len(tt.factors))
-			}
-		})
+	defer func(w int) { ECMWorkers = w }(ECMWorkers)
+	for _, workers := range []int{1, 8} {
+		ECMWorkers = workers
+		for _, tt := range tests {
+			t.Run(fmt.Sprintf("%s/workers=%d", tt.name, workers), func(t *testing.T) {
+				n := product(tt.factors...)
+				orig := new(big.Int).Set(n)
+				p, c := ECM(n, 2000, 50)
+				testutil.VerifyFactoring(t, orig, p, c)
+				if len(c) != 0 {
+					t.Errorf("composites left: %v", c)
+				}
+				if len(p) != len(tt.factors) {
+					t.Errorf("got %d primes %v, want %d", len(p), p, len(tt.factors))
+				}
+			})
+		}
 	}
 }
 
