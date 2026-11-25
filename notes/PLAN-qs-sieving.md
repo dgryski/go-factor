@@ -567,18 +567,50 @@ about 26 digits it uses up its iterations and finds nothing.
 **qsMaxBits** went from 220 to 266 bits. An 80-digit semiprime takes 13 s on
 15 cores and peaks at 544 MB.
 
+**Shared budget** (`factor/budget.go`). After that, Brent, p−1 and p+1
+still took about 1.5 s together on large inputs, most of what was left at 60
+digits. Now all four methods before QS share a third of the estimated QS
+time, counted from the start of Brent:
+- Each runs until a cumulative share is used: Brent 10%, p−1 20%, p+1 35%
+  and ECM 100%. Time one method leaves goes to the next.
+- `BrentContext`, `PMinus1Context` and `PPlus1Context` take one last gcd
+  when the deadline passes, so the work done still counts.
+  `TestContextCancel` checks that each returns soon after a deadline.
+- Without QS to follow there's no deadline. Brent's three runs and p−1 then
+  take 0.38 s on a 60-digit number.
+
+**p−1.** `PMinus1Context(ctx, n, b1)` raises 2 to the prime powers up to B1,
+and to powers of 2 up to n. Powers of 2 are cheap and catch p − 1 with a
+large power of 2, which `TestPMinus1Backtrack` needs. `PMinus1(n)` still uses
+the primes below 50000 to powers below n, about 15× more squarings at the
+same B1. `factor` uses B1 = 10⁶, ten times the B1 of the last ECM level, as
+GMP-ECM suggests.
+
+Capping the powers at first only gave 4–8×. `Exp` uses Montgomery
+multiplication only for exponents of more than one word, so one `Exp` per
+small prime power spent most of its time in `nat.div`. Each batch of 16
+prime powers is now one exponent:
+
+| digits | `PMinus1` | `PMinus1Context`, B1=50000 | B1=10⁶ |
+|---|---|---|---|
+| 40 | 40 ms | 5 ms | 73 ms |
+| 60 | 48 ms | 5 ms | 86 ms |
+| 80 | 83 ms | 6 ms | 109 ms |
+
 End to end with default methods:
 
-| composite | before | after |
-|---|---|---|
-| 30 + 30 digits | 59.8 s | 2.0 s |
-| 33 + 33 digits | 53.6 s | 2.5 s |
-| 36 + 37 digits | not factored (QS skipped) | 6.9 s |
-| 40 + 40 digits, qs in `-methods` | 87.7 s | 36.7 s |
+| composite | at the start | ECM sized | everything sized | found by |
+|---|---|---|---|---|
+| 12 + 48 digits | 0.25 s | – | 0.03 s | p−1 |
+| 30 + 30 digits | 59.8 s | 2.0 s | 0.30 s | QS |
+| 33 + 33 digits | 53.6 s | 2.5 s | 0.88 s | QS |
+| 36 + 37 digits | not factored (QS skipped) | 6.9 s | 5.7 s | QS |
+| 40 + 40 digits, qs in `-methods` | 87.7 s | 36.7 s | – | QS |
 
 **Not done:**
-- Brent, p−1 and p+1 still take about 1.5 s together on large inputs, and
-  most of the 2 s left at 60 digits. They could be sized the same way.
+- p+1 stage 2 runs a full Lucas chain for each prime, so one try at
+  B1 = 10⁴ takes about 450 ms. The baby-step giant-step stage 2 from ECM
+  would make it about one multiply per prime.
 - ECM curves run on one goroutine while QS uses all the cores. Running
   curves in parallel would give ECM much more within the same budget.
 - ECM still uses math/big multiply and reduce. PRAC chains for stage 1, an
@@ -592,4 +624,5 @@ End to end with default methods:
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
 3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
    hot-path big.Int allocations are gone; profile again.
-4. **Size brent, p−1 and p+1** like ECM (see "The `factor` pipeline").
+4. **p+1 stage 2** with baby steps and giant steps (see "The `factor`
+   pipeline").
