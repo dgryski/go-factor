@@ -678,11 +678,133 @@ QS stopped at 220 bits then.
 - The ECM and QS timings are from this laptop. A machine with a different
   balance between one core and all of them would want a different fraction.
 
+## Ideas from michel-leonard/C-Quadratic-Sieve (2026-11-25)
+
+A public domain C99 SIQS with a single large prime. Its notes give 5 hours
+for 310 bits, where ours estimated about 6 minutes for 306 bits, so its
+sieve has nothing to port. Its setup and recovery are worth copying.
+
+Setup on a 512 bit number took 32s before sieving started: 7.7s for the
+primes up to B, 3.1s for trial division, 10.7s for the factor base and
+10.3s for the square roots, with B = 1317051049 (33023253 primes).
+
+1. **Cap the factor base.** It reads the base size from a table by bit
+   size, interpolated linearly: 1300 primes at 135 bits, 4200 at 165,
+   10000 at 200, 20000 at 260 and 55000 at 330, flat past the ends. Ours
+   uses L^0.46 with no cap, which gives 187678 primes at 306 bits, where
+   msieve wanted 69508 relations for the same number. Time 250 and 300 bit
+   inputs with smaller bases before choosing a table.
+2. **Build the factor base by count, with one mod per prime.** It walks
+   the odd primes and stops once it has enough with kN a square mod p
+   (`preparation_part_5`), so it never sieves or trial divides up to B. We
+   take a big.Int mod of every prime up to B three times: trial division
+   of n, `buildFactorBase` on kN and the roots in `newSieve` on kN. One
+   n mod p covers all three, since kN mod p = k·(n mod p) mod p, and 0
+   means p divides n.
+3. **Sieve again when every dependency is trivial.** It raises the target
+   by needs >> (2 + tries) and sieves more, up to 3 times
+   (`outer_continuation_condition`). We give up.
+4. **Use every dependency.** It tries all 64 and combines the divisors by
+   GCD (`qs_register_divisor`), so one matrix can split n completely. Our
+   `split` stops at the first factor and `QuadraticSieve` sieves each
+   composite part again. That only matters for 3 or more large factors.
+5. **Notice stalls.** If 32 A values add no relations, it picks a random
+   target for A. We stop with "ran out of polynomials".
+
+Not worth taking: the multiplier search up to 127 (`knuthSchroeppel`
+stops at 100), multiplying inputs below 115 bits up to 124 bits (we use
+one polynomial below 60 bits), and AVL trees for duplicates (`seenX`).
+
+## Ideas from bbuhrow/yafu (2026-11-25)
+
+yafu's SIQS factors the 80 digit reference number in 3.4s on 15 threads
+(42s of CPU), against our 18.7s (226s of CPU). `factor -methods qs` also
+sieves the 209 bit cofactor again after the first split, which yafu
+doesn't. Run it from a scratch directory, since it writes siqs.dat,
+factor.log and session.log there, and restarts from siqs.dat:
+
+    echo "siqs(N)" | yafu -threads 15 -v -v
+
+**Its parameters on the reference number** (table `direct-neon`, falling
+back to `direct` in `factor/qs/siqs_params.c`):
+- 20,304 primes, p_max = 489,539, against our 59,370 and B = 1,570,053.
+- Single large primes up to 300·p_max, against our 64·p_max.
+- Double large primes from p_max² up to 2.3·10¹⁴, MFB = 1.76.
+- 3 blocks of 32 KB per side, against our 4 (M = 128K).
+- Multiplier 5, the same as ours. A has about 10 primes.
+- Small prime variation: primes below 256 aren't sieved, with a 21 bit
+  correction to the threshold.
+- Q2(x) polynomials, since kN ≡ 1 mod 8.
+- 20,368 relations wanted.
+
+**Factor base sizes, ours (L^0.46) against yafu's `direct` table:**
+
+| bits | ours | yafu |
+|---|---|---|
+| 198 | 7,219 | 5,472 |
+| 232 | 21,133 | 8,208 |
+| 265 | 57,663 | 11,856 |
+| 298 | 150,325 | 35,232 |
+| 330 | 363,614 | 87,500 |
+
+yafu turns double large primes on from 232 bits (70 digits).
+
+**Measured on the reference number with 15 workers**, with a temporary
+change that read B, the large prime multiplier and the double large prime
+settings from the environment:
+
+| B | large primes | sieving | matrix | total |
+|---|---|---|---|---|
+| default, 59,370 primes | 64·p_max, single | 16.5 s | 85,508×83,516, 2.2 s | 18.7 s |
+| 489,539, 20,303 primes | 64·p_max, single | ≈19.6 s | 30,573×29,662, 0.4 s | 20.8 s |
+| 489,539 | 300·p_max, single | 20.7 s | 30,699×29,944, 0.4 s | 21.2 s |
+| 489,539 | 300·p_max, double, 0.4 | 17.6 s | 34,255×34,120, 0.6 s | 18.9 s |
+| 489,539 | 300·p_max, double, 0.5 | 15.7 s | 45,206×43,517, 0.8 s | 16.8 s |
+
+- The smaller base alone is slower. With double large primes at 0.5 it is
+  10% faster than the default.
+- The matrix with double large primes stays small with the small base,
+  45,206×43,517 in 0.8s, against 133,913 columns and 4.9s at the default
+  B in "Double large primes". That was why they never paid off.
+- At 0.5, the first dependency split off p18·p23 together, so the second
+  split was 133 bits and not 209. That saved about 0.6s of the total.
+- Not tried: fractions above 0.5, and bases between 20k and 59k primes.
+
+**Ideas, most useful first:**
+1. **Retune B with double large primes on.** The sweep above should cover
+   fractions 0.5–0.7 and several B, at 70, 75 and 80 digits, then become
+   a table by bit size as in yafu, in place of L^0.46. This also fixes the
+   setup time on large inputs (see "Ideas from
+   michel-leonard/C-Quadratic-Sieve").
+2. **Raise the large prime bound** toward 300·p_max with double large
+   primes on. It made no difference with single large primes.
+3. **The sieve itself.** Even with its parameters we use 5× yafu's CPU
+   time. It sieves and trial divides the medium primes with NEON or AVX2
+   kernels (`med_sieve_32k_neon.c`, `tdiv_medprimes_32k_neon`) and checks
+   sieve locations 16 at a time. Profile ours on the reference number
+   before choosing what to copy.
+4. **Small prime variation.** It skips primes below 256 with a 21 bit
+   correction. Ours skips below 30 (`minSievePrime`).
+5. **Q2(x) polynomials.** When kN ≡ 1 mod 8, sieve ((2Ax + B)² − kN)/(4A)
+   with B odd, which takes a bit off every value.
+6. **Split double large prime cofactors with a small ECM** (yafu's
+   `dlp-ecm`), not `rho64`. `splitCofactor` was 6% of a 240 bit profile.
+7. **Split n completely from one matrix** (see "Ideas from
+   michel-leonard/C-Quadratic-Sieve", item 4). It would have saved about
+   1s on the reference number.
+
 ## Next steps
 
 1. **Finish double large primes** (above).
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
+   Cap B for large inputs (see "Ideas from michel-leonard/C-Quadratic-Sieve").
+   Tune it with double large primes on: a third of our B with fraction 0.5
+   was 10% faster at 80 digits (see "Ideas from bbuhrow/yafu").
 3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
    hot-path big.Int allocations are gone; profile again.
 4. **Retune the pre-QS budget** now that ECM runs in parallel (see "The
    `factor` pipeline").
+5. **Cheaper setup**: one mod per prime, then sieve again on trivial
+   dependencies (see "Ideas from michel-leonard/C-Quadratic-Sieve").
+6. **Profile the sieve against yafu's**, which uses 5× less CPU with the
+   same parameters (see "Ideas from bbuhrow/yafu").
