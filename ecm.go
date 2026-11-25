@@ -7,6 +7,10 @@ import (
 
 // ECM factors n with Lenstra's elliptic curve method, trying up to curves curves.
 // See https://en.wikipedia.org/wiki/Lenstra_elliptic-curve_factorization
+//
+// It uses Suyama curves in Montgomery form with x-only arithmetic, so stage 1
+// needs no inversions, and a baby-step giant-step stage 2 as in MIRACL's
+// factor.c.
 func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
 	if n.Cmp(one) <= 0 {
 		return nil, nil
@@ -15,11 +19,22 @@ func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
 		return []*big.Int{n}, nil
 	}
 
+	b2 := ecmB2Multiplier * b1
 	e := &ecm{
-		rnd:    rand.New(rand.NewSource(1)),
-		b1:     b1,
-		primes: sievePrimes(ecmB2Multiplier * b1),
-		curves: curves,
+		rnd:     rand.New(rand.NewSource(1)),
+		b1:      b1,
+		b2:      b2,
+		primes:  sievePrimes(b1),
+		isPrime: make([]uint64, (b2+ecmD)/64+1),
+		curves:  curves,
+	}
+	for _, p := range sievePrimes(b2) {
+		e.isPrime[p/64] |= 1 << (p % 64)
+	}
+	for m := 1; m <= ecmD/2; m += 2 {
+		if gcdInt(m, ecmD) == 1 {
+			e.babies = append(e.babies, m)
+		}
 	}
 	return e.factor(n)
 }
@@ -27,15 +42,28 @@ func ECM(n *big.Int, b1, curves int) (primes, composites []*big.Int) {
 const (
 	ecmB2Multiplier = 100
 
-	// Stage 2 caches d*P for prime gaps d < 2*ecmCacheSize.
-	ecmCacheSize = 128
+	// Stage 1 takes a gcd after this many primes.
+	ecmStage1Batch = 50
+
+	// Stage 2 giant steps are multiples of ecmD = 2*3*5*7*11.
+	ecmD = 2310
+
+	// Stage 2 takes a gcd after this many giant steps.
+	ecmStage2Batch = 16
 )
 
 type ecm struct {
-	rnd    *rand.Rand
-	b1     int
-	primes []int
-	curves int // left to try, shared by recursive calls
+	rnd     *rand.Rand
+	b1, b2  int
+	primes  []int    // primes <= b1
+	isPrime []uint64 // bitset of primes <= b2
+	babies  []int    // odd m <= ecmD/2 coprime to ecmD
+	curves  int      // left to try, shared by recursive calls
+}
+
+// prime reports whether q is a prime in (b1, b2].
+func (e *ecm) prime(q int) bool {
+	return q > e.b1 && q <= e.b2 && e.isPrime[q/64]&(1<<(q%64)) != 0
 }
 
 func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
@@ -67,116 +95,280 @@ func (e *ecm) factor(n *big.Int) (primes, composites []*big.Int) {
 // curve runs both stages on a random curve and returns a proper factor of n or nil.
 func (e *ecm) curve(n *big.Int) *big.Int {
 	c := &ecCurve{n: n}
-
-	var p ecPoint
-	p.x.Rand(e.rnd, n)
-	p.y.Rand(e.rnd, n)
-	c.a.Rand(e.rnd, n)
-
-	// b = y^2 - x(x^2 + a)
-	var b, t big.Int
-	t.Mul(&p.x, &p.x)
-	t.Add(&t, &c.a)
-	t.Mul(&t, &p.x)
-	b.Mul(&p.y, &p.y)
-	b.Sub(&b, &t)
-	b.Mod(&b, n)
-
-	// disc = 4a^3 + 27b^2 is 0 for a singular curve but may share a factor with n.
-	var disc big.Int
-	disc.Mul(&c.a, &c.a)
-	disc.Mul(&disc, &c.a)
-	disc.Lsh(&disc, 2)
-	t.Mul(&b, &b)
-	t.Mul(&t, big.NewInt(27))
-	disc.Add(&disc, &t)
-	if g, ok := c.split(&disc); ok {
-		return g
-	} else if g != nil {
-		return nil
-	}
-
-	// Stage 1 multiplies P by every prime power up to b1.
-	for _, pr := range e.primes {
-		if pr > e.b1 {
-			break
-		}
-		k := uint64(pr)
-		for k*uint64(pr) <= uint64(e.b1) {
-			k *= uint64(pr)
-		}
-		if g := c.mul(&p, &p, k); g != nil {
-			return c.proper(g)
-		}
-		if p.inf {
-			// P has order dividing k mod every prime of n.
-			return nil
-		}
-	}
-
-	// Stage 2 steps Q = q*P over primes q above b1. When Q = O mod p the next
-	// Q + d*P has no inverse mod p, which exposes p.
-	start := 0
-	for start < len(e.primes) && e.primes[start] <= e.b1 {
-		start++
-	}
-	if start == len(e.primes) {
-		return nil
-	}
-
-	var q ecPoint
-	if g := c.mul(&q, &p, uint64(e.primes[start])); g != nil {
+	var p xzPoint
+	if g := c.suyama(&p, 6+e.rnd.Int63n(1<<32)); g != nil {
 		return c.proper(g)
 	}
 
-	var cache [ecmCacheSize]*ecPoint
-	var step ecPoint
-	for i := start + 1; i < len(e.primes); i++ {
-		if q.inf {
-			return nil
+	// Stage 1 multiplies P by every prime power up to b1. A prime of n shows
+	// up in gcd(Z, n) once P = O mod that prime.
+	saved := new(xzPoint)
+	saved.set(&p)
+	start := 0
+	for i, q := range e.primes {
+		k := uint64(q)
+		for k*uint64(q) <= uint64(e.b1) {
+			k *= uint64(q)
 		}
-		d := e.primes[i] - e.primes[i-1]
-		var dp *ecPoint
-		if d/2 < ecmCacheSize {
-			dp = cache[d/2]
-			if dp == nil {
-				dp = new(ecPoint)
-				if g := c.mul(dp, &p, uint64(d)); g != nil {
+		c.mul(&p, &p, k)
+
+		if (i+1)%ecmStage1Batch != 0 && i+1 != len(e.primes) {
+			continue
+		}
+		g, _ := c.split(&p.z)
+		if g == nil {
+			saved.set(&p)
+			start = i + 1
+			continue
+		}
+		if g != n {
+			return g
+		}
+		// Every prime of n was found in this batch. Redo it one prime at a time.
+		p.set(saved)
+		for _, q := range e.primes[start : i+1] {
+			for k := uint64(q); k <= uint64(e.b1); k *= uint64(q) {
+				c.mul(&p, &p, uint64(q))
+				if g, _ := c.split(&p.z); g != nil {
 					return c.proper(g)
 				}
-				cache[d/2] = dp
 			}
-		} else {
-			if g := c.mul(&step, &p, uint64(d)); g != nil {
-				return c.proper(g)
-			}
-			dp = &step
 		}
-		if g := c.add(&q, &q, dp); g != nil {
-			return c.proper(g)
-		}
+		return nil
 	}
 
+	return e.stage2(c, &p)
+}
+
+// stage2 looks for one more prime q in (b1, b2] with q*P = O mod a prime of n.
+// It writes q = c±m with c a multiple of ecmD and m a baby step. x(c*P) and
+// x(m*P) agree mod p exactly when (c-m)*P or (c+m)*P is O mod p, so one
+// product term covers both.
+func (e *ecm) stage2(c *ecCurve, p *xzPoint) *big.Int {
+	n := c.n
+
+	// Baby steps: fu[m] = x(m*P) for m in e.babies.
+	fu := make([]big.Int, ecmD/2+1)
+	if g := c.normalise(&fu[1], p); g != nil {
+		return c.proper(g)
+	}
+	var p2, prev, cur, next xzPoint
+	c.double(&p2, p)
+	prev.set(p)
+	c.add(&cur, &p2, p, p) // 3P
+	for m := 3; m <= ecmD/2; m += 2 {
+		if gcdInt(m, ecmD) == 1 {
+			if g := c.normalise(&fu[m], &cur); g != nil {
+				return c.proper(g)
+			}
+		}
+		// (m+2)P = mP + 2P, with difference (m-2)P.
+		c.add(&next, &cur, &p2, &prev)
+		prev.set(&cur)
+		cur.set(&next)
+	}
+
+	// Giant steps: cur = iv*G and next = (iv+1)*G for G = ecmD*P, starting at
+	// the multiple of ecmD nearest b1.
+	var giant xzPoint
+	c.mul(&giant, p, ecmD)
+	iv := (e.b1 + ecmD/2) / ecmD
+	if iv < 1 {
+		iv = 1
+	}
+	c.ladder(&cur, &next, &giant, uint64(iv))
+
+	var x, t, g big.Int
+	acc := big.NewInt(1)
+	for steps := 1; ; steps++ {
+		base := iv * ecmD
+		if gg := c.normalise(&x, &cur); gg != nil {
+			return c.proper(gg)
+		}
+		for _, m := range e.babies {
+			if !e.prime(base-m) && !e.prime(base+m) {
+				continue
+			}
+			c.sub(&t, &x, &fu[m])
+			c.mulMod(acc, acc, &t)
+		}
+
+		last := base+ecmD/2 >= e.b2
+		if steps%ecmStage2Batch == 0 || last {
+			g.GCD(nil, nil, acc, n)
+			if g.Cmp(one) != 0 {
+				if g.Cmp(n) == 0 {
+					return nil
+				}
+				return &g
+			}
+		}
+		if last {
+			return nil
+		}
+
+		// (iv+2)G = (iv+1)G + G, with difference iv*G.
+		c.add(&prev, &next, &giant, &cur)
+		cur.set(&next)
+		next.set(&prev)
+		iv++
+	}
+}
+
+// xzPoint is a point (X:Z) on a Montgomery curve with y dropped.
+// Z = 0 is the point at infinity.
+type xzPoint struct {
+	x, z big.Int
+}
+
+func (p *xzPoint) set(q *xzPoint) {
+	p.x.Set(&q.x)
+	p.z.Set(&q.z)
+}
+
+// ecCurve is the Montgomery curve By^2 = x^3 + Ax^2 + x mod n, stored as
+// a24 = (A+2)/4.
+type ecCurve struct {
+	n   *big.Int
+	a24 big.Int
+
+	q, t           big.Int // mulMod scratch
+	s1, d1, s2, d2 big.Int
+	u, w           big.Int
+	l1, l2         xzPoint // ladder scratch
+}
+
+// suyama sets p to the starting point of Suyama's curve for sigma. These
+// curves have group order divisible by 12. If 16u^3v is not invertible it
+// returns its gcd with n.
+func (c *ecCurve) suyama(p *xzPoint, sigma int64) *big.Int {
+	n := c.n
+	var u, v, t, a, inv big.Int
+	s := big.NewInt(sigma)
+	u.Mul(s, s)
+	u.Sub(&u, big.NewInt(5))
+	u.Mod(&u, n)
+	v.Lsh(s, 2)
+	v.Mod(&v, n)
+
+	// x = u^3, z = v^3
+	c.mulMod(&p.x, &u, &u)
+	c.mulMod(&p.x, &p.x, &u)
+	c.mulMod(&p.z, &v, &v)
+	c.mulMod(&p.z, &p.z, &v)
+
+	// a24 = (v-u)^3 (3u+v) / 16u^3v
+	c.sub(&t, &v, &u)
+	c.mulMod(&a, &t, &t)
+	c.mulMod(&a, &a, &t)
+	t.Mul(&u, big.NewInt(3))
+	t.Add(&t, &v)
+	t.Mod(&t, n)
+	c.mulMod(&a, &a, &t)
+
+	c.mulMod(&t, &p.x, &v)
+	t.Lsh(&t, 4)
+	t.Mod(&t, n)
+	if inv.ModInverse(&t, n) == nil {
+		g, _ := c.split(&t)
+		if g == nil {
+			return n
+		}
+		return g
+	}
+	c.mulMod(&c.a24, &a, &inv)
 	return nil
 }
 
-type ecPoint struct {
-	x, y big.Int
-	inf  bool // the point at infinity
+// mulMod sets z = x*y mod n for x, y in [0, n).
+func (c *ecCurve) mulMod(z, x, y *big.Int) {
+	c.t.Mul(x, y)
+	c.q.QuoRem(&c.t, c.n, z)
 }
 
-func (p *ecPoint) set(q *ecPoint) {
-	p.x.Set(&q.x)
-	p.y.Set(&q.y)
-	p.inf = q.inf
+// addMod sets z = x+y mod n for x, y in [0, n).
+func (c *ecCurve) addMod(z, x, y *big.Int) {
+	z.Add(x, y)
+	if z.Cmp(c.n) >= 0 {
+		z.Sub(z, c.n)
+	}
 }
 
-type ecCurve struct {
-	n *big.Int
-	a big.Int
+// sub sets z = x-y mod n for x, y in [0, n).
+func (c *ecCurve) sub(z, x, y *big.Int) {
+	z.Sub(x, y)
+	if z.Sign() < 0 {
+		z.Add(z, c.n)
+	}
+}
 
-	l, t, u, inv big.Int
-	r, s         ecPoint
+// double sets r = 2p. r may alias p.
+func (c *ecCurve) double(r, p *xzPoint) {
+	c.addMod(&c.s1, &p.x, &p.z)
+	c.sub(&c.d1, &p.x, &p.z)
+	c.mulMod(&c.s1, &c.s1, &c.s1) // (x+z)^2
+	c.mulMod(&c.d1, &c.d1, &c.d1) // (x-z)^2
+	c.sub(&c.u, &c.s1, &c.d1)     // 4xz
+	c.mulMod(&r.x, &c.s1, &c.d1)
+	c.mulMod(&c.w, &c.a24, &c.u)
+	c.addMod(&c.w, &c.w, &c.d1)
+	c.mulMod(&r.z, &c.w, &c.u)
+}
+
+// add sets r = p+q given diff = p-q. r may alias p or q but not diff.
+func (c *ecCurve) add(r, p, q, diff *xzPoint) {
+	c.addMod(&c.s1, &p.x, &p.z)
+	c.sub(&c.d1, &p.x, &p.z)
+	c.addMod(&c.s2, &q.x, &q.z)
+	c.sub(&c.d2, &q.x, &q.z)
+	c.mulMod(&c.u, &c.d1, &c.s2)
+	c.mulMod(&c.w, &c.s1, &c.d2)
+	c.addMod(&c.s1, &c.u, &c.w)
+	c.sub(&c.d1, &c.u, &c.w)
+	c.mulMod(&c.s1, &c.s1, &c.s1)
+	c.mulMod(&c.d1, &c.d1, &c.d1)
+	c.mulMod(&r.x, &c.s1, &diff.z)
+	c.mulMod(&r.z, &c.d1, &diff.x)
+}
+
+// ladder sets r1 = k*p and r2 = (k+1)*p for k >= 1 with the Montgomery
+// ladder. p must not alias r1 or r2.
+func (c *ecCurve) ladder(r1, r2, p *xzPoint, k uint64) {
+	r1.set(p)
+	c.double(r2, p)
+	top := 63
+	for k>>uint(top)&1 == 0 {
+		top--
+	}
+	for bit := top - 1; bit >= 0; bit-- {
+		if k>>uint(bit)&1 == 1 {
+			c.add(r1, r1, r2, p)
+			c.double(r2, r2)
+		} else {
+			c.add(r2, r1, r2, p)
+			c.double(r1, r1)
+		}
+	}
+}
+
+// mul sets r = k*p for k >= 1. r may alias p.
+func (c *ecCurve) mul(r, p *xzPoint, k uint64) {
+	c.ladder(&c.l1, &c.l2, p, k)
+	r.set(&c.l1)
+}
+
+// normalise sets x = p.x/p.z. If p.z is not invertible it returns its gcd
+// with n.
+func (c *ecCurve) normalise(x *big.Int, p *xzPoint) *big.Int {
+	var inv big.Int
+	if inv.ModInverse(&p.z, c.n) == nil {
+		if g, _ := c.split(&p.z); g != nil {
+			return g
+		}
+		return c.n
+	}
+	c.mulMod(x, &p.x, &inv)
+	return nil
 }
 
 // split returns (g, true) for a proper factor g = gcd(d, n). Otherwise g is
@@ -194,103 +386,19 @@ func (c *ecCurve) split(d *big.Int) (*big.Int, bool) {
 	return &g, true
 }
 
-// invert sets c.inv to 1/d mod n. If d is not invertible it returns gcd(d, n).
-func (c *ecCurve) invert(d *big.Int) *big.Int {
-	c.u.Mod(d, c.n)
-	if c.inv.ModInverse(&c.u, c.n) != nil {
-		return nil
-	}
-	g, _ := c.split(&c.u)
-	return g
-}
-
-// add sets r = p + q. If a denominator is not invertible it returns its gcd
-// with n, which is n itself if the curve failed mod every prime at once.
-func (c *ecCurve) add(r, p, q *ecPoint) *big.Int {
-	switch {
-	case p.inf:
-		r.set(q)
-		return nil
-	case q.inf:
-		r.set(p)
-		return nil
-	}
-
-	n := c.n
-	if p.x.Cmp(&q.x) == 0 {
-		c.t.Add(&p.y, &q.y)
-		c.t.Mod(&c.t, n)
-		if c.t.Sign() == 0 {
-			// P + (-P) = O
-			r.inf = true
-			return nil
-		}
-		// l = (3x^2 + a) / 2y
-		c.t.Lsh(&p.y, 1)
-		if g := c.invert(&c.t); g != nil {
-			return g
-		}
-		c.l.Mul(&p.x, &p.x)
-		c.l.Mul(&c.l, big.NewInt(3))
-		c.l.Add(&c.l, &c.a)
-	} else {
-		// l = (y2 - y1) / (x2 - x1)
-		c.t.Sub(&q.x, &p.x)
-		if g := c.invert(&c.t); g != nil {
-			return g
-		}
-		c.l.Sub(&q.y, &p.y)
-	}
-	c.l.Mul(&c.l, &c.inv)
-	c.l.Mod(&c.l, n)
-
-	// x3 = l^2 - x1 - x2
-	c.t.Mul(&c.l, &c.l)
-	c.t.Sub(&c.t, &p.x)
-	c.t.Sub(&c.t, &q.x)
-	c.t.Mod(&c.t, n)
-
-	// y3 = l(x1 - x3) - y1
-	c.u.Sub(&p.x, &c.t)
-	c.u.Mul(&c.u, &c.l)
-	c.u.Sub(&c.u, &p.y)
-	c.u.Mod(&c.u, n)
-
-	r.x.Set(&c.t)
-	r.y.Set(&c.u)
-	r.inf = false
-	return nil
-}
-
-// mul sets r = k*p. It returns the same values as add and leaves r unchanged
-// when it fails.
-func (c *ecCurve) mul(r, p *ecPoint, k uint64) *big.Int {
-	acc, base := &c.r, &c.s
-	acc.inf = true
-	base.set(p)
-	for k > 0 {
-		if k&1 == 1 {
-			if g := c.add(acc, acc, base); g != nil {
-				return g
-			}
-		}
-		k >>= 1
-		if k > 0 {
-			if g := c.add(base, base, base); g != nil {
-				return g
-			}
-		}
-	}
-	r.set(acc)
-	return nil
-}
-
 // proper returns g, or nil if g is n and the curve has no factor to give.
 func (c *ecCurve) proper(g *big.Int) *big.Int {
 	if g == c.n {
 		return nil
 	}
 	return g
+}
+
+func gcdInt(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 // sievePrimes returns the primes <= max.
