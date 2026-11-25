@@ -137,10 +137,10 @@ func main() {
 		}
 	}
 
-	// Above about 220 bits (66 digits) the quadratic sieve takes
-	// minutes, and its dense matrix needs gigabytes. Asking for qs by
-	// name with -methods lifts the limit.
-	const qsMaxBits = 220
+	// At 266 bits (80 digits) the quadratic sieve takes about 15s on 15
+	// cores and 550MB, and the time doubles every 3 or 4 digits. Asking for
+	// qs by name with -methods lifts the limit.
+	const qsMaxBits = 266
 	qsRuns := func(n *big.Int) bool {
 		return run["qs"] && (methodsSet || n.BitLen() <= qsMaxBits)
 	}
