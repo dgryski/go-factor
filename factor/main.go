@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log"
 	"math/big"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/dgryski/go-factor"
 	"github.com/dgryski/go-factor/qs"
@@ -68,46 +71,63 @@ func main() {
 		}
 	}
 
-	if run["brent"] && len(ctmp) > 0 {
-		p := int64(2)
-		for _, v := range []int64{1, -1, 3} {
-			var comps []*big.Int
-			for _, cc := range ctmp {
-				log.Printf("starting brent(%v,%v)", p, v)
-				ptmp, c2 := factor.Brent(cc, p, v)
-				if len(ptmp) > 0 {
-					log.Printf("brent(%v,%v)=%+v\n", p, v, ptmp)
-				}
-				comps = append(comps, c2...)
-			}
-			ctmp = comps
-		}
+	// At 266 bits (80 digits) the quadratic sieve takes about 15s on 15
+	// cores and 550MB, and the time doubles every 3 or 4 digits. Asking for
+	// qs by name with -methods lifts the limit.
+	const qsMaxBits = 266
+	qsRuns := func(n *big.Int) bool {
+		return run["qs"] && (methodsSet || n.BitLen() <= qsMaxBits)
 	}
 
-	if run["p-1"] && len(ctmp) > 0 {
-		log.Println("starting p-1")
+	qsWorkers := *workers
+	if qsWorkers <= 0 {
+		qsWorkers = runtime.GOMAXPROCS(0)
+	}
+	b := &budget{start: time.Now(), workers: qsWorkers, qsRuns: qsRuns}
+
+	// each runs f on every composite left, until share of its budget is used.
+	each := func(name string, share float64, f func(context.Context, *big.Int) ([]*big.Int, []*big.Int)) {
+		log.Printf("starting %s", name)
 		var comps []*big.Int
 		for _, cc := range ctmp {
-			ptmp, c2 := factor.PMinus1(cc)
+			ctx, cancel, ok := b.context(cc, share)
+			if !ok {
+				log.Printf("skipping %s for %d digits: its share of the time before qs is used", name, len(cc.String()))
+				comps = append(comps, cc)
+				continue
+			}
+			ptmp, c2 := f(ctx, cc)
+			cancel()
 			if len(ptmp) > 0 {
-				log.Printf("p-1=%+v\n", ptmp)
+				log.Printf("%s=%+v\n", name, ptmp)
 			}
 			comps = append(comps, c2...)
 		}
 		ctmp = comps
+	}
+
+	if run["brent"] {
+		for _, v := range []int64{1, -1, 3} {
+			if len(ctmp) == 0 {
+				break
+			}
+			each(fmt.Sprintf("brent(2,%v)", v), shareBrent, func(ctx context.Context, n *big.Int) ([]*big.Int, []*big.Int) {
+				return factor.BrentContext(ctx, n, 2, v)
+			})
+		}
+	}
+
+	// GMP-ECM suggests p-1 with 10 times the B1 of the last ECM level.
+	if run["p-1"] && len(ctmp) > 0 {
+		each("p-1", sharePMinus, func(ctx context.Context, n *big.Int) ([]*big.Int, []*big.Int) {
+			return factor.PMinus1Context(ctx, n, 1000000)
+		})
 	}
 
 	if run["p+1"] && len(ctmp) > 0 {
-		log.Println("starting p+1")
-		var comps []*big.Int
-		for _, cc := range ctmp {
-			ptmp, c2 := factor.PPlus1(cc, 10000, 3)
-			if len(ptmp) > 0 {
-				log.Printf("p+1=%+v\n", ptmp)
-			}
-			comps = append(comps, c2...)
-		}
-		ctmp = comps
+		each("p+1", sharePPlus, func(ctx context.Context, n *big.Int) ([]*big.Int, []*big.Int) {
+			return factor.PPlus1Context(ctx, n, 10000, 3)
+		})
 	}
 
 	if run["squfof"] && len(ctmp) > 0 {
@@ -137,22 +157,10 @@ func main() {
 		}
 	}
 
-	// At 266 bits (80 digits) the quadratic sieve takes about 15s on 15
-	// cores and 550MB, and the time doubles every 3 or 4 digits. Asking for
-	// qs by name with -methods lifts the limit.
-	const qsMaxBits = 266
-	qsRuns := func(n *big.Int) bool {
-		return run["qs"] && (methodsSet || n.BitLen() <= qsMaxBits)
-	}
-
 	if run["ecm"] && len(ctmp) > 0 {
-		qsWorkers := *workers
-		if qsWorkers <= 0 {
-			qsWorkers = runtime.GOMAXPROCS(0)
-		}
 		var comps []*big.Int
 		for _, cc := range ctmp {
-			ptmp, c2 := ecmPretest(cc, qsRuns(cc), qsWorkers)
+			ptmp, c2 := ecmPretest(cc, b)
 			if len(ptmp) > 0 {
 				log.Printf("ecm=%+v\n", ptmp)
 			}
