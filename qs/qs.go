@@ -8,6 +8,7 @@
 package qs
 
 import (
+	"fmt"
 	"math"
 	"math/big"
 	"math/bits"
@@ -149,11 +150,39 @@ func logf(format string, args ...interface{}) {
 	}
 }
 
-// logProgress reports how many relations the sieve has collected.
+// rateAlpha weighs the latest relations-per-second sample in the EWMA used
+// to estimate the time left. The rate climbs as partials start combining,
+// so with a log every 5s this mostly reflects the last 10s or so.
+const rateAlpha = 0.5
+
+// logProgress reports how many relations the sieve has collected and how
+// long the rest should take at the recent rate.
 func (s *sieve) logProgress() {
-	logf("qs: %d/%d relations (%d full, %d from partials), %d partials, %d polynomials, %v",
-		len(s.relations)+s.partialExcess, s.want, len(s.relations), s.partialExcess, len(s.partials), s.polys,
-		time.Since(s.start).Round(time.Millisecond))
+	now := time.Now()
+	have := len(s.relations) + s.partialExcess
+	// The first log comes after the first batch, and the time before it is
+	// mostly setup, so it only sets the starting point.
+	if dt := now.Sub(s.lastLog).Seconds(); !s.lastLog.IsZero() && dt > 0 {
+		r := max(0, float64(have-s.lastHave)/dt)
+		if s.rate == 0 {
+			s.rate = r
+		} else {
+			s.rate = rateAlpha*r + (1-rateAlpha)*s.rate
+		}
+	}
+	s.lastLog, s.lastHave = now, have
+
+	left := ""
+	if have < s.want {
+		left = ", time left unknown"
+		if s.rate > 0 {
+			eta := time.Duration(float64(s.want-have) / s.rate * float64(time.Second))
+			left = fmt.Sprintf(", about %v left", eta.Round(time.Second))
+		}
+	}
+	logf("qs: %d/%d relations (%d full, %d from partials), %d partials, %d polynomials, %v%s",
+		have, s.want, len(s.relations), s.partialExcess, len(s.partials), s.polys,
+		now.Sub(s.start).Round(time.Millisecond), left)
 }
 
 // params chooses the factor base bound b and the sieve half-width, and
@@ -432,9 +461,11 @@ type sieve struct {
 	nextCount     int // len(partials) at which to count again
 
 	// For progress logging.
-	polys   int // polynomials sieved
-	start   time.Time
-	lastLog time.Time
+	polys    int // polynomials sieved
+	start    time.Time
+	lastLog  time.Time
+	lastHave int     // relations at lastLog
+	rate     float64 // EWMA of relations per second between logs
 }
 
 // worker sieves polynomials. Each worker has its own copy of the roots and
@@ -697,7 +728,6 @@ func (s *sieve) siqs(sieveRange int64) *big.Int {
 			s.polys += polys
 			if Logf != nil && time.Since(s.lastLog) > 5*time.Second {
 				s.logProgress()
-				s.lastLog = time.Now()
 			}
 		}
 		if finished {
