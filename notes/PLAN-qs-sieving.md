@@ -626,23 +626,53 @@ One try:
 | 60 | 452 ms | 15 ms | 71 ms | 337 ms |
 | 80 | 489 ms | 16 ms | 74 ms | 349 ms |
 
+**Parallel ECM.** QS used all the cores but ECM used one, so ECM got
+little done within its budget.
+- `ECMWorkers` goroutines run the curves, `runtime.GOMAXPROCS(0)` by
+  default, and `factor -workers` sets it along with `qs.Workers`.
+- One goroutine draws each curve's σ from the seeded generator, so the same
+  curves are tried whatever the worker count, though which finds a factor
+  first can vary.
+- The first factor found cancels the other curves. `curve` and `stage2` take
+  the context, so the cancellation and the caller's deadline both reach
+  curves in progress.
+- The stage 2 prime bitset is built under a `sync.Once`.
+- `TestECM` runs with 1 and 8 workers, and is clean under `-race`.
+- TinyGo's `GOMAXPROCS` returns 1, so `factor.tiny` runs one ECM worker.
+
+60 curves at B1 = 11000 on a 60-digit number:
+
+| workers | 1 | 2 | 4 | 5 | 8 | 15 |
+|---|---|---|---|---|---|---|
+| time | 2.68 s | 1.46 s | 0.80 s | 0.68 s | 0.57 s | 0.47 s |
+| speedup | 1.0× | 1.8× | 3.3× | 4.0× | 4.7× | 5.7× |
+
+Past 5 workers the extra cores are efficiency cores, and with 4 curves per
+worker at 15 the last curves leave cores idle.
+
 End to end with default methods:
 
-| composite | at the start | ECM sized | everything sized | found by |
-|---|---|---|---|---|
-| 12 + 48 digits | 0.25 s | – | 0.03 s | p−1 |
-| 30 + 30 digits | 59.8 s | 2.0 s | 0.30 s | QS |
-| 33 + 33 digits | 53.6 s | 2.5 s | 0.88 s | QS |
-| 36 + 37 digits | not factored (QS skipped) | 6.9 s | 5.7 s | QS |
-| 40 + 40 digits, qs in `-methods` | 87.7 s | 36.7 s | – | QS |
+| composite | at the start | ECM sized | everything sized | parallel ECM | found by |
+|---|---|---|---|---|---|
+| 12 + 48 digits | 0.25 s | – | 0.03 s | – | p−1 |
+| 30 + 30 digits | 59.8 s | 2.0 s | 0.30 s | – | QS |
+| 33 + 33 digits | 53.6 s | 2.5 s | 0.88 s | – | QS |
+| 36 + 37 digits | not factored (QS skipped) | 6.9 s | 5.7 s | 5.6 s | QS |
+| 40 + 40 digits | 87.7 s | 36.7 s | – | 32.2 s | QS |
+| 22 + 58 digits | – | – | 2.7 s | 1.8 s | ECM |
+| 24 + 56 digits | 43.2 s | 37.1 s | 32.0 s | 7.4 s | ECM, where QS found it before |
+
+The 40 + 40 digit runs before "parallel ECM" named qs in `-methods`, since
+QS stopped at 220 bits then.
 
 **Not done:**
 - The deadlines are wall-clock time, so which method finds a factor can vary
   between runs. The 12 + 48 digit number needs p−1 to reach B1 = 35407
   within about 18 ms. It usually does, but the first run of a freshly built
   binary is slower on macOS, and then ECM found it instead.
-- ECM curves run on one goroutine while QS uses all the cores. Running
-  curves in parallel would give ECM much more within the same budget.
+- ECM's share is still a third of the QS estimate, chosen when ECM ran on
+  one core. It now gets about 6× more done in that time, so the right share
+  may have changed.
 - ECM still uses math/big multiply and reduce. PRAC chains for stage 1, an
   FFT stage 2 as in GMP-ECM, or Edwards curves would each be faster.
 - The ECM and QS timings are from this laptop. A machine with a different
@@ -654,6 +684,5 @@ End to end with default methods:
 2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
 3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
    hot-path big.Int allocations are gone; profile again.
-4. **Parallel ECM curves.** QS uses all the cores but ECM uses one, so
-   ECM gets far less work done within its budget (see "The `factor`
-   pipeline").
+4. **Retune the pre-QS budget** now that ECM runs in parallel (see "The
+   `factor` pipeline").
