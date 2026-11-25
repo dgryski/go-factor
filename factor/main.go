@@ -124,9 +124,11 @@ func main() {
 		})
 	}
 
+	// GMP-ECM suggests p+1 three times with 5 times the B1 of the last ECM
+	// level.
 	if run["p+1"] && len(ctmp) > 0 {
 		each("p+1", sharePPlus, func(ctx context.Context, n *big.Int) ([]*big.Int, []*big.Int) {
-			return factor.PPlus1Context(ctx, n, 10000, 3)
+			return factor.PPlus1Context(ctx, n, 250000, 3)
 		})
 	}
 
