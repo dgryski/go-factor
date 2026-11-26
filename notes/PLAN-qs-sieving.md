@@ -793,18 +793,40 @@ settings from the environment:
    michel-leonard/C-Quadratic-Sieve", item 4). It would have saved about
    1s on the reference number.
 
-## Next steps
+## Prioritized improvements (2026-11-26)
 
-1. **Finish double large primes** (above).
-2. **Retune B and M** for SIQS at 70–80 digits. Ours is larger than msieve's.
-   Cap B for large inputs (see "Ideas from michel-leonard/C-Quadratic-Sieve").
-   Tune it with double large primes on: a third of our B with fraction 0.5
-   was 10% faster at 80 digits (see "Ideas from bbuhrow/yafu").
-3. **Allocations.** `runtime.madvise` was 15% of a 200-bit profile. The
-   hot-path big.Int allocations are gone; profile again.
-4. **Retune the pre-QS budget** now that ECM runs in parallel (see "The
-   `factor` pipeline").
-5. **Cheaper setup**: one mod per prime, then sieve again on trivial
-   dependencies (see "Ideas from michel-leonard/C-Quadratic-Sieve").
-6. **Profile the sieve against yafu's**, which uses 5× less CPU with the
-   same parameters (see "Ideas from bbuhrow/yafu").
+With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20–95 digits. Profiling the 80-digit reference run (`M = 128K`, DLP off, 15 workers: 16.45s wall, 14.96s sieve, 166.0s CPU) showed:
+
+- `fillBuckets`: 52.5% CPU (45.7% flat from 25.9B `nextOffset` 64-bit divisions and `[][]uint64` bucket slice appends).
+- `sievePoly`: 22.0% flat CPU (byte-by-byte threshold scan, bucket draining, inner stride loop, per-polynomial `w.small` rebuild).
+- `moveRoots`: 7.3% CPU.
+- `bucketHits`: 5.0% CPU.
+- `math/big` (`Mod` in `sieveA`/`setRootsInv` + `QuoRem` in `tryFactorize`): ~4.5% CPU, plus `runtime.madvise` 2.4%.
+
+### Priority 1 (CPU hotspots and sieve data structures)
+
+1. **Remove `big.Int` division and `nextOffset` divisions (`sieveA`, `fillBuckets`, `tryFactorize`)**
+   - Compute `aInv`, `deltas`, and initial roots in one pass per `A` using `uint64` prefix-product batch inversion of $q_j \bmod p$ and 32-bit `invMod32` ($B_j A^{-1} \equiv \gamma_j q_j^{-1} \pmod p$).
+   - Store `r1, r2` directly as non-negative offsets from `lo`, removing `nextOffset` divisions from `sievePoly` and `fillBuckets`, and use a branch-only single-hit check when $p \ge 2M$.
+   - Factor $|Y(x)|$ using 32/64-bit hardware `UDIV` limb division instead of `big.Int.QuoRem`, testing small primes directly against `w.roots[:resieveFrom]`.
+2. **Flat `uint32` bucket arena and 8-byte SWAR scan (`sievePoly`, `fillBuckets`, `bucketHits`)**
+   - Replace `buckets [][]uint64` (8 bytes/hit + slice headers) with a pre-allocated flat `uint32` slab (`idx << blockShift | off`, 4 bytes/hit) grouped by `logP` with 4x unrolled draining.
+   - Replace the byte-by-byte threshold loop with 8-byte SWAR scanning, `clear(block)`, and 4x unrolled prime stride updates.
+
+### Priority 2 (Algorithmic and parameter wins at 70–95 digits)
+
+3. **$Q_2(x)$ polynomials when $kN \equiv 1 \pmod 8$**
+   - Sieve $Y_2(x) = ((2Ax + B)^2 - kN)/(4A)$ with odd $B$ (choosing the sign of $B_{s-1}$ so $B$ is odd) and $X = (2Ax + B)(N+1)/2 \bmod N$, halving target $A$ and dividing sieve values by 4.
+4. **Tighter partial recount schedule near completion**
+   - Shrink the `countPartials` interval as `len(relations) + partialExcess` approaches `want` so runs stop near `want` instead of overshooting by ~5–6%.
+5. **Retune factor base table, Double Large Primes, sieve width, and small-prime skip**
+   - Replace `L(N)^0.46` above ~200 bits with a smaller table-driven $B$ paired with Double Large Primes (`dlpMinBits`, `dlpSlackFrac`, higher `largePrimeMult`), `largeSieveRange` (`256K`), and higher `minSievePrime` (small-prime variation), swept after Priorities 1–2.4 are in place.
+
+### Priority 3 (Pipeline, robustness, and vectorisation)
+
+6. **Combine all 64 Lanczos dependencies by GCD** so composites with 3+ factors split from one matrix.
+7. **Sieve additional relations if all dependencies are trivial** instead of returning `nil`.
+8. **Raise `qsMaxBits` to the QS/GNFS crossover (~95 digits)** and retune the parallel ECM pretest share in `factor/budget.go`.
+9. **Single `n mod p` setup pass** combining trial division, Legendre symbol, and modular square root setup.
+10. **Small P−1 / ECM cofactor split** ahead of `rho64` if `SplitCofactor` becomes hot under DLP.
+11. **SIMD / `avo` inner sieve and medium-prime kernel** after algorithmic and parameter changes settle.
