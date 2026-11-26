@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	blockShift    = 15 // 32 KB sieve blocks
+	blockShift    = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
 	blockSize     = 1 << blockShift
+	blockMask     = blockSize - 1
 	minSievePrime = 29
 )
 
@@ -40,6 +41,158 @@ type vertPrime struct {
 	idx  int32
 	p    uint32
 	logP byte
+}
+
+type logGroup struct {
+	logP       byte
+	start, end int
+}
+
+type overHit struct {
+	idx  int32
+	off  uint16
+	logP byte
+}
+
+// fkArena stores Franke-Kleinjung bucket hits as packed uint32 entries
+// (idx << blockShift | off) grouped by LogP in a flat slab per block.
+type fkArena struct {
+	data      []uint32
+	counts    []uint32
+	groupEnds [][]uint32
+	overflow  [][]overHit
+	hasOver   bool
+	stride    uint32
+	shift     uint
+}
+
+func buildLogGroupsRat(rfb []RatIdeal, idxs []int32) []logGroup {
+	if len(idxs) == 0 {
+		return nil
+	}
+	var out []logGroup
+	curLog := rfb[idxs[0]].LogP
+	start := 0
+	for i := 1; i < len(idxs); i++ {
+		lg := rfb[idxs[i]].LogP
+		if lg != curLog {
+			out = append(out, logGroup{logP: curLog, start: start, end: i})
+			curLog = lg
+			start = i
+		}
+	}
+	return append(out, logGroup{logP: curLog, start: start, end: len(idxs)})
+}
+
+func buildLogGroupsAlg(afb []AlgIdeal, idxs []int32) []logGroup {
+	if len(idxs) == 0 {
+		return nil
+	}
+	var out []logGroup
+	curLog := afb[idxs[0]].LogP
+	start := 0
+	for i := 1; i < len(idxs); i++ {
+		lg := afb[idxs[i]].LogP
+		if lg != curLog {
+			out = append(out, logGroup{logP: curLog, start: start, end: i})
+			curLog = lg
+			start = i
+		}
+	}
+	return append(out, logGroup{logP: curLog, start: start, end: len(idxs)})
+}
+
+func newFKArena(numBlocks, numGroups, expectedPerBlock int) *fkArena {
+	want := expectedPerBlock * 3
+	if want < 2048 {
+		want = 2048
+	}
+	shift := uint(11)
+	for (1 << shift) < want && shift < 17 {
+		shift++
+	}
+	stride := uint32(1 << shift)
+	ge := make([][]uint32, numGroups)
+	geBacking := make([]uint32, numGroups*numBlocks)
+	for g := 0; g < numGroups; g++ {
+		ge[g] = geBacking[g*numBlocks : (g+1)*numBlocks]
+	}
+	return &fkArena{
+		data:      make([]uint32, numBlocks<<shift),
+		counts:    make([]uint32, numBlocks),
+		groupEnds: ge,
+		overflow:  make([][]overHit, numBlocks),
+		stride:    stride,
+		shift:     shift,
+	}
+}
+
+func (a *fkArena) reset() {
+	clear(a.counts)
+	if a.hasOver {
+		for i := range a.overflow {
+			a.overflow[i] = a.overflow[i][:0]
+		}
+		a.hasOver = false
+	}
+}
+
+func (a *fkArena) addOverflow(bi int, idx int32, off uint16, logP byte) {
+	a.hasOver = true
+	a.overflow[bi] = append(a.overflow[bi], overHit{idx: idx, off: off, logP: logP})
+}
+
+func (a *fkArena) endGroup(g int) {
+	copy(a.groupEnds[g], a.counts)
+}
+
+func (a *fkArena) drainBlock(bi int, buf []byte, groups []logGroup) {
+	base := bi << a.shift
+	var cur uint32
+	for g, grp := range groups {
+		end := a.groupEnds[g][bi]
+		if end == cur {
+			continue
+		}
+		lg := grp.logP
+		s := a.data[base+int(cur) : base+int(end)]
+		i := 0
+		for ; i+3 < len(s); i += 4 {
+			buf[s[i]&blockMask] += lg
+			buf[s[i+1]&blockMask] += lg
+			buf[s[i+2]&blockMask] += lg
+			buf[s[i+3]&blockMask] += lg
+		}
+		for ; i < len(s); i++ {
+			buf[s[i]&blockMask] += lg
+		}
+		cur = end
+	}
+	if a.hasOver {
+		for _, ov := range a.overflow[bi] {
+			buf[ov.off] += ov.logP
+		}
+	}
+}
+
+func (a *fkArena) gatherHits(bi int, candBits *[blockSize / 64]uint64, candSlot *[blockSize]uint16, dst [][]int32) {
+	base := bi << a.shift
+	s := a.data[base : base+int(a.counts[bi])]
+	for _, e := range s {
+		off := e & blockMask
+		if candBits[off>>6]&(1<<(off&63)) != 0 {
+			k := candSlot[off]
+			dst[k] = append(dst[k], int32(e>>blockShift))
+		}
+	}
+	if a.hasOver {
+		for _, ov := range a.overflow[bi] {
+			if candBits[ov.off>>6]&(1<<(ov.off&63)) != 0 {
+				k := candSlot[ov.off]
+				dst[k] = append(dst[k], ov.idx)
+			}
+		}
+	}
 }
 
 // ReduceLattice constructs a Gauss-reduced basis for L = {(a, b) : a ≡ b*r (mod q)}
@@ -100,20 +253,16 @@ func invMod32(a, p uint32) uint32 {
 	return uint32(t)
 }
 
-// transformRoot computes the lattice-transformed hit condition for ideal (p, r):
-//
-//	i ≡ lambda * j (mod p), or vertical (j ≡ 0 mod p) if vert is true, or all (everywhere) if all is true.
+// transformRoot computes the lattice-transformed hit condition for ideal (p, r).
 func transformRoot(p, r uint32, lq *LatticeQ) (lambda uint32, vert, all bool) {
 	u1, u2 := lq.U1, lq.U2
 	v1, v2 := lq.V1, lq.V2
 	p64 := uint64(p)
 	var ap, bp uint64
 	if r == p {
-		// Projective: b ≡ 0 (mod p) => i*u2 + j*v2 ≡ 0 (mod p)
 		ap = modInt64(u2, p64)
 		bp = modInt64(-v2, p64)
 	} else {
-		// Affine: a ≡ r*b (mod p) => i*(u1 - r*u2) ≡ j*(r*v2 - v1) (mod p)
 		r64 := uint64(r)
 		u1m := modInt64(u1, p64)
 		u2m := modInt64(u2, p64)
@@ -145,7 +294,6 @@ func transformRoot(p, r uint32, lq *LatticeQ) (lambda uint32, vert, all bool) {
 
 // fkReduce reduces the p-lattice basis (-p, 0), (lambda, 1) to Franke-Kleinjung
 // vectors (a0, b0), (a1, b1) satisfying -W < a0 < 0 < a1 < W and a1 - a0 >= W.
-// Requires 0 < lambda < p and p >= W >= 2.
 func fkReduce(p, lambda, W int64) (a0, b0, a1, b1 int64) {
 	a0, b0 = -p, 0
 	a1, b1 = lambda, 1
@@ -175,25 +323,41 @@ func fkReduce(p, lambda, W int64) (a0, b0, a1, b1 int64) {
 	return a0, b0, a1, b1
 }
 
-// addFKHits appends Franke-Kleinjung bucket hits for p >= 2*I while skipping both-even (i, j).
-func addFKHits(p, lambda uint32, I, J int, tag uint64, buckets [][]uint64) {
+// addFKHitsArena appends Franke-Kleinjung hits for p >= 2*I into the flat uint32 arena,
+// skipping both-even (i, j) pairs.
+func addFKHitsArena(p, lambda uint32, I, J int, idx int32, logP byte, a *fkArena) {
 	W := 2 * I
 	total := (J - 1) * W
 	if total <= 0 {
 		return
 	}
+	tag := uint32(idx) << blockShift
+	counts := a.counts
+	data := a.data
+	stride := a.stride
+	if idx >= 1<<(32-blockShift) {
+		stride = 0
+	}
+	shift := a.shift
+
 	if lambda == 0 {
 		// Skip even j since i = 0 is even.
 		for adjPos := I; adjPos < total; adjPos += 2 * W {
 			bi := adjPos >> blockShift
-			buckets[bi] = append(buckets[bi], tag|uint64(adjPos&(blockSize-1)))
+			off := uint32(adjPos & blockMask)
+			if n := counts[bi]; n < stride {
+				data[bi<<shift|int(n)] = tag | off
+				counts[bi] = n + 1
+			} else {
+				a.addOverflow(bi, idx, uint16(off), logP)
+			}
 		}
 		return
 	}
 
 	a0, b0, a1, b1 := fkReduce(int64(p), int64(lambda), int64(W))
 	x := I
-	pos := I // starts at (i=0, j=0); subtract W to get adjPos
+	pos := I
 	thresh0 := int(-a0)
 	thresh1 := W - int(a1)
 	step0 := int(b0)*W + int(a0)
@@ -224,7 +388,13 @@ func addFKHits(p, lambda uint32, I, J int, tag uint64, buckets [][]uint64) {
 			if pos&evenMask != 0 {
 				adjPos := pos - W
 				bi := adjPos >> blockShift
-				buckets[bi] = append(buckets[bi], tag|uint64(adjPos&(blockSize-1)))
+				off := uint32(adjPos & blockMask)
+				if n := counts[bi]; n < stride {
+					data[bi<<shift|int(n)] = tag | off
+					counts[bi] = n + 1
+				} else {
+					a.addOverflow(bi, idx, uint16(off), logP)
+				}
 			}
 		}
 		return
@@ -247,7 +417,53 @@ func addFKHits(p, lambda uint32, I, J int, tag uint64, buckets [][]uint64) {
 		if ((x-I)|(pos/W))&1 != 0 {
 			adjPos := pos - W
 			bi := adjPos >> blockShift
-			buckets[bi] = append(buckets[bi], tag|uint64(adjPos&(blockSize-1)))
+			off := uint32(adjPos & blockMask)
+			if n := counts[bi]; n < stride {
+				data[bi<<shift|int(n)] = tag | off
+				counts[bi] = n + 1
+			} else {
+				a.addOverflow(bi, idx, uint16(off), logP)
+			}
+		}
+	}
+}
+
+func emitVertArena(p, I, J, W int, idx int32, logP byte, a *fkArena) {
+	tag := uint32(idx) << blockShift
+	counts := a.counts
+	data := a.data
+	stride := a.stride
+	if idx >= 1<<(32-blockShift) {
+		stride = 0
+	}
+	shift := a.shift
+	for j := p; j < J; j += p {
+		base := (j - 1) * W
+		if j&1 == 0 {
+			// Skip even i on even j lines where (x ^ I)&1 == 1 selects odd i.
+			for x := (I & 1) ^ 1; x < W; x += 2 {
+				pos := base + x
+				bi := pos >> blockShift
+				off := uint32(pos & blockMask)
+				if n := counts[bi]; n < stride {
+					data[bi<<shift|int(n)] = tag | off
+					counts[bi] = n + 1
+				} else {
+					a.addOverflow(bi, idx, uint16(off), logP)
+				}
+			}
+		} else {
+			for x := 0; x < W; x++ {
+				pos := base + x
+				bi := pos >> blockShift
+				off := uint32(pos & blockMask)
+				if n := counts[bi]; n < stride {
+					data[bi<<shift|int(n)] = tag | off
+					counts[bi] = n + 1
+				} else {
+					a.addOverflow(bi, idx, uint16(off), logP)
+				}
+			}
 		}
 	}
 }
@@ -593,7 +809,7 @@ func buildSpecialQs(poly *Poly, fb *FactorBases, params *Params) []LatticeQ {
 		dfp := arith.PolyDerivModP(fp, q)
 		for _, r := range arith.PolyRootsModP(fp, q) {
 			if arith.PolyEvalModP(dfp, r, q) == 0 {
-				continue // multiple root: v_q(F) need not be the ideal's valuation
+				continue
 			}
 			afbIdx := int32(-1)
 			if q <= uint64(params.Ba) {
@@ -607,7 +823,21 @@ func buildSpecialQs(poly *Poly, fb *FactorBases, params *Params) []LatticeQ {
 	return qs
 }
 
-// sieveLattice runs the special-q lattice sieve with Franke-Kleinjung buckets.
+func estimateExpectedFKHitsPerBlock(rfb []RatIdeal, afb []AlgIdeal, fkIdxs []int32, isRat bool) int {
+	var invSum float64
+	if isRat {
+		for _, idx := range fkIdxs {
+			invSum += 1.0 / float64(rfb[idx].P)
+		}
+	} else {
+		for _, idx := range fkIdxs {
+			invSum += 1.0 / float64(afb[idx].P)
+		}
+	}
+	return int(0.8*float64(blockSize)*invSum) + 256
+}
+
+// sieveLattice runs the special-q lattice sieve with flat Franke-Kleinjung bucket arenas.
 func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relation), shouldStop func() bool) int {
 	sqs := buildSpecialQs(poly, fb, params)
 	if len(sqs) == 0 {
@@ -643,6 +873,11 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 		}
 	}
 
+	ratGroups := buildLogGroupsRat(fb.RFB, ratFK)
+	algGroups := buildLogGroupsAlg(fb.AFB, algFK)
+	ratExpHits := estimateExpectedFKHitsPerBlock(fb.RFB, nil, ratFK, true)
+	algExpHits := estimateExpectedFKHitsPerBlock(nil, fb.AFB, algFK, false)
+
 	smallSlackRat := expectedSmallLogSumRat(fb, minSievePrime)
 	smallSlackAlg := expectedSmallLogSumAlg(fb, minSievePrime)
 
@@ -676,8 +911,8 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 		go func() {
 			defer wg.Done()
 			var ratBuf, algBuf [blockSize]byte
-			ratBuckets := make([][]uint64, numBlocks)
-			algBuckets := make([][]uint64, numBlocks)
+			ratArena := newFKArena(numBlocks, len(ratGroups), ratExpHits)
+			algArena := newFKArena(numBlocks, len(algGroups), algExpHits)
 			scratch := newCofactorScratch(poly.Degree)
 
 			ratLines := make([]linePrime, 0, len(ratLineIdx))
@@ -704,12 +939,9 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 				lq := &sqs[qi]
 				logQ := math.Log2(float64(lq.Q))
 
-				for b := 0; b < numBlocks; b++ {
-					ratBuckets[b] = ratBuckets[b][:0]
-					algBuckets[b] = algBuckets[b][:0]
-				}
+				ratArena.reset()
+				algArena.reset()
 
-				// Transform roots for line primes and fill FK buckets for p >= W.
 				ratLines = ratLines[:0]
 				ratVerts = ratVerts[:0]
 				ratAll = ratAll[:0]
@@ -747,38 +979,41 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 					}
 				}
 
-				for _, idx := range ratFK {
-					id := fb.RFB[idx]
-					lam, vert, all := transformRoot(id.P, id.R, lq)
-					tag := uint64(id.LogP)<<48 | uint64(idx)<<16
-					if all {
-						ratAll = append(ratAll, idx)
-						ratAllLog += id.LogP
-					} else if vert {
-						emitVertBuckets(int(id.P), I, J, W, tag, ratBuckets)
-					} else {
-						addFKHits(id.P, lam, I, J, tag, ratBuckets)
+				for g, grp := range ratGroups {
+					for _, idx := range ratFK[grp.start:grp.end] {
+						id := fb.RFB[idx]
+						lam, vert, all := transformRoot(id.P, id.R, lq)
+						if all {
+							ratAll = append(ratAll, idx)
+							ratAllLog += id.LogP
+						} else if vert {
+							emitVertArena(int(id.P), I, J, W, idx, grp.logP, ratArena)
+						} else {
+							addFKHitsArena(id.P, lam, I, J, idx, grp.logP, ratArena)
+						}
 					}
+					ratArena.endGroup(g)
 				}
 
-				for _, idx := range algFK {
-					id := fb.AFB[idx]
-					if id.P == lq.Q {
-						continue
+				for g, grp := range algGroups {
+					for _, idx := range algFK[grp.start:grp.end] {
+						id := fb.AFB[idx]
+						if id.P == lq.Q {
+							continue
+						}
+						lam, vert, all := transformRoot(id.P, id.R, lq)
+						if all {
+							algAll = append(algAll, idx)
+							algAllLog += id.LogP
+						} else if vert {
+							emitVertArena(int(id.P), I, J, W, idx, grp.logP, algArena)
+						} else {
+							addFKHitsArena(id.P, lam, I, J, idx, grp.logP, algArena)
+						}
 					}
-					lam, vert, all := transformRoot(id.P, id.R, lq)
-					tag := uint64(id.LogP)<<48 | uint64(idx)<<16
-					if all {
-						algAll = append(algAll, idx)
-						algAllLog += id.LogP
-					} else if vert {
-						emitVertBuckets(int(id.P), I, J, W, tag, algBuckets)
-					} else {
-						addFKHits(id.P, lam, I, J, tag, algBuckets)
-					}
+					algArena.endGroup(g)
 				}
 
-				// Sieve each block.
 				for bi := 0; bi < numBlocks && !stop.Load(); bi++ {
 					bStart := bi * blockSize
 					bEnd := bStart + blockSize
@@ -789,9 +1024,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 
 					ab := algBuf[:bLen]
 					sieveBlockLines(ab, bStart, bEnd, I, W, algLines, algVerts, algAllLog)
-					for _, e := range algBuckets[bi] {
-						ab[uint16(e)] += byte(e >> 48)
-					}
+					algArena.drainBlock(bi, ab, algGroups)
 
 					aThresh := latticeBlockThresholdAlg(poly, lq, bStart, bEnd, I, W, logQ, params.SlackAlg+smallSlackAlg, scratch)
 					if !hasByteGe(ab, aThresh) {
@@ -800,9 +1033,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 
 					rb := ratBuf[:bLen]
 					sieveBlockLines(rb, bStart, bEnd, I, W, ratLines, ratVerts, ratAllLog)
-					for _, e := range ratBuckets[bi] {
-						rb[uint16(e)] += byte(e >> 48)
-					}
+					ratArena.drainBlock(bi, rb, ratGroups)
 					rThresh := latticeBlockThresholdRat(poly, lq, bStart, bEnd, I, W, params.SlackRat+smallSlackRat, scratch)
 
 					rawOffs = appendBothGe(rawOffs[:0], ab, rb, aThresh, rThresh)
@@ -863,12 +1094,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						candSlot[off] = uint16(k)
 						ratCandHits[k] = ratCandHits[k][:0]
 					}
-					for _, e := range ratBuckets[bi] {
-						if off := uint16(e); candBits[off/64]&(1<<(off%64)) != 0 {
-							k := candSlot[off]
-							ratCandHits[k] = append(ratCandHits[k], int32(uint32(e>>16)))
-						}
-					}
+					ratArena.gatherHits(bi, &candBits, &candSlot, ratCandHits)
 					for _, off := range candPos {
 						candBits[off/64] = 0
 					}
@@ -897,7 +1123,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						continue
 					}
 
-					// Stage 2 scans algBuckets[bi] only for Stage 1 survivors.
+					// Stage 2 scans algArena only for Stage 1 survivors.
 					for len(algCandHits) < len(survivors) {
 						algCandHits = append(algCandHits, nil)
 					}
@@ -907,12 +1133,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						candSlot[off] = uint16(k)
 						algCandHits[k] = algCandHits[k][:0]
 					}
-					for _, e := range algBuckets[bi] {
-						if off := uint16(e); candBits[off/64]&(1<<(off%64)) != 0 {
-							k := candSlot[off]
-							algCandHits[k] = append(algCandHits[k], int32(uint32(e>>16)))
-						}
-					}
+					algArena.gatherHits(bi, &candBits, &candSlot, algCandHits)
 					for _, sv := range survivors {
 						candBits[sv.off/64] = 0
 					}
@@ -947,23 +1168,18 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 	return int(qDone.Load())
 }
 
-func emitVertBuckets(p, I, J, W int, tag uint64, buckets [][]uint64) {
-	for j := p; j < J; j += p {
-		base := (j - 1) * W
-		if j&1 == 0 {
-			// Skip even i on even j lines where (x ^ I)&1 == 1 selects odd i.
-			for x := (I & 1) ^ 1; x < W; x += 2 {
-				pos := base + x
-				bi := pos >> blockShift
-				buckets[bi] = append(buckets[bi], tag|uint64(pos&(blockSize-1)))
-			}
-		} else {
-			for x := 0; x < W; x++ {
-				pos := base + x
-				bi := pos >> blockShift
-				buckets[bi] = append(buckets[bi], tag|uint64(pos&(blockSize-1)))
-			}
-		}
+func addSieveStride(seg []byte, x, step, limit int, logP byte) {
+	step2 := step << 1
+	step3 := step2 + step
+	step4 := step << 2
+	for ; x+step3 < limit; x += step4 {
+		seg[x] += logP
+		seg[x+step] += logP
+		seg[x+step2] += logP
+		seg[x+step3] += logP
+	}
+	for ; x < limit; x += step {
+		seg[x] += logP
 	}
 }
 
@@ -978,7 +1194,6 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 		clear(buf)
 	}
 
-	// Fast path when block boundaries align with full lines of width W (always true for power-of-2 I <= 16384).
 	if bStart%W == 0 && bEnd%W == 0 {
 		j0 := 1 + bStart/W
 		nLines := (bEnd - bStart) / W
@@ -994,9 +1209,7 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 			for l := firstL; l < nLines; l += vpP {
 				seg := buf[l*W : (l+1)*W]
 				if (j0+l)&1 == 0 {
-					for x := iOddFirst; x < W; x += 2 {
-						seg[x] += logP
-					}
+					addSieveStride(seg, iOddFirst, 2, W, logP)
 				} else {
 					for x := 0; x < W; x++ {
 						seg[x] += logP
@@ -1021,13 +1234,9 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 					if (x-I)&1 == 0 {
 						x += p
 					}
-					for ; x < W; x += p2 {
-						seg[x] += logP
-					}
+					addSieveStride(seg, x, p2, W, logP)
 				} else {
-					for ; x < W; x += p {
-						seg[x] += logP
-					}
+					addSieveStride(seg, x, p, W, logP)
 				}
 				off += lam
 				if off >= p {
@@ -1038,7 +1247,6 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 		return
 	}
 
-	// General path for arbitrary non-aligned W.
 	j0 := 1 + bStart/W
 	for _, vp := range verts {
 		vpP := int(vp.p)
@@ -1053,10 +1261,7 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 			if j%vpP == 0 {
 				seg := buf[pos-bStart : pos-bStart+segLen]
 				if j&1 == 0 {
-					x := ((xFrom - I) & 1) ^ 1
-					for ; x < segLen; x += 2 {
-						seg[x] += logP
-					}
+					addSieveStride(seg, ((xFrom-I)&1)^1, 2, segLen, logP)
 				} else {
 					for x := 0; x < segLen; x++ {
 						seg[x] += logP
@@ -1092,13 +1297,9 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 				if (xGlobal-I)&1 == 0 {
 					x += p
 				}
-				for ; x < segLen; x += p2 {
-					seg[x] += logP
-				}
+				addSieveStride(seg, x, p2, segLen, logP)
 			} else {
-				for ; x < segLen; x += p {
-					seg[x] += logP
-				}
+				addSieveStride(seg, x, p, segLen, logP)
 			}
 			if xFrom+segLen == W {
 				off += lam

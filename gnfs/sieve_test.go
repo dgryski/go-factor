@@ -17,49 +17,76 @@ func TestFrankeKleinjungMatchesBruteForce(t *testing.T) {
 		numBlocks := (total + blockSize - 1) >> blockShift
 
 		primes := arith.PrimesUpTo(400)
-		for _, p64 := range primes {
-			p := uint32(p64)
-			if int(p) < W {
-				continue
-			}
-			for lam := uint32(0); lam < p; lam += 7 {
-				buckets := make([][]uint64, numBlocks)
-				addFKHits(p, lam, I, J, uint64(p)<<16, buckets)
-				got := make(map[[2]int]bool)
-				for bi, bkt := range buckets {
-					for _, e := range bkt {
-						gPos := bi*blockSize + int(uint16(e))
-						j := 1 + gPos/W
-						i := (gPos % W) - I
-						if (i|j)&1 == 0 {
-							t.Fatalf("emitted both-even (%d,%d) for I=%d p=%d lam=%d", i, j, I, p, lam)
-						}
-						pos := [2]int{i, j}
-						if got[pos] {
-							t.Fatalf("duplicate hit (%d,%d) for I=%d p=%d lam=%d", i, j, I, p, lam)
-						}
-						got[pos] = true
-					}
+		for _, forceOverflow := range []bool{false, true} {
+			for _, p64 := range primes {
+				p := uint32(p64)
+				if int(p) < W {
+					continue
 				}
+				for lam := uint32(0); lam < p; lam += 7 {
+					arena := newFKArena(numBlocks, 1, 64)
+					if forceOverflow {
+						arena.stride = 2
+					}
+					addFKHitsArena(p, lam, I, J, 7, 5, arena)
+					arena.endGroup(0)
 
-				want := make(map[[2]int]bool)
-				for j := 1; j < J; j++ {
-					for i := -I; i < I; i++ {
-						if (i|j)&1 == 0 {
-							continue
+					got := make(map[[2]int]bool)
+					for bi := 0; bi < numBlocks; bi++ {
+						base := bi << arena.shift
+						for _, e := range arena.data[base : base+int(arena.counts[bi])] {
+							if int32(e>>blockShift) != 7 {
+								t.Fatalf("bad idx %d", e>>blockShift)
+							}
+							gPos := bi*blockSize + int(e&blockMask)
+							j := 1 + gPos/W
+							i := (gPos % W) - I
+							if (i|j)&1 == 0 {
+								t.Fatalf("emitted both-even (%d,%d) for I=%d p=%d lam=%d", i, j, I, p, lam)
+							}
+							pos := [2]int{i, j}
+							if got[pos] {
+								t.Fatalf("duplicate hit (%d,%d) for I=%d p=%d lam=%d", i, j, I, p, lam)
+							}
+							got[pos] = true
 						}
-						diff := (int64(i) - int64(lam)*int64(j)) % int64(p)
-						if diff == 0 {
-							want[[2]int{i, j}] = true
+						for _, ov := range arena.overflow[bi] {
+							if ov.idx != 7 || ov.logP != 5 {
+								t.Fatalf("bad overflow entry %+v", ov)
+							}
+							gPos := bi*blockSize + int(ov.off)
+							j := 1 + gPos/W
+							i := (gPos % W) - I
+							if (i|j)&1 == 0 {
+								t.Fatalf("emitted both-even overflow (%d,%d)", i, j)
+							}
+							pos := [2]int{i, j}
+							if got[pos] {
+								t.Fatalf("duplicate overflow hit (%d,%d)", i, j)
+							}
+							got[pos] = true
 						}
 					}
-				}
-				if len(got) != len(want) {
-					t.Fatalf("I=%d p=%d lam=%d: got %d hits, want %d", I, p, lam, len(got), len(want))
-				}
-				for pos := range want {
-					if !got[pos] {
-						t.Fatalf("I=%d p=%d lam=%d: missing hit %v", I, p, lam, pos)
+
+					want := make(map[[2]int]bool)
+					for j := 1; j < J; j++ {
+						for i := -I; i < I; i++ {
+							if (i|j)&1 == 0 {
+								continue
+							}
+							diff := (int64(i) - int64(lam)*int64(j)) % int64(p)
+							if diff == 0 {
+								want[[2]int{i, j}] = true
+							}
+						}
+					}
+					if len(got) != len(want) {
+						t.Fatalf("I=%d p=%d lam=%d over=%v: got %d hits, want %d", I, p, lam, forceOverflow, len(got), len(want))
+					}
+					for pos := range want {
+						if !got[pos] {
+							t.Fatalf("I=%d p=%d lam=%d: missing hit %v", I, p, lam, pos)
+						}
 					}
 				}
 			}
