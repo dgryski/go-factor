@@ -6,31 +6,45 @@ Section 4 collects the formulas the pipeline depends on, with their derivations,
 
 ---
 
-## 0. Status (2026-11-25)
+## 0. Status (2026-11-26)
 
-The package exists and factors end to end: `gnfs.Factor`, wired into `factor/main.go` after `qs` (methods list, `gnfsMaxBits = 450`, `-v`, `-workers`, `-gnfs-save`). `go test ./gnfs` takes about 15s.
+The package exists and factors end to end: `gnfs.Factor`, wired into `factor/main.go` after `qs` (methods list, `gnfsMaxBits = 450`, `-v`, `-workers`, `-gnfs-save`, separate GNFS pretest budget above `qsMaxBits`). `go test ./gnfs` takes about 13.5s.
+
+### Baselines (Apple M5 Pro, 15 cores)
+
+- **`qs`:**
+  - 80 digits (264 bits): 15.9s total (14.6s sieve, $B = 1.47\text{M}$, want 56,291 relations, matrix 81.1k×79.3k reduced to 14.6k×14.5k in 0.63s, Block Lanczos 0.53s, LA total 1.28s).
+  - 90 digits (297 bits): 2m11s total (2m06.6s sieve, $B = 4.13\text{M}$, want 146,021 relations, matrix 205.1k×202.8k reduced to 36.1k×36.0k in 1.87s, Block Lanczos 2.08s, LA total 4.24s).
+  - 95 digits (315 bits): 9m06s total (8m56.0s sieve, $B = 7.09\text{M}$, want 241,682 relations, matrix 346.1k×339.0k reduced to 60.3k×60.2k in 3.96s, Block Lanczos 5.22s, LA total 9.66s). Extrapolates to ~38m at 100 digits.
+- **`BenchmarkQuadraticSieve` pre vs post refactor:** unchanged within noise (60 bits 382µs vs 376µs, 120 bits 4.11ms vs 4.16ms, 160 bits 34.2ms vs 34.1ms).
+- **`BenchmarkBlockLanczos` (row weight 40):** 0.19s / 21 MB at 10k cols, 2.45s / 123 MB at 50k cols, 16.7s / 540 MB at 150k cols.
+- **`BenchmarkBigMul` (`math/big`):** 8.1ms at 1 Mbit, 24.3ms at 2 Mbit, 102ms at 5 Mbit, 309ms at 10 Mbit.
+- **80-digit (265-bit) GNFS profile:** before sieve/cofactor optimizations (`160k_21`), 9m53.8s wall (9m30.6s sieve = 96.1%, 11.4s LA = 1.9%, 9.0s sqrt = 1.5%); CPU was 35.5% line sieving, 22.5% `addFKHits`, 16.3% byte-by-byte threshold scan, 4.7% `transformRoot` Fermat inversion, and 3.3% + GC in `big.Int` cofactoring. After prime-outer line sieving with carried offsets, skipping both-even $(i, j)$ in line and FK sieving, 8-byte SWAR threshold scans, 32-bit Euclidean `invMod32`, two-stage 128/64-bit cofactoring, and starting `QMin` inside the upper factor base (`250k_q80k`), the same 265-bit number dropped to 4m34.0s wall (3m56.4s sieve, 10.2s LA).
 
 ### Milestones
 
 | Milestone | State |
 | :--- | :--- |
-| **M-1** | Not done. No `qs` timings at 90–100 digits and no `big.Int` multiplication benchmark are recorded. |
-| **M0** | Done. `internal/arith` has the 64-bit arithmetic plus polynomials mod $p$ (roots, Rabin's test, factoring); `internal/linalg` has `Reducer`, Block Lanczos and a rows-based `FindDependencies`. `qs` uses both and its tests pass. The `qs` benchmarks have not been compared before and after the move. |
-| **M1** | Done. Base-$m$, coarse bad ideals, QCs, line sieve, square root by Hensel lifting. The 4.7 checks are tests or run-time checks: lattice round trip, factorizations multiplying back to $G$ and $F$, $\beta^2 = \gamma$, and $X_{\text{alg}}^2 \equiv X_{\text{rat}}^2$. Dependencies failing $\beta^2 = \gamma$ are counted in the log. |
-| **M2** | Mostly done. Dedup, singleton pruning on $(p, r)$ ideals, `Reducer`, parallel Block Lanczos. `BenchmarkBlockLanczos` covers 150k columns, but no numbers are recorded. |
-| **M3** | Mostly done. Gauss reduction, $\lambda_p$, Franke–Kleinjung buckets, two-sided 2LP. Resieving is replaced by collecting each candidate's bucket hits. Verified only up to 195 bits (59 digits), not 80–95 digits; see the parameter table below. |
-| **M4** | Partial. Smooth $c_d$ search, Murphy $\alpha$, skewness, and a small rotation search ($u \in [-2, 2]$, $v \in [-8, 8]$, only from 140 bits). No translation and no root sieve. `-gnfs-save` writes $N$, the polynomial and the $(a, b)$ pairs, but nothing reads them back to resume. |
-| **M5** | Partial. The square root already uses a product tree, and the table has $d = 5$ above 365 bits. Exact bad ideals, Kleinjung, P−1/ECM cofactoring and runs at 100+ digits are not done. |
+| **M-1** | Done. `qs` timed at 80, 90 and 95 digits; `BenchmarkBigMul` recorded at 1–10 Mbit; `BenchmarkBlockLanczos` recorded up to 150k cols; pre/post refactor `qs` benchmarks verified equal. |
+| **M0** | Done. `internal/arith` and `internal/linalg` shared with `qs` with no benchmark regression. |
+| **M1** | Done. Base-$m$, coarse bad ideals, QCs, line sieve, square root by Hensel lifting, and all 4.7 checks. Zero bad squares observed across all runs up to 295 bits. |
+| **M2** | Done. Dedup, singleton pruning on $(p, r)$ ideals, `Reducer`, parallel Block Lanczos benchmarked to 150k columns. |
+| **M3** | Mostly done. Gauss reduction, $\lambda_p$, prime-outer line sieving, Franke–Kleinjung buckets, both-even skipping, SWAR candidate scan, two-stage 128/64-bit 2LP cofactoring, extended special-$q$ sieving. Verified up to 295 bits (89 digits); 305–365 bits (92–110 digits) still needs tuning runs. |
+| **M4** | Partial. Smooth $c_d$ search, Murphy $\alpha$, skewness, small rotation search ($u \in [-2, 2]$, $v \in [-8, 8]$ from 140 bits), and `-gnfs-save` checkpointing + full/partial resume + `TestSavedRelations`. Translation and root sieve are not done. |
+| **M5** | Partial. Product-tree square root and $d = 5$ parameter row exist. Exact bad ideals, Kleinjung, P−1/ECM cofactoring and runs at 95–110+ digits are not done. |
 
 ### Parameter table (`defaultParams`)
 
 | Bits | State |
 | :--- | :--- |
-| < 115 | Line sieve, $d = 3$, Br 800, Ba 1200. Passes the 30–42 digit test; not swept. |
-| 115–150 | $d = 4$, Br = Ba = 8000, LP $2^{17}$. 0.3s at 115 bits, 0.7s at 149 bits. |
-| 150–200 | $d = 4$, Br = Ba = 30000, LP $2^{18}$, $I = 1024$. 1.6s at 151 bits, 4s at 195 bits. The old row (Br 5000, Ba 8000) found no cycles at 195 bits. |
-| 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $I = J = 1024$. 11s at 204 bits, 26s at 230 bits, 3m9s at 249 bits, one number each. The old row (Br 10000, Ba 20000, LP $2^{21}$) failed at 249 bits and on one of two 230-bit numbers, running out of special-$q$; Br = Ba = 60000 with LP $2^{19}$ also failed at 249 bits. |
-| ≥ 250 | Not tested. |
+| < 115 | Line sieve, $d = 3$, Br 1200, Ba 1800, LP 32k/48k, ratio 0.80. 80–96ms at 95 bits, 134–272ms at 114 bits (down from 603ms with Br 800, Ba 1200). |
+| 115–150 | $d = 4$, Br = Ba = 8000, LP $2^{17}$, ratio 0.80. 0.3s at 115 bits, 0.6s at 149 bits. |
+| 150–200 | $d = 4$, Br = Ba = 30000, LP $2^{18}$, $Q_{\min} = 20\text{k}$, $I = 1024$, $J = 512$, ratio 0.85. 1.6s at 151 bits, 3–4s at 195 bits. |
+| 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $Q_{\min} = 60\text{k}$, $I = J = 1024$, ratio 0.95. Four seeds at 230 and 249 bits all passed (before sieve speedups: 26–33s at 230 bits, 1m53s–3m02s at 249 bits; after sieve speedups: 12.0s sieve / 17s total at 230 bits). |
+| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.92. 4m34s at 265 bits / 80 digits (3m56s sieve, 10.2s LA). |
+| 275–305 | $d = 4$, Br = Ba = 400000, LP $2^{22}$, mfb 44, $Q_{\min} = 150\text{k}$, $I = J = 2048$, ratio 1.08. 21m51s at 295 bits / 89 digits (20m35s sieve, 41.6s LA, 27.9s sqrt, 0 bad squares). |
+| 305–365 | $d = 4$, Br = 550000, Ba = 600000, LP $2^{23}$, mfb 46, $Q_{\min} = 250\text{k}$, $I = J = 2048$, ratio 1.08. Extrapolated from 265 and 295 bits; not yet timed. |
+| ≥ 365 | $d = 5$, Br = 500000, Ba = 800000, LP $2^{26}$, mfb 52. Not tested. |
 
 `chooseDegree` reads the degree from this table.
 
@@ -40,36 +54,28 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 - **Bad ideals** are flagged for any multiple root of $f \bmod p$, which is a little more than $p^2 \mid \operatorname{disc}(f)$ requires.
 - **Multiple roots above $B_a$** have no QC, so special-$q$ roots and algebraic large primes at multiple roots are skipped.
 - **Small composite factors** that fit in 64 bits go to rho instead of back into GNFS.
-- **Progress** is measured in relations against an estimated target, not in excess. Excess stays at $-\#\text{fixed columns}$ until large-prime cycles form, dips, then climbs steeply. The target starts at $0.9\,(\pi(\text{LP}_{\text{rat}}) + \pi(\text{LP}_{\text{alg}}))$ and, once excess is rising, extrapolates its slope against the relation count. Over ten runs from 195 to 249 bits, the relations collected were 0.64–1.32 times that sum, so 0.9 is only a middle value. The ratios are inflated by overshoot (next bullet).
-- **Overshoot:** runs used to stop with excess 63–7327 against a goal of 32, because excess was checked every ~7% more relations. Once excess rises above $-\#\text{fixed columns}$ it is now checked every 1%. This change is not yet measured.
+- **Progress** is measured in relations against a per-row `RelTargetRatio` times $\pi(\text{LP}_{\text{rat}}) + \pi(\text{LP}_{\text{alg}})$, switching to slope extrapolation once the 2-core slope reaches 0.2 (ignoring tiny pre-percolation slopes).
+- **Overshoot:** excess is checked every ~7% before $-\#\text{fixed}/2$, every ~1% while climbing, and every `2*(goal - excess)` (clamped to `[100, 1000]`) above $-2000$. Recent runs stopped at excess 36–703 against a goal of 32.
 
 ### Remaining work
 
-Priority 1 blocks the next milestone or covers code that hasn't been measured. Priority 2 is needed before 80–100 digits are practical. Priority 3 is the rest of M4 and M5. Size is the code involved: S is under a day, M a few days, L a week or more. Machine time for tuning runs comes on top and grows quickly with size.
+Priority 1 covers tuning and verification at 92–100 digits. Priority 2 covers algorithmic polynomial selection and sieve yield improvements needed to overtake `qs` (~2m11s at 90d, ~9m06s at 95d, ~38m extrapolated at 100d). Priority 3 covers larger M5 scaling and low-level vectorisation.
 
-Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped without `-tune`. For example, `GNFS_BITS=230,249 GNFS_CANDS=default,100k GNFS_SEEDS=4 go test ./gnfs -run Sweep -v -tune -timeout 120m`. The package path has to come before `-tune`. Each line gives the time, the relations collected and the large-prime ideal count, which together calibrate `relTargetRatio`. Seeds are fixed, so a sweep produces the same numbers each time.
+Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped without `-tune` and prints live 15s progress lines. For example, `GNFS_BITS=265 GNFS_CANDS=default GNFS_SEEDS=2 go test ./gnfs -run Sweep -v -tune -timeout 120m`. The package path has to come before `-tune`.
 
 | Priority | Task | Size | Notes |
 | :--- | :--- | :--- | :--- |
-| 1 | Run a 230-bit factorization with `-v` | S | Checks the new progress messages and the 1% excess checks, and how much sieving the overshoot fix saves. Two 150-bit runs ended with excess 261 and 101, down from 63–7327 before. |
-| 1 | Check the 200–250 row on more numbers | S | One number per size so far; 249 bits took 3m9s and may be near the edge. A run on four 249-bit numbers was started and stopped before the first finished. |
-| 1 | M-1 baselines | S | `qs` at 90, 95 and 100 digits; `big.Int` multiplication at 1–10 Mbit; record `BenchmarkBlockLanczos`; compare the `qs` benchmarks with the pre-refactor code. |
-| 1 | Tune the 250–300 and 300–365 bit rows | M | Untested. Needed for the M3 target of 80–95 digits. |
-| 1 | Profile one 80-digit run | S | Sieve vs. cofactorization vs. linear algebra vs. square root. Decides what priority 2 speed work is worth doing. |
-| 2 | Keep sieving when the special-$q$ range runs out | S | The sieve gives up after four doublings of QMax. That caused most failures of undersized rows. The QC bound has to stay above the largest special-$q$. |
-| 2 | Cofactorization speed | M | Every trial division is `big.Int.QuoRem`. Use `uint64`/128-bit norms where they fit. |
-| 2 | Skip both-even $(i, j)$ in the sieve | S | Currently skipped only in the candidate scan, so the sieve saves nothing. |
-| 2 | Calibrate `relTargetRatio` per row | S | Measured 0.64–1.32. A per-row value, or one derived from $B_r$, $B_a$ and the large-prime bounds, gives a better first estimate. |
-| 2 | Sweep the < 115 bit line-sieve row | S | Passes its test but was never tuned. |
-| 2 | Resume from `-gnfs-save` | S | `readPolyAndPairs` exists. Each $(a, b)$ has to be re-factored, which needs a `cofactorCandidate` variant without sieve hits. |
-| 2 | Time budget in `factor/main.go` | S | Estimates the time for the methods before the sieve from `qs` timings, even for numbers only GNFS will run on. |
-| 3 | Translation and root sieve (M4) | L | Rotation is limited to $u \in [-2, 2]$, $v \in [-8, 8]$. Compare yield against the current polynomials at 90–100 digits. |
-| 3 | $d = 5$ tuning and 100–110 digit runs (M5) | M | Mostly machine time: probably hours per 100-digit run. |
-| 3 | P−1/ECM cofactoring for mfb above 64 bits | M | Needs 128-bit arithmetic. |
-| 3 | Exact bad ideals | L | Only if the coarse handling shows dependencies failing $\beta^2 = \gamma$ at larger sizes; none have so far. |
-| 3 | Free relations | S | Small gain (about $1/|\mathrm{Gal}|$ of primes). When added, $p$ goes in `RatCols` or `RatLPs` like any other rational prime and the $d$ ideals in `AlgCols`. |
+| 1 | Time and tune the 305–365 bit row (92–100 digits) | M | Verify 95- and 100-digit semiprimes end to end and measure the crossover gap against `qs`. |
+| 1 | Check 250–275 and 275–305 bit rows on more seeds | S | One seed each at 265 and 295 bits so far. |
+| 2 | Translation and root sieve (M4) | L | Current polynomials use base-$m$ over smooth $c_d$ with small rotations ($u \in [-2, 2]$, $v \in [-8, 8]$). Better size + root optimisation directly shrinks $F(a, b)$ norms and cuts sieve time at 90–110 digits. |
+| 2 | Bucket layout and cache blocking for FK hits | M | `sieveBlockLines` (39% CPU) and `addFKHits` (32% CPU) dominate the 80-digit profile. Pre-allocated flat arena buckets and prime-bucket cache blocking would cut memory traffic. |
+| 2 | $d = 5$ tuning and 100–110 digit runs (M5) | M | Mostly machine time once polynomial selection is stronger. |
+| 3 | P−1/ECM cofactoring for mfb above 64 bits | M | Needed once 2LP/3LP cofactor bounds exceed 64 bits above ~105 digits. |
+| 3 | Kleinjung polynomial selection | L | Non-monic $g$ ($a_1 \ne 1$); measure yield gain after Phase 1B translation + root sieve first. |
+| 3 | Exact bad ideals | L | Only if coarse handling shows dependencies failing $\beta^2 = \gamma$ at larger sizes; 0 bad squares seen so far. |
+| 3 | Free relations | S | `cofactorPair` already supports them; small gain (about $1/|\mathrm{Gal}|$ of primes). |
 | 3 | Skewness from $\int F^2$ alone | S | Matches the plan; made no difference on the one polynomial checked. |
-| 3 | Kleinjung polynomial selection | L | Optional; only if polynomial quality limits yield. |
+| 3 | SIMD / `avo` core sieving loop | M | After algorithmic improvements are done; rewrite the inner sieve and threshold scan loops using Go's `simd` package or [`avo`](https://github.com/mmcloughlin/avo). |
 
 GNFS trial-divides only up to $\max(B_r, B_a)$. That is enough for correctness, and `factor/main.go` runs rho and ECM first.
 
