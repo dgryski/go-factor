@@ -1,18 +1,21 @@
-package qs
+package linalg
 
 import (
 	"math/bits"
 	"math/rand"
+	"runtime"
+	"sync"
 )
 
 // This is Montgomery's block Lanczos over GF(2), from "A Block Lanczos
 // Algorithm for Finding Dependencies over GF(2)", EUROCRYPT 1995.
 
-// mat64 is a 64×64 GF(2) matrix: bit j of m[i] is entry (i, j).
-type mat64 [64]uint64
+// Mat64 is a 64×64 GF(2) matrix: bit j of m[i] is entry (i, j).
+type Mat64 [64]uint64
 
-func mulMat64(a, b mat64) mat64 {
-	var out mat64
+// MulMat64 multiplies two 64×64 GF(2) matrices.
+func MulMat64(a, b Mat64) Mat64 {
+	var out Mat64
 	for i := 0; i < 64; i++ {
 		row := a[i]
 		var acc uint64
@@ -26,16 +29,16 @@ func mulMat64(a, b mat64) mat64 {
 	return out
 }
 
-func addMat64(a, b mat64) mat64 {
-	var out mat64
+// AddMat64 adds two 64×64 GF(2) matrices.
+func AddMat64(a, b Mat64) Mat64 {
+	var out Mat64
 	for i := 0; i < 64; i++ {
 		out[i] = a[i] ^ b[i]
 	}
 	return out
 }
 
-// mulVecMat64 adds v·m to dst, a byte of v at a time.
-func mulVecMat64(dst, v []uint64, m mat64) {
+func buildLUT64(m Mat64) [8][256]uint64 {
 	var lut [8][256]uint64
 	for b := 0; b < 8; b++ {
 		base := b * 8
@@ -44,7 +47,13 @@ func mulVecMat64(dst, v []uint64, m mat64) {
 			lut[b][val] = lut[b][val&(val-1)] ^ m[base+lsb]
 		}
 	}
-	for r, x := range v {
+	return lut
+}
+
+// mulVecMat64Range adds v[start:end]·m to dst[start:end].
+func mulVecMat64Range(dst, v []uint64, lut *[8][256]uint64, start, end int) {
+	for r := start; r < end; r++ {
+		x := v[r]
 		if x == 0 {
 			continue
 		}
@@ -59,10 +68,15 @@ func mulVecMat64(dst, v []uint64, m mat64) {
 	}
 }
 
-// innerProd64 returns aᵀ·b.
-func innerProd64(a, b []uint64) mat64 {
-	var res mat64
-	for r := range a {
+// MulVecMat64 adds v·m to dst, a byte of v at a time.
+func MulVecMat64(dst, v []uint64, m Mat64) {
+	lut := buildLUT64(m)
+	mulVecMat64Range(dst, v, &lut, 0, len(v))
+}
+
+func innerProd64Range(a, b []uint64, start, end int) Mat64 {
+	var res Mat64
+	for r := start; r < end; r++ {
 		ar := a[r]
 		br := b[r]
 		if ar == 0 || br == 0 {
@@ -77,11 +91,16 @@ func innerProd64(a, b []uint64) mat64 {
 	return res
 }
 
-// findWinv picks a maximal invertible principal submatrix of the symmetric t,
+// InnerProd64 returns aᵀ·b.
+func InnerProd64(a, b []uint64) Mat64 {
+	return innerProd64Range(a, b, 0, len(a))
+}
+
+// FindWinv picks a maximal invertible principal submatrix of the symmetric t,
 // preferring indices not in sPrev, and returns its inverse and index mask.
-func findWinv(t mat64, sPrev uint64) (wInv mat64, sMask uint64) {
+func FindWinv(t Mat64, sPrev uint64) (wInv Mat64, sMask uint64) {
 	m := t
-	var w mat64
+	var w Mat64
 	for i := 0; i < 64; i++ {
 		w[i] = uint64(1) << uint(i)
 	}
@@ -174,9 +193,9 @@ func findWinv(t mat64, sPrev uint64) (wInv mat64, sMask uint64) {
 	return wInv, sMask
 }
 
-// symPrecond is the invertible symmetric P = Lᵀ·L, with L = U1·Perm·L1 for random
+// SymPrecond is the invertible symmetric P = Lᵀ·L, with L = U1·Perm·L1 for random
 // sparse unit triangular L1 and U1 and a random permutation.
-type symPrecond struct {
+type SymPrecond struct {
 	c    int
 	lIdx [][3]int32
 	uIdx [][3]int32
@@ -184,7 +203,8 @@ type symPrecond struct {
 	buf  []uint64
 }
 
-func newSymPrecond(c int, rng *rand.Rand) *symPrecond {
+// NewSymPrecond constructs a random symmetric preconditioner for c columns.
+func NewSymPrecond(c int, rng *rand.Rand) *SymPrecond {
 	lIdx := make([][3]int32, c)
 	uIdx := make([][3]int32, c)
 	perm := make([]int32, c)
@@ -194,7 +214,6 @@ func newSymPrecond(c int, rng *rand.Rand) *symPrecond {
 		lIdx[r] = [3]int32{-1, -1, -1}
 		uIdx[r] = [3]int32{-1, -1, -1}
 
-		// Pick up to 3 distinct indices in [0, r).
 		for k := 0; k < 3 && k < r; k++ {
 			for {
 				j := int32(rng.Intn(r))
@@ -205,7 +224,6 @@ func newSymPrecond(c int, rng *rand.Rand) *symPrecond {
 			}
 		}
 
-		// Pick up to 3 distinct indices in [r+1, c).
 		rem := c - 1 - r
 		for k := 0; k < 3 && k < rem; k++ {
 			for {
@@ -222,7 +240,7 @@ func newSymPrecond(c int, rng *rand.Rand) *symPrecond {
 		perm[i], perm[j] = perm[j], perm[i]
 	})
 
-	return &symPrecond{
+	return &SymPrecond{
 		c:    c,
 		lIdx: lIdx,
 		uIdx: uIdx,
@@ -231,12 +249,11 @@ func newSymPrecond(c int, rng *rand.Rand) *symPrecond {
 	}
 }
 
-// apply computes v <- P * v = L1^T * Perm^T * U1^T * U1 * Perm * L1 * v.
-func (p *symPrecond) apply(v []uint64) {
+// Apply computes v <- P * v = L1^T * Perm^T * U1^T * U1 * Perm * L1 * v.
+func (p *SymPrecond) Apply(v []uint64) {
 	c := p.c
 	buf := p.buf
 
-	// 1. v <- L1 * v (iterate r from c-1 down to 0)
 	for r := c - 1; r >= 0; r-- {
 		e := p.lIdx[r]
 		if e[0] >= 0 {
@@ -250,12 +267,10 @@ func (p *symPrecond) apply(v []uint64) {
 		}
 	}
 
-	// 2. buf <- Perm * v
 	for r := 0; r < c; r++ {
 		buf[r] = v[p.perm[r]]
 	}
 
-	// 3. buf <- U1 * buf (iterate r from 0 up to c-1)
 	for r := 0; r < c; r++ {
 		e := p.uIdx[r]
 		if e[0] >= 0 {
@@ -269,7 +284,6 @@ func (p *symPrecond) apply(v []uint64) {
 		}
 	}
 
-	// 4. buf <- U1^T * buf (iterate r from c-1 down to 0)
 	for r := c - 1; r >= 0; r-- {
 		br := buf[r]
 		if br == 0 {
@@ -287,12 +301,10 @@ func (p *symPrecond) apply(v []uint64) {
 		}
 	}
 
-	// 5. v <- Perm^T * buf
 	for r := 0; r < c; r++ {
 		v[p.perm[r]] = buf[r]
 	}
 
-	// 6. v <- L1^T * v (iterate r from 0 up to c-1)
 	for r := 0; r < c; r++ {
 		vr := v[r]
 		if vr == 0 {
@@ -311,16 +323,62 @@ func (p *symPrecond) apply(v []uint64) {
 	}
 }
 
-// blockLanczos returns subsets of rows that sum to zero mod 2, up to 64. It
-// uses A = B·P·Bᵀ, since with A = B·Bᵀ each unit of rank(B) − rank(B·Bᵀ) costs one.
-func blockLanczos(rows [][]int32, numCols int, seed int64) [][]int {
-	return blockLanczosCheck(rows, numCols, seed, nil)
+type parTask struct {
+	n  int
+	fn func(wid, start, end int)
 }
 
-// blockLanczosCheck is blockLanczos, calling onF with each F matrix and
-// Montgomery's form of it, for testing.
+type lanczosPool struct {
+	nw  int
+	chs []chan parTask
+	wg  sync.WaitGroup
+}
 
-func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter int, f, fMont mat64)) [][]int {
+func newLanczosPool(nw int) *lanczosPool {
+	p := &lanczosPool{
+		nw:  nw,
+		chs: make([]chan parTask, nw),
+	}
+	for w := 0; w < nw; w++ {
+		ch := make(chan parTask, 1)
+		p.chs[w] = ch
+		wid := w
+		go func() {
+			for t := range ch {
+				start := wid * t.n / nw
+				end := (wid + 1) * t.n / nw
+				t.fn(wid, start, end)
+				p.wg.Done()
+			}
+		}()
+	}
+	return p
+}
+
+func (p *lanczosPool) run(n int, fn func(wid, start, end int)) {
+	p.wg.Add(p.nw)
+	t := parTask{n: n, fn: fn}
+	for _, ch := range p.chs {
+		ch <- t
+	}
+	p.wg.Wait()
+}
+
+func (p *lanczosPool) close() {
+	for _, ch := range p.chs {
+		close(ch)
+	}
+}
+
+// BlockLanczos returns subsets of rows that sum to zero mod 2, up to 64. It
+// uses A = B·P·Bᵀ, since with A = B·Bᵀ each unit of rank(B) − rank(B·Bᵀ) costs one.
+func BlockLanczos(rows [][]int32, numCols int, seed int64) [][]int {
+	return BlockLanczosCheck(rows, numCols, seed, nil)
+}
+
+// BlockLanczosCheck is BlockLanczos, calling onF with each F matrix and
+// Montgomery's form of it, for testing.
+func BlockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter int, f, fMont Mat64)) [][]int {
 	R := len(rows)
 	C := numCols
 	if R == 0 || C == 0 {
@@ -328,37 +386,124 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 	}
 
 	rng := rand.New(rand.NewSource(seed))
-	pre := newSymPrecond(C, rng)
+	pre := NewSymPrecond(C, rng)
+
+	nw := runtime.GOMAXPROCS(0)
+	if R < 4096 || nw <= 1 {
+		nw = 1
+	} else if nw > 16 {
+		nw = 16
+	}
+
+	var pool *lanczosPool
+	var localC [][]uint64
+	var localM []Mat64
+	if nw > 1 {
+		pool = newLanczosPool(nw)
+		defer pool.close()
+		localC = make([][]uint64, nw)
+		buf := make([]uint64, nw*C)
+		for w := 0; w < nw; w++ {
+			localC[w] = buf[w*C : (w+1)*C]
+		}
+		localM = make([]Mat64, nw)
+	}
 
 	mulBt := func(v, dst []uint64) {
-		for i := range dst {
-			dst[i] = 0
-		}
-		for r, cols := range rows {
-			vr := v[r]
-			if vr == 0 {
-				continue
+		if nw == 1 {
+			for i := range dst {
+				dst[i] = 0
 			}
-			for _, c := range cols {
-				dst[c] ^= vr
+			for r, cols := range rows {
+				vr := v[r]
+				if vr == 0 {
+					continue
+				}
+				for _, c := range cols {
+					dst[c] ^= vr
+				}
 			}
+			return
 		}
+		pool.run(R, func(wid, start, end int) {
+			lc := localC[wid]
+			for i := range lc {
+				lc[i] = 0
+			}
+			for r := start; r < end; r++ {
+				vr := v[r]
+				if vr == 0 {
+					continue
+				}
+				for _, c := range rows[r] {
+					lc[c] ^= vr
+				}
+			}
+		})
+		pool.run(C, func(_ int, start, end int) {
+			copy(dst[start:end], localC[0][start:end])
+			for w := 1; w < nw; w++ {
+				lc := localC[w]
+				for c := start; c < end; c++ {
+					dst[c] ^= lc[c]
+				}
+			}
+		})
 	}
 
 	mulB := func(t, dst []uint64) {
-		for r, cols := range rows {
-			var acc uint64
-			for _, c := range cols {
-				acc ^= t[c]
+		if nw == 1 {
+			for r, cols := range rows {
+				var acc uint64
+				for _, c := range cols {
+					acc ^= t[c]
+				}
+				dst[r] = acc
 			}
-			dst[r] = acc
+			return
 		}
+		pool.run(R, func(_ int, start, end int) {
+			for r := start; r < end; r++ {
+				var acc uint64
+				for _, c := range rows[r] {
+					acc ^= t[c]
+				}
+				dst[r] = acc
+			}
+		})
+	}
+
+	innerProd := func(a, b []uint64) Mat64 {
+		if nw == 1 {
+			return innerProd64Range(a, b, 0, R)
+		}
+		pool.run(R, func(wid, start, end int) {
+			localM[wid] = innerProd64Range(a, b, start, end)
+		})
+		res := localM[0]
+		for w := 1; w < nw; w++ {
+			for i := 0; i < 64; i++ {
+				res[i] ^= localM[w][i]
+			}
+		}
+		return res
+	}
+
+	mulVecMat := func(dst, v []uint64, m Mat64) {
+		lut := buildLUT64(m)
+		if nw == 1 {
+			mulVecMat64Range(dst, v, &lut, 0, R)
+			return
+		}
+		pool.run(R, func(_ int, start, end int) {
+			mulVecMat64Range(dst, v, &lut, start, end)
+		})
 	}
 
 	tmpC := make([]uint64, C)
 	mulA := func(v, dst []uint64) {
 		mulBt(v, tmpC)
-		pre.apply(tmpC)
+		pre.Apply(tmpC)
 		mulB(tmpC, dst)
 	}
 
@@ -377,33 +522,32 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 	vNext := make([]uint64, R)
 	pi := make([]uint64, R)
 
-	var wPrev, wPrev2, tPrev, mPrev mat64
+	var wPrev, wPrev2, tPrev, mPrev Mat64
 	var sPrev uint64
 
 	maxIter := R/32 + 64
 	for iter := 0; iter < maxIter; iter++ {
 		mulA(vi, pi)
-		ti := innerProd64(vi, pi)
-		mi := innerProd64(pi, pi)
+		ti := innerProd(vi, pi)
+		mi := innerProd(pi, pi)
 
-		wInv, sMask := findWinv(ti, sPrev)
+		wInv, sMask := FindWinv(ti, sPrev)
 		if sMask == 0 {
 			break
 		}
 
-		vtV0 := innerProd64(vi, v0)
-		mulVecMat64(x, vi, mulMat64(wInv, vtV0))
+		vtV0 := innerProd(vi, v0)
+		mulVecMat(x, vi, MulMat64(wInv, vtV0))
 
 		if iter > 0 && ((^sPrev)&^sMask) != 0 {
 			break
 		}
 
-		// D_i = I + W_i^inv * (M_i * S_i + T_i)
-		var ms mat64
+		var ms Mat64
 		for r := 0; r < 64; r++ {
 			ms[r] = mi[r] & sMask
 		}
-		di := mulMat64(wInv, addMat64(ms, ti))
+		di := MulMat64(wInv, AddMat64(ms, ti))
 		for r := 0; r < 64; r++ {
 			di[r] ^= uint64(1) << uint(r)
 		}
@@ -411,45 +555,44 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 		for r := 0; r < R; r++ {
 			vNext[r] = pi[r] & sMask
 		}
-		mulVecMat64(vNext, vi, di)
+		mulVecMat(vNext, vi, di)
 
 		if iter >= 1 {
-			var tS mat64
+			var tS Mat64
 			for r := 0; r < 64; r++ {
 				tS[r] = ti[r] & sMask
 			}
-			ei := mulMat64(wPrev, tS)
-			mulVecMat64(vNext, vPrev, ei)
+			ei := MulMat64(wPrev, tS)
+			mulVecMat(vNext, vPrev, ei)
 
 			if iter >= 2 {
-				var notPrevTS mat64
+				var notPrevTS Mat64
 				notPrev := ^sPrev
 				for r := 0; r < 64; r++ {
 					if (notPrev>>uint(r))&1 != 0 {
 						notPrevTS[r] = tS[r]
 					}
 				}
-				fi := mulMat64(wPrev2, notPrevTS)
+				fi := MulMat64(wPrev2, notPrevTS)
 
 				if onF != nil {
-					// Montgomery's form: W_{i-2}^inv * (I + T_{i-1}*W_{i-1}^inv) * (M_{i-1}*S_{i-1} + T_{i-1}) * S_i
-					var mPrevS mat64
+					var mPrevS Mat64
 					for r := 0; r < 64; r++ {
 						mPrevS[r] = mPrev[r] & sPrev
 					}
-					rhs := addMat64(mPrevS, tPrev)
+					rhs := AddMat64(mPrevS, tPrev)
 					for r := 0; r < 64; r++ {
 						rhs[r] &= sMask
 					}
-					tw := mulMat64(tPrev, wPrev)
+					tw := MulMat64(tPrev, wPrev)
 					for r := 0; r < 64; r++ {
 						tw[r] ^= uint64(1) << uint(r)
 					}
-					fMont := mulMat64(wPrev2, mulMat64(tw, rhs))
+					fMont := MulMat64(wPrev2, MulMat64(tw, rhs))
 					onF(iter, fi, fMont)
 				}
 
-				mulVecMat64(vNext, vPrev2, fi)
+				mulVecMat(vNext, vPrev2, fi)
 			}
 		}
 
@@ -470,8 +613,6 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 		sPrev = sMask
 	}
 
-	// Final extraction against UNPRECONDITIONED B^T:
-	// compute ker(B^T * [X ^ Y | V_i]).
 	xy := make([]uint64, R)
 	for r := 0; r < R; r++ {
 		xy[r] = x[r] ^ y[r]
@@ -536,8 +677,6 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 		piv++
 	}
 
-	// Different combinations can give the same rows, so drop repeats by
-	// their FNV-1a hash.
 	var deps [][]int
 	seen := make(map[uint64]bool)
 	for k := piv; k < 128; k++ {
@@ -557,7 +696,7 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 			continue
 		}
 		seen[h] = true
-		if isDependency(rows, numCols, dep) {
+		if IsDependency(rows, numCols, dep) {
 			deps = append(deps, dep)
 		}
 	}
@@ -565,8 +704,8 @@ func blockLanczosCheck(rows [][]int32, numCols int, seed int64, onF func(iter in
 	return deps
 }
 
-// isDependency reports whether the rows in dep sum to zero mod 2.
-func isDependency(rows [][]int32, numCols int, dep []int) bool {
+// IsDependency reports whether the rows in dep sum to zero mod 2.
+func IsDependency(rows [][]int32, numCols int, dep []int) bool {
 	parity := make([]uint64, (numCols+63)/64)
 	for _, r := range dep {
 		for _, c := range rows[r] {

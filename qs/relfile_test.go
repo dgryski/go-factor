@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgryski/go-factor/internal/arith"
 	"github.com/dgryski/go-factor/internal/testutil"
 )
 
@@ -52,7 +53,7 @@ func TestRelationsRoundTrip(t *testing.T) {
 	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 35), testutil.RandomPrime(rnd, 35))
 	b, siqs, sieveRange := params(n)
 	kn := new(big.Int).Mul(n, big.NewInt(knuthSchroeppel(n)))
-	factorBase := buildFactorBase(kn, primesUpTo(b))
+	factorBase := buildFactorBase(kn, arith.PrimesUpTo(b))
 	s := newSieve(n, kn, factorBase, siqs)
 	s.siqs(sieveRange)
 	factorBase = s.finish(factorBase)

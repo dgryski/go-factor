@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dgryski/go-factor/internal/arith"
 	"github.com/dgryski/go-factor/internal/progress"
 )
 
@@ -87,7 +88,7 @@ func split(n *big.Int) (*big.Int, *big.Int) {
 
 	// Remove small factors first: primes that divide n would otherwise be
 	// silently dropped from the base, and the multiplier must be coprime to n.
-	primes := primesUpTo(b)
+	primes := arith.PrimesUpTo(b)
 	setup.step("found %d primes up to %d", len(primes), b)
 	var r, bigP big.Int
 	for _, p := range primes {
@@ -233,7 +234,7 @@ func params(n *big.Int) (b int64, siqs bool, sieveRange int64) {
 // knuthSchroeppel picks a small odd square-free multiplier k so that kN has
 // many small primes as quadratic residues. n must have no factors below 100.
 func knuthSchroeppel(n *big.Int) int64 {
-	smallPrimes := primesUpTo(97)[1:]
+	smallPrimes := arith.PrimesUpTo(97)[1:]
 	nModP := make([]uint64, len(smallPrimes))
 	var r, bigP big.Int
 	for i, p := range smallPrimes {
@@ -264,7 +265,7 @@ func knuthSchroeppel(n *big.Int) int64 {
 			lnP := math.Log(float64(p))
 			if knp == 0 {
 				score += lnP / float64(p)
-			} else if powMod64(knp, uint64(p-1)/2, uint64(p)) == 1 {
+			} else if arith.PowMod64(knp, uint64(p-1)/2, uint64(p)) == 1 {
 				score += 2 * lnP / float64(p-1)
 			}
 		}
@@ -285,22 +286,6 @@ func squareFree(k int64) bool {
 	return true
 }
 
-// primesUpTo returns all primes <= b.
-func primesUpTo(b int64) []int64 {
-	composite := make([]bool, b+1)
-	var primes []int64
-	for p := int64(2); p <= b; p++ {
-		if composite[p] {
-			continue
-		}
-		primes = append(primes, p)
-		for i := p * p; i <= b; i += p {
-			composite[i] = true
-		}
-	}
-	return primes
-}
-
 // buildFactorBase returns the primes in primes for which kn is a square
 // mod p: 2, the primes dividing the multiplier, and the odd primes with
 // Legendre symbol 1.
@@ -310,110 +295,11 @@ func buildFactorBase(kn *big.Int, primes []int64) []int64 {
 	for _, p := range primes {
 		bigP.SetInt64(p)
 		knp := r.Mod(kn, &bigP).Uint64()
-		if p == 2 || knp == 0 || powMod64(knp, uint64(p-1)/2, uint64(p)) == 1 {
+		if p == 2 || knp == 0 || arith.PowMod64(knp, uint64(p-1)/2, uint64(p)) == 1 {
 			base = append(base, p)
 		}
 	}
 	return base
-}
-
-// powMod64 returns base^exp mod p. p must be less than 2^32.
-func powMod64(base, exp, p uint64) uint64 {
-	res := uint64(1) % p
-	base %= p
-	for exp > 0 {
-		if exp&1 != 0 {
-			res = res * base % p
-		}
-		base = base * base % p
-		exp >>= 1
-	}
-	return res
-}
-
-// invMod returns the inverse of a mod the prime p. a must not be 0 mod p.
-func invMod(a, p uint64) uint64 {
-	return powMod64(a, p-2, p)
-}
-
-// sqrtModPrime returns t with t² ≡ n (mod p) using Tonelli–Shanks. n must be
-// a quadratic residue mod the prime p.
-func sqrtModPrime(n, p uint32) uint32 {
-	p64 := uint64(p)
-	n64 := uint64(n) % p64
-	if n64 == 0 || p == 2 {
-		return uint32(n64)
-	}
-	if p&3 == 3 {
-		return uint32(powMod64(n64, (p64+1)>>2, p64))
-	}
-
-	// p − 1 = q·2^s with q odd.
-	q, s := p64-1, uint32(0)
-	for q&1 == 0 {
-		q >>= 1
-		s++
-	}
-
-	// Find a quadratic non-residue z.
-	z := uint64(2)
-	for powMod64(z, (p64-1)>>1, p64) != p64-1 {
-		z++
-	}
-
-	m := s
-	c := powMod64(z, q, p64)
-	t := powMod64(n64, q, p64)
-	r := powMod64(n64, (q+1)>>1, p64)
-	for t != 1 {
-		// Find the least i with t^(2^i) = 1.
-		i := uint32(1)
-		for tt := t * t % p64; tt != 1; tt = tt * tt % p64 {
-			i++
-			if i == m {
-				return 0 // not a quadratic residue
-			}
-		}
-		b := c
-		for j := uint32(0); j < m-i-1; j++ {
-			b = b * b % p64
-		}
-		m = i
-		c = b * b % p64
-		t = t * c % p64
-		r = r * b % p64
-	}
-	return uint32(r)
-}
-
-// log2Big returns log2(v) for v > 0. It reads v's top 53 bits from its
-// words, so it doesn't allocate on 64-bit platforms.
-func log2Big(v *big.Int) float64 {
-	if bits.UintSize != 64 {
-		shift := v.BitLen() - 53
-		if shift <= 0 {
-			return math.Log2(float64(v.Uint64()))
-		}
-		top := new(big.Int).Rsh(v, uint(shift)).Uint64()
-		return math.Log2(float64(top)) + float64(shift)
-	}
-	words := v.Bits()
-	if len(words) == 0 {
-		return math.Inf(-1)
-	}
-	top := uint64(words[len(words)-1])
-	topBits := bits.Len64(top)
-	bitLen := (len(words)-1)*64 + topBits
-	if bitLen <= 53 {
-		return math.Log2(float64(top))
-	}
-	shift := topBits - 53
-	sig := top >> uint(shift)
-	if shift < 0 {
-		prev := uint64(words[len(words)-2])
-		sig = top<<uint(-shift) | prev>>uint(64+shift)
-	}
-	return math.Log2(float64(sig)) + float64(bitLen-53)
 }
 
 // relation stores X² ≡ Y (mod N), with Y recorded only as its factors.
@@ -553,7 +439,7 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 	s := &sieve{
 		n:       n,
 		kn:      kn,
-		log2KN:  log2Big(kn),
+		log2KN:  arith.Log2Big(kn),
 		roots:   make([]root, len(factorBase)),
 		numCols: len(factorBase) + 1, // +1 for the sign of Y
 		seenX:   make(map[string]bool),
@@ -566,7 +452,7 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 		bigP.SetInt64(p)
 		s.roots[i] = root{
 			p:    uint32(p),
-			t:    sqrtModPrime(uint32(r.Mod(kn, &bigP).Uint64()), uint32(p)),
+			t:    arith.SqrtModPrime(uint32(r.Mod(kn, &bigP).Uint64()), uint32(p)),
 			logP: byte(math.Round(math.Log2(float64(p)))),
 		}
 	}
@@ -775,7 +661,7 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 		q := uint64(w.roots[idx].p)
 		bigP.SetUint64(q)
 		aq.Quo(a, &bigP)
-		gamma := uint64(w.roots[idx].t) * invMod(r.Mod(&aq, &bigP).Uint64(), q) % q
+		gamma := uint64(w.roots[idx].t) * arith.InvMod(r.Mod(&aq, &bigP).Uint64(), q) % q
 		if gamma > q/2 {
 			gamma = q - gamma
 		}
@@ -794,7 +680,7 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 		}
 		p := uint64(rt.p)
 		bigP.SetUint64(p)
-		w.aInv[i] = uint32(invMod(r.Mod(a, &bigP).Uint64(), p))
+		w.aInv[i] = uint32(arith.InvMod(r.Mod(a, &bigP).Uint64(), p))
 		for v := 0; v < len(aIdx)-1; v++ {
 			w.deltas[v][i] = uint32(2 * r.Mod(bj[v], &bigP).Uint64() * uint64(w.aInv[i]) % p)
 		}
@@ -913,7 +799,7 @@ func (w *worker) setRoots(a, b *big.Int) {
 	for i := range w.roots {
 		if !w.roots[i].inA {
 			p := uint64(w.roots[i].p)
-			w.aInv[i] = uint32(invMod(r.Mod(a, bigP.SetUint64(p)).Uint64(), p))
+			w.aInv[i] = uint32(arith.InvMod(r.Mod(a, bigP.SetUint64(p)).Uint64(), p))
 		}
 	}
 	w.setRootsInv(b, w.aInv)
@@ -1138,13 +1024,13 @@ func (w *worker) maxLog2Y(a, b *big.Int, from, to int64) float64 {
 		y.Mul(&x, &x)
 		y.Sub(&y, s.kn)
 		if y.Sign() != 0 {
-			best = math.Max(best, log2Big(y.Abs(&y)))
+			best = math.Max(best, arith.Log2Big(y.Abs(&y)))
 		}
 	}
 	if signs == 0 {
 		best = math.Max(best, s.log2KN)
 	}
-	return best - log2Big(a)
+	return best - arith.Log2Big(a)
 }
 
 // nextOffset returns the smallest off >= 0 with start+off ≡ root (mod p).
@@ -1208,10 +1094,10 @@ func (w *worker) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fa
 		}
 		c := temp.Uint64()
 		switch {
-		case c <= s.lpBound && (c < s.pMax*s.pMax || isPrime64(c)):
+		case c <= s.lpBound && (c < s.pMax*s.pMax || arith.IsPrime64(c)):
 			lp1 = c
 		case c <= s.dlpCap:
-			if lp1, lp2, ok = splitCofactor(c, s.pMax, s.lpBound); !ok {
+			if lp1, lp2, ok = arith.SplitCofactor(c, s.pMax, s.lpBound); !ok {
 				return nil, 0, 0, false
 			}
 		default:

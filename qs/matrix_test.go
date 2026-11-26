@@ -5,6 +5,8 @@ import (
 	"math/bits"
 	"math/rand"
 	"testing"
+
+	"github.com/dgryski/go-factor/internal/linalg"
 )
 
 // randomRelations returns relations shaped like the sieve's: columns for
@@ -27,7 +29,7 @@ func randomRelations(rng *rand.Rand, numRows, numCols int) []relation {
 func rowsOf(rels []relation) [][]int32 {
 	rows := make([][]int32, len(rels))
 	for i, rel := range rels {
-		rows[i] = oddColumns(rel.Factors)
+		rows[i] = linalg.OddColumns(rel.Factors)
 	}
 	return rows
 }
@@ -39,7 +41,7 @@ func TestFindDependencies(t *testing.T) {
 		rows := rowsOf(rels)
 		deps := findDependencies(rels, size.cols)
 		// Pruning surplus rows may drop dependencies, but keeps keepSurplus.
-		want := len(denseDependencies(rows, size.cols))
+		want := len(linalg.DenseDependencies(rows, size.cols))
 		if want > keepSurplus {
 			want = keepSurplus
 		}
@@ -72,7 +74,7 @@ func TestFindDependencies(t *testing.T) {
 		}
 
 		// And they must be independent.
-		if n := len(denseDependencies(depRows, size.rows)); n != 0 {
+		if n := len(linalg.DenseDependencies(depRows, size.rows)); n != 0 {
 			t.Errorf("%d×%d: %d of the dependencies are combinations of the others", size.rows, size.cols, n)
 		}
 	}

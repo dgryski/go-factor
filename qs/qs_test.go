@@ -2,11 +2,11 @@ package qs
 
 import (
 	"fmt"
-	"math"
 	"math/big"
 	"math/rand"
 	"testing"
 
+	"github.com/dgryski/go-factor/internal/arith"
 	"github.com/dgryski/go-factor/internal/testutil"
 )
 
@@ -64,49 +64,6 @@ func TestQuadraticSieveSIQS(t *testing.T) {
 	testSemiprimes(t, siqsMinBits/2, 75, 5, 3)
 }
 
-func TestLog2Big(t *testing.T) {
-	rng := rand.New(rand.NewSource(3))
-	lengths := []int{52, 53, 54, 63, 64, 65, 117, 128, 266}
-	for n := 1; n <= 512; n++ {
-		lengths = append(lengths, n)
-	}
-	for _, n := range lengths {
-		for i := 0; i < 20; i++ {
-			v := new(big.Int).Rand(rng, new(big.Int).Lsh(one, uint(n-1)))
-			v.SetBit(v, n-1, 1)
-			if i == 0 {
-				v.Lsh(one, uint(n-1)) // a power of two
-			}
-			// Exact for the top 53 bits, then the logarithm of the rest.
-			want := float64(n - 1)
-			if n > 1 {
-				shift := n - 53
-				if shift < 0 {
-					shift = 0
-				}
-				top := new(big.Int).Rsh(v, uint(shift))
-				want = math.Log2(float64(top.Uint64())) + float64(shift)
-			}
-			if got := log2Big(v); got != want {
-				t.Fatalf("log2Big(%v) = %v, want %v (%d bits)", v, got, want, n)
-			}
-		}
-	}
-}
-
-func TestSqrtModPrime(t *testing.T) {
-	for _, p := range primesUpTo(3000) {
-		for n := int64(0); n < p; n++ {
-			if n != 0 && p > 2 && powMod64(uint64(n), uint64(p-1)/2, uint64(p)) != 1 {
-				continue
-			}
-			if r := int64(sqrtModPrime(uint32(n), uint32(p))); r*r%p != n {
-				t.Fatalf("sqrtModPrime(%d, %d) = %d", n, p, r)
-			}
-		}
-	}
-}
-
 // TestRelations checks that every relation gathered by both sieves is
 // correct: X² ≡ Y (mod n), with Y rebuilt from its factors. The factors of
 // these semiprimes are all far above the factor base.
@@ -116,7 +73,7 @@ func TestRelations(t *testing.T) {
 		n := new(big.Int).Mul(testutil.RandomPrime(rnd, bits), testutil.RandomPrime(rnd, bits))
 		b, siqs, sieveRange := params(n)
 		kn := new(big.Int).Mul(n, big.NewInt(knuthSchroeppel(n)))
-		factorBase := buildFactorBase(kn, primesUpTo(b))
+		factorBase := buildFactorBase(kn, arith.PrimesUpTo(b))
 		sv := newSieve(n, kn, factorBase, siqs)
 		if siqs {
 			sv.siqs(sieveRange)
@@ -156,7 +113,7 @@ func TestWorkers(t *testing.T) {
 		n := new(big.Int).Mul(testutil.RandomPrime(rnd, c.bits), testutil.RandomPrime(rnd, c.bits))
 		b, _, sieveRange := params(n)
 		kn := new(big.Int).Mul(n, big.NewInt(knuthSchroeppel(n)))
-		factorBase := buildFactorBase(kn, primesUpTo(b))
+		factorBase := buildFactorBase(kn, arith.PrimesUpTo(b))
 		var runs [2]*sieve
 		for i, w := range []int{1, 4} {
 			Workers = w

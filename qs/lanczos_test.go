@@ -5,9 +5,10 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
+
+	"github.com/dgryski/go-factor/internal/linalg"
 )
 
-// randomSparseRows returns rows with weight distinct random columns each.
 func randomSparseRows(rng *rand.Rand, numRows, numCols, weight int) [][]int32 {
 	rows := make([][]int32, numRows)
 	for r := range rows {
@@ -25,17 +26,16 @@ func randomSparseRows(rng *rand.Rand, numRows, numCols, weight int) [][]int32 {
 }
 
 func TestFindWinv2x2Pivots(t *testing.T) {
-	// Every diagonal entry is 0, which forces 32 2×2 pivots.
-	var sym mat64
+	var sym linalg.Mat64
 	for i := 0; i < 64; i += 2 {
 		sym[i] |= 1 << uint(i+1)
 		sym[i+1] |= 1 << uint(i)
 	}
-	wInv, sMask := findWinv(sym, 0)
+	wInv, sMask := linalg.FindWinv(sym, 0)
 	if sMask != ^uint64(0) {
 		t.Fatalf("mask %016x, want full rank", sMask)
 	}
-	prod := mulMat64(wInv, sym)
+	prod := linalg.MulMat64(wInv, sym)
 	for i := range prod {
 		if prod[i] != 1<<uint(i) {
 			t.Fatalf("row %d of wInv·t is %016x, want %016x", i, prod[i], uint64(1)<<uint(i))
@@ -47,21 +47,20 @@ func TestBlockLanczos(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	for _, tc := range []struct{ rows, cols, weight int }{{90, 70, 8}, {320, 300, 14}, {2030, 2000, 20}, {10064, 10000, 24}} {
 		rows := randomSparseRows(rng, tc.rows, tc.cols, tc.weight)
-		deps := blockLanczos(rows, tc.cols, 1)
+		deps := linalg.BlockLanczos(rows, tc.cols, 1)
 		for i, dep := range deps {
-			if !isDependency(rows, tc.cols, dep) {
+			if !linalg.IsDependency(rows, tc.cols, dep) {
 				t.Fatalf("%d×%d: dependency %d doesn't sum to zero", tc.rows, tc.cols, i)
 			}
 		}
-		indep := independentCount(deps, tc.rows)
-		if indep < lanczosMinDeps {
-			t.Errorf("%d×%d: %d independent dependencies, want at least %d", tc.rows, tc.cols, indep, lanczosMinDeps)
+		indep := linalg.IndependentCount(deps, tc.rows)
+		if indep < linalg.LanczosMinDeps {
+			t.Errorf("%d×%d: %d independent dependencies, want at least %d", tc.rows, tc.cols, indep, linalg.LanczosMinDeps)
 		}
 		t.Logf("%d×%d: %d dependencies, %d independent", tc.rows, tc.cols, len(deps), indep)
 	}
 }
 
-// rankGap returns rank(B) and rank(B·Bᵀ).
 func rankGap(rows [][]int32, numCols int) (rankB, rankA int) {
 	colRows := make([][]int32, numCols)
 	for r, row := range rows {
@@ -83,11 +82,9 @@ func rankGap(rows [][]int32, numCols int) (rankB, rankA int) {
 			}
 		}
 	}
-	return len(rows) - len(denseDependencies(rows, numCols)), len(rows) - len(denseDependencies(aRows, len(rows)))
+	return len(rows) - len(linalg.DenseDependencies(rows, numCols)), len(rows) - len(linalg.DenseDependencies(aRows, len(rows)))
 }
 
-// TestBlockLanczosLargeGap uses matrices where rank(B) − rank(B·Bᵀ) is over
-// 64. Repeating a block of columns makes those columns cancel in B·Bᵀ.
 func TestBlockLanczosLargeGap(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
 	dup := func(m [][]int32, n int, rest [][]int32) [][]int32 {
@@ -117,13 +114,13 @@ func TestBlockLanczosLargeGap(t *testing.T) {
 		if rankB-rankA < 64 {
 			t.Fatalf("%s: gap %d, want at least 64", tc.name, rankB-rankA)
 		}
-		deps := blockLanczos(tc.rows, tc.cols, 1)
+		deps := linalg.BlockLanczos(tc.rows, tc.cols, 1)
 		for i, dep := range deps {
-			if !isDependency(tc.rows, tc.cols, dep) {
+			if !linalg.IsDependency(tc.rows, tc.cols, dep) {
 				t.Fatalf("%s: dependency %d doesn't sum to zero", tc.name, i)
 			}
 		}
-		indep := independentCount(deps, len(tc.rows))
+		indep := linalg.IndependentCount(deps, len(tc.rows))
 		t.Logf("%s: gap %d, %d independent dependencies", tc.name, rankB-rankA, indep)
 		if indep < 32 {
 			t.Errorf("%s: %d independent dependencies, want at least 32", tc.name, indep)
@@ -131,12 +128,10 @@ func TestBlockLanczosLargeGap(t *testing.T) {
 	}
 }
 
-// TestFMatchesMontgomery checks the F term against Montgomery's formula at
-// every iteration.
 func TestFMatchesMontgomery(t *testing.T) {
 	rows := randomSparseRows(rand.New(rand.NewSource(555)), 450, 400, 18)
 	checks := 0
-	deps := blockLanczosCheck(rows, 400, 999, func(iter int, f, fMont mat64) {
+	deps := linalg.BlockLanczosCheck(rows, 400, 999, func(iter int, f, fMont linalg.Mat64) {
 		checks++
 		if f != fMont {
 			t.Fatalf("iteration %d: F differs from Montgomery's", iter)
@@ -150,15 +145,15 @@ func TestFMatchesMontgomery(t *testing.T) {
 func TestPreconditionerSymmetric(t *testing.T) {
 	const c = 257
 	rng := rand.New(rand.NewSource(7))
-	p := newSymPrecond(c, rng)
+	p := linalg.NewSymPrecond(c, rng)
 	x, y := make([]uint64, c), make([]uint64, c)
 	for i := range x {
 		x[i], y[i] = rng.Uint64(), rng.Uint64()
 	}
 	px, py := append([]uint64(nil), x...), append([]uint64(nil), y...)
-	p.apply(px)
-	p.apply(py)
-	if innerProd64(x, py) != innerProd64(px, y) {
+	p.Apply(px)
+	p.Apply(py)
+	if linalg.InnerProd64(x, py) != linalg.InnerProd64(px, y) {
 		t.Fatal("xᵀ·P·y ≠ (P·x)ᵀ·y")
 	}
 }
@@ -168,7 +163,7 @@ func BenchmarkBlockLanczos(b *testing.B) {
 		rows := randomSparseRows(rand.New(rand.NewSource(99)), n+64, n, 24)
 		b.Run(fmt.Sprintf("cols=%d", n), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				blockLanczos(rows, n, 1)
+				linalg.BlockLanczos(rows, n, 1)
 			}
 		})
 	}
