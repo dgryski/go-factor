@@ -176,3 +176,43 @@ func TestAlphaBruteForce(t *testing.T) {
 		t.Errorf("x^4+x^3+x^2+x+1 has no roots mod <= 10, expected alpha > 0, got %v", a)
 	}
 }
+
+func TestSelectPolyKleinjungAndRootSieve(t *testing.T) {
+	rnd := rand.New(rand.NewSource(19))
+	for _, halfBits := range []int{95, 132} {
+		n := new(big.Int).Mul(testutil.RandomPrime(rnd, halfBits), testutil.RandomPrime(rnd, halfBits))
+		p, fac := SelectPoly(n, 4)
+		if fac != nil {
+			continue
+		}
+		if p == nil {
+			t.Fatalf("SelectPoly(%d bits) returned nil", n.BitLen())
+		}
+		if !IsIrreducible(p) {
+			t.Fatalf("SelectPoly(%d bits) returned reducible f", n.BitLen())
+		}
+		var g big.Int
+		g.GCD(nil, nil, new(big.Int).Abs(p.A1), new(big.Int).Abs(p.A0))
+		if g.Cmp(bigOne) != 0 {
+			t.Fatalf("gcd(A1, A0) = %v, want 1", &g)
+		}
+		linMod := new(big.Int).Sub(new(big.Int).Mul(p.A1, p.M), p.A0)
+		if linMod.Mod(linMod, n).Sign() != 0 {
+			t.Fatalf("A1*M != A0 mod N")
+		}
+		if fm := evalMonicBig(p.Coeffs, p.M); new(big.Int).Mod(fm, n).Sign() != 0 {
+			t.Fatalf("f(M) != 0 mod N")
+		}
+
+		base, bfac := BaseMPoly(n, 4, 1)
+		if bfac == nil && base != nil {
+			pr := defaultParams(n)
+			base.Skew = optimizeSkewnessBounded(base, maxSkewForParams(pr))
+			gotScore := dickmanYieldScore(p, pr)
+			baseScore := dickmanYieldScore(base, pr)
+			if gotScore >= baseScore {
+				t.Errorf("%d bits got Dickman score %.2f >= monic base-m %.2f", n.BitLen(), gotScore, baseScore)
+			}
+		}
+	}
+}

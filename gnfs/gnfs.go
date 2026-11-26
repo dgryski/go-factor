@@ -104,7 +104,7 @@ func defaultParams(n *big.Int) *Params {
 			MfbRat: 40, MfbAlg: 40, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 60000, QMax: 400000, IHalf: 1024, JMax: 1024,
 			SlackRat: 46, SlackAlg: 46, NumQCs: 64,
-			RelTargetRatio: 0.95,
+			RelTargetRatio: 0.82,
 		}
 	case bits < 275:
 		return &Params{
@@ -113,7 +113,7 @@ func defaultParams(n *big.Int) *Params {
 			MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 80000, QMax: 800000, IHalf: 2048, JMax: 1024,
 			SlackRat: 48, SlackAlg: 48, NumQCs: 64,
-			RelTargetRatio: 0.92,
+			RelTargetRatio: 0.82,
 		}
 	case bits < 305:
 		return &Params{
@@ -122,7 +122,7 @@ func defaultParams(n *big.Int) *Params {
 			MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 150000, QMax: 2000000, IHalf: 2048, JMax: 2048,
 			SlackRat: 50, SlackAlg: 50, NumQCs: 64,
-			RelTargetRatio: 1.08,
+			RelTargetRatio: 0.84,
 		}
 	case bits < 365:
 		return &Params{
@@ -131,7 +131,7 @@ func defaultParams(n *big.Int) *Params {
 			MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 250000, QMax: 3500000, IHalf: 2048, JMax: 2048,
 			SlackRat: 52, SlackAlg: 52, NumQCs: 64,
-			RelTargetRatio: 1.08,
+			RelTargetRatio: 0.88,
 		}
 	default:
 		return &Params{
@@ -235,8 +235,8 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 		if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
 			return &g, new(big.Int).Div(n, &g)
 		}
-		logf("gnfs: %d bits (%d digits), deg=%d, c_d=%v, skew=%.1f, alpha=%.2f in %v",
-			n.BitLen(), len(n.String()), poly.Degree, poly.Coeffs[poly.Degree],
+		logf("gnfs: %d bits (%d digits), deg=%d, c_d=%v, a_1=%v, skew=%.1f, alpha=%.2f in %v",
+			n.BitLen(), len(n.String()), poly.Degree, poly.Coeffs[poly.Degree], poly.A1,
 			poly.Skew, poly.Alpha, time.Since(polyStart).Round(time.Millisecond))
 	}
 

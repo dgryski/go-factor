@@ -4,7 +4,10 @@ package gnfs
 import (
 	"math"
 	"math/big"
+	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 
 	"github.com/dgryski/go-factor/internal/arith"
 )
@@ -605,11 +608,13 @@ func findFactorFromReducible(p *Poly, n *big.Int) *big.Int {
 	return nil
 }
 
-// OptimizeSkewness finds the skewness s >= 1 minimizing the combined skewed
-// L2 norm log(RMS(F)) + log(RMS(G)) over the unit rectangle.
+// OptimizeSkewness finds the skewness s >= 1 minimizing log(RMS(F)) + log(RMS(G)).
 func OptimizeSkewness(p *Poly) float64 {
+	return optimizeSkewnessBounded(p, 0)
+}
+
+func optimizeSkewnessBounded(p *Poly, maxSkew float64) float64 {
 	d := p.Degree
-	// Represent coefficients as float64 scaled by 2^(-shift) so nothing overflows.
 	maxBits := 0
 	for _, c := range p.Coeffs {
 		if b := c.BitLen(); b > maxBits {
@@ -633,7 +638,6 @@ func OptimizeSkewness(p *Poly) float64 {
 	a1f := scaledFloat(p.A1, shiftG)
 	a0f := scaledFloat(p.A0, shiftG)
 
-	// Starting estimate |c_0 / c_d|^(1/d).
 	s0 := 1.0
 	if cf[d] != 0 && cf[0] != 0 {
 		s0 = math.Pow(math.Abs(cf[0]/cf[d]), 1.0/float64(d))
@@ -644,15 +648,13 @@ func OptimizeSkewness(p *Poly) float64 {
 
 	evalLogNorm := func(logS float64) float64 {
 		s := math.Exp(logS)
-		// Compute I_F(s) / 4 = sum_{(i+j) even} c_i*c_j*s^(i+j-d) / ((i+j+1)*(2d-i-j+1))
 		var sumF float64
 		for i := 0; i <= d; i++ {
 			for j := 0; j <= d; j++ {
 				if (i+j)&1 != 0 {
 					continue
 				}
-				term := cf[i] * cf[j] * math.Pow(s, float64(i+j-d)) / float64((i+j+1)*(2*d-i-j+1))
-				sumF += term
+				sumF += cf[i] * cf[j] * math.Pow(s, float64(i+j-d)) / float64((i+j+1)*(2*d-i-j+1))
 			}
 		}
 		if sumF <= 0 {
@@ -665,15 +667,41 @@ func OptimizeSkewness(p *Poly) float64 {
 		return 0.5*math.Log(sumF) + 0.5*math.Log(sumG)
 	}
 
-	// Golden section search on [max(0, logS0 - 8), logS0 + 12].
 	center := math.Log(s0)
 	lo := math.Max(0, center-8)
 	hi := center + 12
+	if maxSkew >= 1 {
+		logMax := math.Log(maxSkew)
+		if hi > logMax {
+			hi = logMax
+		}
+		if lo > hi {
+			lo = math.Max(0, hi-8)
+		}
+	}
+	if hi <= lo {
+		return math.Exp(lo)
+	}
+
+	const gridN = 32
+	bestK := 0
+	bestV := math.Inf(1)
+	for k := 0; k <= gridN; k++ {
+		ls := lo + (hi-lo)*float64(k)/gridN
+		if v := evalLogNorm(ls); v < bestV {
+			bestV = v
+			bestK = k
+		}
+	}
+	step := (hi - lo) / gridN
+	lo = math.Max(lo, lo+float64(bestK-1)*step)
+	hi = math.Min(hi, lo+2*step)
+
 	phi := (math.Sqrt(5) - 1) / 2
 	x1 := hi - phi*(hi-lo)
 	x2 := lo + phi*(hi-lo)
 	f1, f2 := evalLogNorm(x1), evalLogNorm(x2)
-	for iter := 0; iter < 45; iter++ {
+	for iter := 0; iter < 36; iter++ {
 		if f1 < f2 {
 			hi = x2
 			x2 = x1
@@ -711,11 +739,7 @@ func scaledFloat(x *big.Int, shift int) float64 {
 	return f
 }
 
-// ComputeAlpha computes Murphy's alpha(f) over primes <= bound:
-//
-//	alpha(f) = sum_{p <= bound} (1/(p-1) - E[v_p(F(a, b))]) * log(p)
-//
-// Negative alpha means F has more small prime factors than a random integer.
+// ComputeAlpha computes Murphy's alpha(f) over primes <= bound.
 func ComputeAlpha(p *Poly, bound int64) float64 {
 	primes := arith.PrimesUpTo(bound)
 	d := p.Degree
@@ -734,11 +758,7 @@ func ComputeAlpha(p *Poly, bound int64) float64 {
 	return alpha
 }
 
-// expectedValP computes E[v_p(F(a, b))] over coprime (a, b) for prime p.
 func expectedValP(coeffs []*big.Int, fp []uint64, p uint64, d int) float64 {
-	// Fast check: if f mod p is squarefree and p does not divide c_d,
-	// or if all roots (including projective) are simple:
-	// Every simple affine root contributes p/(p^2-1); projective root (p | c_d, p !| c_{d-1}) contributes p/(p^2-1).
 	fpTrim := arith.PolyTrim(fp)
 	roots := arith.PolyRootsModP(fpTrim, p)
 	dfp := arith.PolyDerivModP(fpTrim, p)
@@ -755,18 +775,15 @@ func expectedValP(coeffs []*big.Int, fp []uint64, p uint64, d int) float64 {
 	if allSimple {
 		np := len(roots)
 		if fp[d] == 0 {
-			np++ // simple projective root
+			np++
 		}
 		return float64(np) * float64(p) / float64(p*p-1)
 	}
 
-	// General case (multiple roots or multiple projective root): lift mod p^k.
 	var total float64
-	// Affine classes: roots mod p.
 	for _, r := range roots {
 		total += liftExpectedVal(coeffs, r, 1, p, p)
 	}
-	// Projective class (1 : 0): evaluate reversed polynomial at y ≡ 0 (mod p).
 	if fp[d] == 0 {
 		revCoeffs := make([]*big.Int, d+1)
 		for i := 0; i <= d; i++ {
@@ -777,23 +794,15 @@ func expectedValP(coeffs []*big.Int, fp []uint64, p uint64, d int) float64 {
 	return total / float64(p+1)
 }
 
-// liftExpectedVal computes sum_{k >= level} Pr(p^k | f(x) | x ≡ r mod p^level)
-// weighted so that level=1 corresponds to conditioning on x ≡ r mod p.
 func liftExpectedVal(coeffs []*big.Int, r uint64, level int, pk, p uint64) float64 {
-	// Weight of matching r mod p^level within x ≡ r_1 mod p is p^(-(level-1)).
 	weight := math.Pow(float64(p), float64(-(level - 1)))
-
-	// Check Hensel condition: if p !| f'(r), every lift is unique at all higher levels.
 	dfModP := evalDerivModP(coeffs, r%p, p)
 	if dfModP != 0 {
 		return weight * float64(p) / float64(p-1)
 	}
-
-	// Stop if p^(level+1) overflows uint64 or weight is negligible.
 	if level >= 12 || pk > (^uint64(0))/p {
 		return weight * float64(p) / float64(p-1)
 	}
-
 	nextPK := pk * p
 	sum := weight
 	for t := uint64(0); t < p; t++ {
@@ -832,103 +841,43 @@ func evalPolyBigMod(coeffs []*big.Int, x, mod uint64) uint64 {
 	return res
 }
 
-// SelectPoly chooses a degree and searches for a good polynomial pair (f, g)
-// for n using chosen smooth leading coefficients c_d and rotations f + (ux+v)g.
-// If a non-trivial factor of n is found during selection, it returns nil, factor.
-func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
-	if degree <= 0 {
-		degree = chooseDegree(n)
+// Cap skewness near the special-q lattice scale so |b| stays at least 1.
+func maxSkewForParams(pr *Params) float64 {
+	if !pr.UseLattice {
+		return 1000
 	}
-
-	// Candidate smooth leading coefficients.
-	cds := smoothCDs(n.BitLen())
-
-	var best *Poly
-	bestScore := math.Inf(1)
-
-	scorePoly := func(p *Poly) float64 {
-		// Combined skewed log-norm of F and G plus alpha(f).
-		return logNormScore(p) + p.Alpha
+	qMid := math.Sqrt(float64(pr.QMin) * float64(pr.QMax))
+	if qMid < 10000 {
+		qMid = 10000
 	}
-
-	for _, cd := range cds {
-		base, fac := BaseMPoly(n, degree, cd)
-		if fac != nil {
-			return nil, fac
-		}
-		if base == nil {
-			continue
-		}
-		sc := scorePoly(base)
-		if sc < bestScore {
-			bestScore = sc
-			best = base
-		}
-
-		// Try small rotations f + (u*x + v) * (x - m).
-		if degree >= 3 && n.BitLen() >= 140 {
-			rotated, fac := bestRotation(base, n)
-			if fac != nil {
-				return nil, fac
-			}
-			if rotated != nil {
-				rsc := scorePoly(rotated)
-				if rsc < bestScore {
-					bestScore = rsc
-					best = rotated
-				}
-			}
-		}
-	}
-	if best == nil {
-		// Fallback to cd = 1.
-		return BaseMPoly(n, degree, 1)
-	}
-	return best, nil
+	return qMid * 1.5
 }
 
-// chooseDegree returns the degree from the parameter table, so the size
-// thresholds live in one place.
-func chooseDegree(n *big.Int) int {
-	return defaultParams(n).Degree
+// dickmanYieldScore returns u_F*ln(u_F) + u_G*ln(u_G) at typical sieve scale.
+func dickmanYieldScore(p *Poly, pr *Params) float64 {
+	logRMSF, logRMSG := logNormParts(p)
+	var logA, logQ float64
+	if pr.UseLattice {
+		qTyp := math.Sqrt(float64(pr.QMin) * float64(pr.QMax))
+		if qTyp < 2 {
+			qTyp = 2
+		}
+		logQ = math.Log(qTyp)
+		aTyp := math.Sqrt(float64(pr.IHalf) * float64(max(1, pr.JMax/2)) * qTyp)
+		logA = math.Log(aTyp)
+	} else {
+		aTyp := math.Sqrt(float64(pr.LineA) * float64(max(1, pr.LineB/2)))
+		logA = math.Log(aTyp)
+	}
+
+	lnBa := math.Log(float64(max(int64(100), pr.Ba)))
+	lnBr := math.Log(float64(max(int64(100), pr.Br)))
+	uF := math.Max(1.0, (logRMSF+float64(p.Degree)*logA-logQ+p.Alpha)/lnBa)
+	uG := math.Max(1.0, (logRMSG+logA)/lnBr)
+	return uF*math.Log(uF) + uG*math.Log(uG)
 }
 
-func smoothCDs(bits int) []uint64 {
-	if bits < 150 {
-		return []uint64{1, 2, 6, 12, 30, 60}
-	}
-	// Smooth products of 2, 3, 5, 7, 11.
-	cands := []uint64{1}
-	primes := []uint64{2, 3, 5, 7, 11}
-	limit := uint64(5000)
-	if bits >= 280 {
-		limit = 50000
-	}
-	for _, p := range primes {
-		n := len(cands)
-		for i := 0; i < n; i++ {
-			v := cands[i]
-			for v <= limit/p {
-				v *= p
-				cands = append(cands, v)
-			}
-		}
-	}
-	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
-	if len(cands) > 48 {
-		// Keep a spread of sizes (first 24 and 24 evenly spaced).
-		picked := make([]uint64, 0, 48)
-		picked = append(picked, cands[:24]...)
-		step := (len(cands) - 24) / 24
-		for i := 24; i < len(cands) && len(picked) < 48; i += step {
-			picked = append(picked, cands[i])
-		}
-		return picked
-	}
-	return cands
-}
-
-func logNormScore(p *Poly) float64 {
+func logNormParts(p *Poly) (logRMSF, logRMSG float64) {
 	d := p.Degree
 	s := p.Skew
 	if s <= 0 {
@@ -958,7 +907,7 @@ func logNormScore(p *Poly) float64 {
 	if sumF <= 0 {
 		sumF = 1e-300
 	}
-	logRMSF := 0.5*math.Log(sumF) + float64(shiftF)*math.Ln2
+	logRMSF = 0.5*math.Log(sumF) + float64(shiftF)*math.Ln2
 
 	maxGBits := max(p.A1.BitLen(), p.A0.BitLen())
 	shiftG := maxGBits - 500
@@ -971,55 +920,962 @@ func logNormScore(p *Poly) float64 {
 	if sumG <= 0 {
 		sumG = 1e-300
 	}
-	logRMSG := 0.5*math.Log(sumG) + float64(shiftG)*math.Ln2
-	return logRMSF + logRMSG
+	logRMSG = 0.5*math.Log(sumG) + float64(shiftG)*math.Ln2
+	return logRMSF, logRMSG
 }
 
-func bestRotation(base *Poly, n *big.Int) (*Poly, *big.Int) {
-	m := base.A0 // A1 == 1 here
-	var best *Poly
-	bestScore := logNormScore(base) + base.Alpha
+func logNormScore(p *Poly) float64 {
+	lf, lg := logNormParts(p)
+	return lf + lg
+}
 
-	type cand struct {
-		u, v  int64
-		alpha float64
+// SelectPoly searches skewed base-m and Kleinjung polynomial pairs, size-optimizes
+// them by translation and rotation, and runs a root sieve over (u, v) rotations.
+func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
+	pr := defaultParams(n)
+	if degree <= 0 {
+		degree = pr.Degree
+	} else {
+		cp := *pr
+		cp.Degree = degree
+		pr = &cp
 	}
-	var top []cand
-	for u := int64(-2); u <= 2; u++ {
-		for v := int64(-8); v <= 8; v++ {
-			if u == 0 && v == 0 {
-				continue
-			}
-			rot, fac := normalizePoly(rotatePoly(base, u, v), n)
-			if fac != nil {
-				return nil, fac
-			}
-			if rot == nil {
-				continue
-			}
-			a := ComputeAlpha(rot, 80)
-			top = append(top, cand{u, v, a})
+	bits := n.BitLen()
+	maxSkew := maxSkewForParams(pr)
+
+	if bits < 130 {
+		return selectPolySmall(n, degree, pr, maxSkew)
+	}
+
+	var rawCands []*Poly
+	for _, cd := range skewedCDPool(bits, degree) {
+		p, fac := fixedCDBaseMPoly(n, degree, cd)
+		if fac != nil {
+			return nil, fac
+		}
+		if p != nil {
+			rawCands = append(rawCands, p)
 		}
 	}
-	sort.Slice(top, func(i, j int) bool { return top[i].alpha < top[j].alpha })
-	if len(top) > 6 {
-		top = top[:6]
+
+	if bits >= 170 && degree >= 3 {
+		kjCands, fac := kleinjungCandidates(n, degree)
+		if fac != nil {
+			return nil, fac
+		}
+		rawCands = append(rawCands, kjCands...)
 	}
 
+	if len(rawCands) == 0 {
+		return BaseMPoly(n, degree, 1)
+	}
+
+	type sizedCand struct {
+		poly      *Poly
+		sizeScore float64
+	}
+	sized := make([]sizedCand, 0, len(rawCands))
+	for _, p := range rawCands {
+		opt, fac := sizeOptimizePoly(p, n, maxSkew)
+		if fac != nil {
+			return nil, fac
+		}
+		if opt == nil {
+			continue
+		}
+		opt.Alpha = projectiveAlphaBonus(opt.Coeffs[degree])
+		sized = append(sized, sizedCand{poly: opt, sizeScore: dickmanYieldScore(opt, pr)})
+	}
+	if len(sized) == 0 {
+		return BaseMPoly(n, degree, 1)
+	}
+
+	sort.Slice(sized, func(i, j int) bool { return sized[i].sizeScore < sized[j].sizeScore })
+	topN := 24
+	if len(sized) < topN {
+		topN = len(sized)
+	}
+	sized = sized[:topN]
+
+	nw := Workers
+	if nw <= 0 {
+		nw = runtime.GOMAXPROCS(0)
+	}
+	if nw > topN {
+		nw = topN
+	}
+	if nw < 1 {
+		nw = 1
+	}
+
+	results := make([]*Poly, topN)
+	factors := make([]*big.Int, topN)
+	var nextIdx atomic.Int64
+	var wg sync.WaitGroup
+	pks := buildRootSievePrimes(97)
+
+	for w := 0; w < nw; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				idx := int(nextIdx.Add(1) - 1)
+				if idx >= topN {
+					return
+				}
+				best, fac := rootSieveOptimize(sized[idx].poly, n, pr, maxSkew, pks)
+				if fac != nil {
+					factors[idx] = fac
+					return
+				}
+				results[idx] = best
+			}
+		}()
+	}
+	wg.Wait()
+
+	for _, fac := range factors {
+		if fac != nil {
+			return nil, fac
+		}
+	}
+
+	var best *Poly
+	bestScore := math.Inf(1)
+	for _, cand := range results {
+		if cand == nil {
+			continue
+		}
+		sc := dickmanYieldScore(cand, pr)
+		if sc < bestScore {
+			bestScore = sc
+			best = cand
+		}
+	}
+	if best == nil {
+		return BaseMPoly(n, degree, 1)
+	}
+	return best, nil
+}
+
+func selectPolySmall(n *big.Int, degree int, pr *Params, maxSkew float64) (*Poly, *big.Int) {
+	var best *Poly
+	bestScore := math.Inf(1)
+	for _, cd := range []uint64{1, 2, 6, 12, 30, 60} {
+		base, fac := BaseMPoly(n, degree, cd)
+		if fac != nil {
+			return nil, fac
+		}
+		if base == nil {
+			continue
+		}
+		base.Skew = optimizeSkewnessBounded(base, maxSkew)
+		sc := dickmanYieldScore(base, pr)
+		if sc < bestScore {
+			bestScore = sc
+			best = base
+		}
+	}
+	if best == nil {
+		return BaseMPoly(n, degree, 1)
+	}
+	return best, nil
+}
+
+func chooseDegree(n *big.Int) int {
+	return defaultParams(n).Degree
+}
+
+func skewedCDPool(bits, d int) []uint64 {
+	maxLog2 := bits / (d + 3)
+	if maxLog2 > 40 {
+		maxLog2 = 40
+	}
+	if maxLog2 < 10 {
+		maxLog2 = 10
+	}
+	limit := uint64(1) << uint(maxLog2)
+	cands := []uint64{1}
+	for _, p := range []uint64{2, 3, 5, 7, 11, 13} {
+		n := len(cands)
+		for i := 0; i < n; i++ {
+			v := cands[i]
+			for v <= limit/p {
+				v *= p
+				cands = append(cands, v)
+			}
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i] < cands[j] })
+
+	const targetCount = 64
+	if len(cands) <= targetCount {
+		return cands
+	}
+	out := make([]uint64, 0, targetCount)
+	out = append(out, 1, 6, 12, 30, 60, 210, 420, 840, 2520)
+	seen := make(map[uint64]bool, targetCount)
+	for _, v := range out {
+		seen[v] = true
+	}
+	maxL := math.Log(float64(cands[len(cands)-1]))
+	minL := math.Log(60.0)
+	steps := targetCount - len(out)
+	for s := 0; s < steps; s++ {
+		want := math.Exp(minL + (maxL-minL)*float64(s)/float64(max(1, steps-1)))
+		idx := sort.Search(len(cands), func(i int) bool { return float64(cands[i]) >= want })
+		for dIdx := 0; dIdx < len(cands); dIdx++ {
+			if i := idx + dIdx; i < len(cands) && !seen[cands[i]] {
+				seen[cands[i]] = true
+				out = append(out, cands[i])
+				break
+			}
+			if i := idx - 1 - dIdx; i >= 0 && !seen[cands[i]] {
+				seen[cands[i]] = true
+				out = append(out, cands[i])
+				break
+			}
+		}
+	}
+	return out
+}
+
+// fixedCDBaseMPoly keeps c_d fixed and chooses nearest m = round((n/c_d)^(1/d))
+// so c_d stays smooth and |c_{d-1}| <= (d/2)*c_d.
+func fixedCDBaseMPoly(n *big.Int, d int, cd uint64) (*Poly, *big.Int) {
+	if cd == 0 {
+		cd = 1
+	}
+	cdBig := new(big.Int).SetUint64(cd)
+	q := new(big.Int).Quo(n, cdBig)
+	if q.Sign() <= 0 {
+		return nil, nil
+	}
+	mFloor := arith.NthRoot(q, d)
+	mCeil := new(big.Int).Add(mFloor, bigOne)
+	dBig := big.NewInt(int64(d))
+
+	rFloor := new(big.Int).Sub(n, new(big.Int).Mul(cdBig, new(big.Int).Exp(mFloor, dBig, nil)))
+	rCeil := new(big.Int).Sub(n, new(big.Int).Mul(cdBig, new(big.Int).Exp(mCeil, dBig, nil)))
+	m := mFloor
+	rem := rFloor
+	if new(big.Int).Abs(rCeil).Cmp(new(big.Int).Abs(rFloor)) < 0 {
+		m = mCeil
+		rem = rCeil
+	}
+	if m.Cmp(big.NewInt(4)) < 0 {
+		return nil, nil
+	}
+
+	coeffs := make([]*big.Int, d+1)
+	coeffs[d] = cdBig
+	halfM := new(big.Int).Rsh(m, 1)
+	negHalfM := new(big.Int).Neg(halfM)
+	cur := new(big.Int).Set(rem)
+	for i := 0; i < d-1; i++ {
+		quot, r := new(big.Int).QuoRem(cur, m, new(big.Int))
+		if r.Cmp(halfM) > 0 {
+			r.Sub(r, m)
+			quot.Add(quot, bigOne)
+		} else if r.Cmp(negHalfM) < 0 {
+			r.Add(r, m)
+			quot.Sub(quot, bigOne)
+		}
+		coeffs[i] = r
+		cur = quot
+	}
+	coeffs[d-1] = cur
+
+	p := &Poly{
+		Degree: d,
+		Coeffs: coeffs,
+		A1:     big.NewInt(1),
+		A0:     new(big.Int).Set(m),
+		M:      new(big.Int).Mod(m, n),
+	}
+	return normalizePoly(p, n)
+}
+
+// kleinjungCandidates builds non-monic g(x) = a_1*x - a_0 pairs with c_d*a_0^d ≡ N (mod a_1^2),
+// following Kleinjung, Math. Comp. 75 (2006), Section 2.1.
+func kleinjungCandidates(n *big.Int, d int) ([]*Poly, *big.Int) {
+	bits := n.BitLen()
+	maxA1Bits := (bits/d - 16) / 2
+	if maxA1Bits < 12 {
+		return nil, nil
+	}
+	if maxA1Bits > 29 {
+		maxA1Bits = 29
+	}
+
+	var splitCandPrimes []uint64
+	var bigP, rTmp big.Int
+	for _, sp := range arith.PrimesUpTo(600) {
+		if sp < 11 || int64(d)%sp == 0 {
+			continue
+		}
+		up := uint64(sp)
+		if rTmp.Mod(n, bigP.SetUint64(up)).Sign() == 0 {
+			return nil, new(big.Int).SetUint64(up)
+		}
+		splitCandPrimes = append(splitCandPrimes, up)
+	}
+
+	cds := []uint64{
+		60, 120, 210, 420, 840, 1260, 2520, 5040, 7560, 10080,
+		15120, 25200, 27720, 50400, 60060, 110880, 180180, 360360, 720720,
+	}
+
+	type primeRoots struct {
+		p  uint64
+		p2 uint64
+		rs []uint64
+	}
+
+	var out []*Poly
+	dBig := big.NewInt(int64(d))
+	for _, cd := range cds {
+		var prs []primeRoots
+		for _, p := range splitCandPrimes {
+			if cd%p == 0 {
+				continue
+			}
+			rs := rootsNthModP2(cd, n, d, p)
+			if len(rs) == d {
+				prs = append(prs, primeRoots{p: p, p2: p * p, rs: rs})
+				if len(prs) >= 8 {
+					break
+				}
+			}
+		}
+		numFactors := 3
+		if (d == 4 && maxA1Bits >= 21 || d == 3 && maxA1Bits >= 20) && len(prs) >= 4 {
+			numFactors = 4
+		}
+		if len(prs) < numFactors {
+			continue
+		}
+
+		for offset := 0; offset+numFactors <= len(prs) && offset < 2; offset++ {
+			tuple := prs[offset : offset+numFactors]
+			a1 := uint64(1)
+			tooBig := false
+			for _, pr := range tuple {
+				if a1 > (uint64(1)<<uint(maxA1Bits))/pr.p {
+					tooBig = true
+					break
+				}
+				a1 *= pr.p
+			}
+			if tooBig || a1 <= 1 {
+				continue
+			}
+			a1Sq := a1 * a1
+
+			rems := []uint64{0}
+			mod := uint64(1)
+			for _, pr := range tuple {
+				invM, ok := arith.InvMod64(mod%pr.p2, pr.p2)
+				if !ok {
+					rems = nil
+					break
+				}
+				next := make([]uint64, 0, len(rems)*len(pr.rs))
+				for _, r0 := range rems {
+					r0m := r0 % pr.p2
+					for _, r1 := range pr.rs {
+						diff := (r1 + pr.p2 - r0m) % pr.p2
+						k := arith.MulMod64(diff, invM, pr.p2)
+						next = append(next, r0+k*mod)
+					}
+				}
+				rems = next
+				mod *= pr.p2
+			}
+			if len(rems) == 0 {
+				continue
+			}
+
+			cdBig := new(big.Int).SetUint64(cd)
+			targetA0 := arith.NthRoot(new(big.Int).Quo(n, cdBig), d)
+			if targetA0.BitLen() <= maxA1Bits*2+4 {
+				continue
+			}
+			a1SqBig := new(big.Int).SetUint64(a1Sq)
+			tMod := new(big.Int).Mod(targetA0, a1SqBig).Uint64()
+
+			type rootCand struct {
+				a0     *big.Int
+				M      *big.Int
+				td1    *big.Int
+				remAbs *big.Int
+			}
+			var bestRoots []rootCand
+			var a0, a0d, a0d1, num, M, remCheck, td1, rem3, remAbs big.Int
+
+			for _, r := range rems {
+				var delta int64
+				if r >= tMod {
+					dPos := r - tMod
+					if dPos > a1Sq/2 {
+						delta = -int64(a1Sq - dPos)
+					} else {
+						delta = int64(dPos)
+					}
+				} else {
+					dNeg := tMod - r
+					if dNeg > a1Sq/2 {
+						delta = int64(a1Sq - dNeg)
+					} else {
+						delta = -int64(dNeg)
+					}
+				}
+				a0.Add(targetA0, big.NewInt(delta))
+				if a0.Sign() <= 0 {
+					continue
+				}
+				a0ModA1 := rTmp.Mod(&a0, bigP.SetUint64(a1)).Uint64()
+				if arith.Gcd64(a0ModA1, a1) != 1 {
+					continue
+				}
+
+				a0d1.Exp(&a0, big.NewInt(int64(d-1)), nil)
+				a0d.Mul(&a0d1, &a0)
+				num.Mul(cdBig, &a0d)
+				num.Sub(n, &num)
+				M.QuoRem(&num, a1SqBig, &remCheck)
+				if remCheck.Sign() != 0 {
+					continue
+				}
+
+				roundQuoRem(&td1, &rem3, &M, &a0d1)
+				remAbs.Abs(&rem3)
+
+				if len(bestRoots) < 3 {
+					bestRoots = append(bestRoots, rootCand{
+						a0:     new(big.Int).Set(&a0),
+						M:      new(big.Int).Set(&M),
+						td1:    new(big.Int).Set(&td1),
+						remAbs: new(big.Int).Set(&remAbs),
+					})
+					sort.Slice(bestRoots, func(i, j int) bool { return bestRoots[i].remAbs.Cmp(bestRoots[j].remAbs) < 0 })
+				} else if remAbs.Cmp(bestRoots[2].remAbs) < 0 {
+					bestRoots[2] = rootCand{
+						a0:     new(big.Int).Set(&a0),
+						M:      new(big.Int).Set(&M),
+						td1:    new(big.Int).Set(&td1),
+						remAbs: new(big.Int).Set(&remAbs),
+					}
+					sort.Slice(bestRoots, func(i, j int) bool { return bestRoots[i].remAbs.Cmp(bestRoots[j].remAbs) < 0 })
+				}
+			}
+
+			a1Big := new(big.Int).SetUint64(a1)
+			invA1ModN := new(big.Int).ModInverse(a1Big, n)
+			if invA1ModN == nil {
+				var g big.Int
+				g.GCD(nil, nil, a1Big, n)
+				if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
+					return nil, &g
+				}
+				continue
+			}
+
+			for _, rc := range bestRoots {
+				p := expandKleinjungRoot(n, d, cdBig, a1, a1Big, rc.a0, rc.M, rc.td1, invA1ModN, dBig)
+				if p == nil {
+					continue
+				}
+				normed, fac := normalizePoly(p, n)
+				if fac != nil {
+					return nil, fac
+				}
+				if normed != nil {
+					out = append(out, normed)
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+func rootsNthModP2(cd uint64, n *big.Int, d int, p uint64) []uint64 {
+	var bigP, rem big.Int
+	nModP := rem.Mod(n, bigP.SetUint64(p)).Uint64()
+	if nModP == 0 {
+		return nil
+	}
+	invCD := arith.InvMod(cd%p, p)
+	rhs := arith.MulMod64(nModP, invCD, p)
+	fp := make([]uint64, d+1)
+	fp[0] = (p - rhs) % p
+	fp[d] = 1
+	roots := arith.PolyRootsModP(fp, p)
+	if len(roots) != d {
+		return nil
+	}
+
+	p2 := p * p
+	nModP2 := rem.Mod(n, bigP.SetUint64(p2)).Uint64()
+	cdP2 := cd % p2
+	cdP := cd % p
+	out := make([]uint64, 0, d)
+	for _, x := range roots {
+		if x == 0 {
+			return nil
+		}
+		xd := arith.PowMod64(x, uint64(d), p2)
+		val := (arith.MulMod64(cdP2, xd, p2) + p2 - nModP2) % p2
+		deriv := arith.MulMod64(uint64(d)%p*cdP%p, arith.PowMod64(x, uint64(d-1), p), p)
+		if deriv == 0 {
+			return nil
+		}
+		k := arith.MulMod64((p-(val/p))%p, arith.InvMod(deriv, p), p)
+		out = append(out, x+k*p)
+	}
+	return out
+}
+
+func roundQuoRem(q, r, a, b *big.Int) {
+	q.QuoRem(a, b, r)
+	var twoR big.Int
+	twoR.Lsh(r, 1)
+	if twoR.Sign() >= 0 {
+		if twoR.Cmp(b) > 0 {
+			q.Add(q, bigOne)
+			r.Sub(r, b)
+		}
+	} else {
+		var negB big.Int
+		negB.Neg(b)
+		if twoR.Cmp(&negB) < 0 {
+			q.Sub(q, bigOne)
+			r.Add(r, b)
+		}
+	}
+}
+
+func modBigUint64(x *big.Int, m uint64) uint64 {
+	var bigM, r big.Int
+	return r.Mod(x, bigM.SetUint64(m)).Uint64()
+}
+
+func expandKleinjungRoot(n *big.Int, d int, cdBig *big.Int, a1 uint64, a1Big, a0, M, td1, invA1ModN, _ *big.Int) *Poly {
+	a0Pows := make([]*big.Int, d)
+	a0Pows[0] = big.NewInt(1)
+	for i := 1; i < d; i++ {
+		a0Pows[i] = new(big.Int).Mul(a0Pows[i-1], a0)
+	}
+
+	coeffs := make([]*big.Int, d+1)
+	coeffs[d] = new(big.Int).Set(cdBig)
+	coeffs[d-1] = new(big.Int).Mul(a1Big, td1)
+
+	Q := new(big.Int).Sub(M, new(big.Int).Mul(td1, a0Pows[d-1]))
+	a0Mod := modBigUint64(a0, a1)
+	invA0, ok := arith.InvMod64(a0Mod, a1)
+	if !ok {
+		return nil
+	}
+
+	var approx, remTmp, checkRem big.Int
+	for i := d - 2; i >= 1; i-- {
+		roundQuoRem(&approx, &remTmp, Q, a0Pows[i])
+		qMod := modBigUint64(Q, a1)
+		ciMod := arith.MulMod64(qMod, arith.PowMod64(invA0, uint64(i), a1), a1)
+		approxMod := modBigUint64(&approx, a1)
+		var shift int64
+		if ciMod >= approxMod {
+			dp := ciMod - approxMod
+			if dp > a1/2 {
+				shift = -int64(a1 - dp)
+			} else {
+				shift = int64(dp)
+			}
+		} else {
+			dn := approxMod - ciMod
+			if dn > a1/2 {
+				shift = int64(a1 - dn)
+			} else {
+				shift = -int64(dn)
+			}
+		}
+		ci := new(big.Int).Add(&approx, big.NewInt(shift))
+		coeffs[i] = ci
+		Q.Sub(Q, new(big.Int).Mul(ci, a0Pows[i]))
+		Q.QuoRem(Q, a1Big, &checkRem)
+		if checkRem.Sign() != 0 {
+			return nil
+		}
+	}
+	coeffs[0] = Q
+
+	mMod := new(big.Int).Mul(a0, invA1ModN)
+	mMod.Mod(mMod, n)
+	return &Poly{
+		Degree: d,
+		Coeffs: coeffs,
+		A1:     new(big.Int).Set(a1Big),
+		A0:     new(big.Int).Set(a0),
+		M:      mMod,
+	}
+}
+
+func clonePoly(p *Poly) *Poly {
+	coeffs := make([]*big.Int, len(p.Coeffs))
+	for i, c := range p.Coeffs {
+		coeffs[i] = new(big.Int).Set(c)
+	}
+	return &Poly{
+		Degree: p.Degree,
+		Coeffs: coeffs,
+		A1:     new(big.Int).Set(p.A1),
+		A0:     new(big.Int).Set(p.A0),
+		M:      new(big.Int).Set(p.M),
+		Skew:   p.Skew,
+		Alpha:  p.Alpha,
+	}
+}
+
+// translatePoly shifts x -> x + k, setting f_new(x) = f(x + k) and A0_new = A0 - k*A1.
+func translatePoly(p *Poly, k *big.Int, n *big.Int) *Poly {
+	if k.Sign() == 0 {
+		return clonePoly(p)
+	}
+	out := clonePoly(p)
+	d := out.Degree
+	var prod big.Int
+	for i := 0; i < d; i++ {
+		for j := d - 1; j >= i; j-- {
+			prod.Mul(k, out.Coeffs[j+1])
+			out.Coeffs[j].Add(out.Coeffs[j], &prod)
+		}
+	}
+	out.A0.Sub(out.A0, new(big.Int).Mul(k, out.A1))
+	out.M.Sub(out.M, k)
+	out.M.Mod(out.M, n)
+	return out
+}
+
+func rotatePolyBig(base *Poly, u, v *big.Int) *Poly {
+	out := clonePoly(base)
+	if u.Sign() == 0 && v.Sign() == 0 {
+		return out
+	}
+	t2 := new(big.Int).Mul(u, out.A1)
+	t1 := new(big.Int).Sub(new(big.Int).Mul(v, out.A1), new(big.Int).Mul(u, out.A0))
+	t0 := new(big.Int).Neg(new(big.Int).Mul(v, out.A0))
+	out.Coeffs[2].Add(out.Coeffs[2], t2)
+	out.Coeffs[1].Add(out.Coeffs[1], t1)
+	out.Coeffs[0].Add(out.Coeffs[0], t0)
+	return out
+}
+
+// sizeOptimizePoly minimizes the skewed norm via translation and 2x2 continuous rotation.
+func sizeOptimizePoly(base *Poly, n *big.Int, maxSkew float64) (*Poly, *big.Int) {
+	cur := clonePoly(base)
+	cur.Skew = optimizeSkewnessBounded(cur, maxSkew)
+	curScore := logNormScore(cur)
+	d := cur.Degree
+
+	for iter := 0; iter < 6; iter++ {
+		improved := false
+
+		denom := new(big.Int).Mul(big.NewInt(int64(d)), cur.Coeffs[d])
+		if denom.Sign() != 0 {
+			var kt, rem big.Int
+			negC := new(big.Int).Neg(cur.Coeffs[d-1])
+			if denom.Sign() < 0 {
+				denom.Neg(denom)
+				negC.Neg(negC)
+			}
+			roundQuoRem(&kt, &rem, negC, denom)
+			if kt.Sign() != 0 {
+				cand := translatePoly(cur, &kt, n)
+				if cand.A0.Sign() > 0 {
+					cand.Skew = optimizeSkewnessBounded(cand, maxSkew)
+					if sc := logNormScore(cand); sc < curScore-1e-6 {
+						cur, curScore, improved = cand, sc, true
+					}
+				}
+			}
+		}
+
+		if d >= 3 {
+			uBig, vBig, ok := solveBestUVBig(cur)
+			if ok && (uBig.Sign() != 0 || vBig.Sign() != 0) {
+				cand := rotatePolyBig(cur, uBig, vBig)
+				cand.Skew = optimizeSkewnessBounded(cand, maxSkew)
+				if sc := logNormScore(cand); sc < curScore-1e-6 {
+					cur, curScore, improved = cand, sc, true
+				}
+			}
+		}
+
+		if !improved {
+			break
+		}
+	}
+
+	return normalizePoly(cur, n)
+}
+
+func solveBestUVBig(p *Poly) (uOut, vOut *big.Int, ok bool) {
+	d := p.Degree
+	s := p.Skew
+	if s <= 0 {
+		s = 1
+	}
+	maxBits := max(p.A0.BitLen(), p.A1.BitLen())
+	for _, c := range p.Coeffs {
+		if b := c.BitLen(); b > maxBits {
+			maxBits = b
+		}
+	}
+	shift := maxBits - 450
+	if shift < 0 {
+		shift = 0
+	}
+	cf := make([]float64, d+1)
+	for i, c := range p.Coeffs {
+		cf[i] = scaledFloat(c, shift)
+	}
+	a1f := scaledFloat(p.A1, shift)
+	a0f := scaledFloat(p.A0, shift)
+
+	du := make([]float64, d+1)
+	dv := make([]float64, d+1)
+	du[1], du[2] = -a0f, a1f
+	dv[0], dv[1] = -a0f, a1f
+
+	inner := func(x, y []float64) float64 {
+		var tot float64
+		for i := 0; i <= d; i++ {
+			if x[i] == 0 {
+				continue
+			}
+			for j := 0; j <= d; j++ {
+				if (i+j)&1 != 0 || y[j] == 0 {
+					continue
+				}
+				tot += x[i] * y[j] * math.Pow(s, float64(i+j-d)) / float64((i+j+1)*(2*d-i-j+1))
+			}
+		}
+		return tot
+	}
+
+	a11 := inner(du, du)
+	a12 := inner(du, dv)
+	a22 := inner(dv, dv)
+	det := a11*a22 - a12*a12
+	if !(det > 0) || math.IsInf(det, 0) || math.IsNaN(det) {
+		return nil, nil, false
+	}
+	b1 := -inner(cf, du)
+	b2 := -inner(cf, dv)
+	uf := (b1*a22 - b2*a12) / det
+	vf := (a11*b2 - a12*b1) / det
+	if math.IsNaN(uf) || math.IsInf(uf, 0) || math.IsNaN(vf) || math.IsInf(vf, 0) {
+		return nil, nil, false
+	}
+	return floatToRoundedBig(uf), floatToRoundedBig(vf), true
+}
+
+func floatToRoundedBig(x float64) *big.Int {
+	if math.Abs(x) < 0.5 {
+		return new(big.Int)
+	}
+	if math.Abs(x) < 1e15 {
+		return big.NewInt(int64(math.Round(x)))
+	}
+	bf := new(big.Float).SetPrec(128).SetFloat64(x)
+	if x >= 0 {
+		bf.Add(bf, big.NewFloat(0.5))
+	} else {
+		bf.Sub(bf, big.NewFloat(0.5))
+	}
+	out, _ := bf.Int(nil)
+	return out
+}
+
+func projectiveAlphaBonus(cd *big.Int) float64 {
+	var bonus float64
+	var bigP, r big.Int
+	for _, p := range []int64{2, 3, 5, 7, 11, 13, 17, 19, 23} {
+		if r.Mod(cd, bigP.SetInt64(p)).Sign() == 0 {
+			pf := float64(p)
+			bonus -= pf / (pf*pf - 1) * math.Log(pf)
+		}
+	}
+	return bonus
+}
+
+type rootSievePK struct {
+	p      uint64
+	pk     uint64
+	weight float32
+}
+
+func buildRootSievePrimes(bound int64) []rootSievePK {
+	var out []rootSievePK
+	for _, p64 := range arith.PrimesUpTo(bound) {
+		p := uint64(p64)
+		pk := p
+		level := 1
+		for pk <= uint64(bound) {
+			w := math.Log(float64(p)) / (float64(p+1) * math.Pow(float64(p), float64(level-1)))
+			out = append(out, rootSievePK{p: p, pk: pk, weight: float32(w)})
+			pk *= p
+			level++
+		}
+	}
+	return out
+}
+
+// rootSieveOptimize sieves (u, v) in [-U, U] x [-V, V] around base for small-prime root density,
+// following Murphy (1999), Chapter 5.2.
+func rootSieveOptimize(base *Poly, n *big.Int, pr *Params, maxSkew float64, pks []rootSievePK) (*Poly, *big.Int) {
+	rmsF, _ := logNormParts(base)
+	s := base.Skew
+	if s < 1 {
+		s = 1
+	}
+	logA0 := arith.Log2Big(new(big.Int).Abs(base.A0)) * math.Ln2
+	maxU := int(math.Exp(rmsF + 0.4 + math.Log(s) - logA0))
+	if maxU < 2 {
+		maxU = 2
+	}
+	if maxU > 12 {
+		maxU = 12
+	}
+	maxV := int(math.Exp(rmsF + 0.4 + 2*math.Log(s) - logA0))
+	if maxV < 16 {
+		maxV = 16
+	}
+	if maxV > 768 {
+		maxV = 768
+	}
+
+	lenV := 2*maxV + 1
+	gains := make([]float32, lenV)
+
+	d := base.Degree
+	numPK := len(pks)
+	baseMod := make([][]uint64, numPK)
+	a1Mod := make([]uint64, numPK)
+	a0Mod := make([]uint64, numPK)
+	var bigM, rTmp big.Int
+	for idx, entry := range pks {
+		bigM.SetUint64(entry.pk)
+		cm := make([]uint64, d+1)
+		for i, c := range base.Coeffs {
+			cm[i] = rTmp.Mod(c, &bigM).Uint64()
+		}
+		baseMod[idx] = cm
+		a1Mod[idx] = rTmp.Mod(base.A1, &bigM).Uint64()
+		a0Mod[idx] = rTmp.Mod(base.A0, &bigM).Uint64()
+	}
+
+	type uvCand struct {
+		u, v int64
+		gain float32
+	}
+	const keepTop = 8
+	top := make([]uvCand, 0, keepTop+1)
+	top = append(top, uvCand{0, 0, 0})
+
+	cu := make([]uint64, d+1)
+	for u := int64(-maxU); u <= int64(maxU); u++ {
+		clear(gains)
+		for idx, entry := range pks {
+			pk := entry.pk
+			p := entry.p
+			w := entry.weight
+			copy(cu, baseMod[idx])
+			um := modInt64(u, pk)
+			a1m := a1Mod[idx]
+			a0m := a0Mod[idx]
+			cu[2] = (cu[2] + um*a1m) % pk
+			sub1 := (um * a0m) % pk
+			if cu[1] >= sub1 {
+				cu[1] -= sub1
+			} else {
+				cu[1] = cu[1] + pk - sub1
+			}
+
+			pkInt := int(pk)
+			vBias := maxV % pkInt
+			for x := uint64(0); x < pk; x++ {
+				gx := (a1m*x + pk - a0m) % pk
+				var fx uint64
+				for i := d; i >= 0; i-- {
+					fx = (fx*x + cu[i]) % pk
+				}
+				if gx%p != 0 {
+					invG, ok := arith.InvMod64(gx, pk)
+					if !ok {
+						continue
+					}
+					vMod := ((pk - fx) % pk) * invG % pk
+					off := (int(vMod) + vBias) % pkInt
+					for j := off; j < lenV; j += pkInt {
+						gains[j] += w
+					}
+				} else {
+					g := arith.Gcd64(gx, pk)
+					if fx%g != 0 {
+						continue
+					}
+					step := int(pk / g)
+					if step == 1 {
+						for j := 0; j < lenV; j++ {
+							gains[j] += w
+						}
+					} else {
+						stepU := uint64(step)
+						invG, ok := arith.InvMod64((gx/g)%stepU, stepU)
+						if !ok {
+							continue
+						}
+						fxRed := (fx / g) % stepU
+						vMod := ((stepU - fxRed) % stepU) * invG % stepU
+						off := (int(vMod) + maxV%step) % step
+						for j := off; j < lenV; j += step {
+							gains[j] += w
+						}
+					}
+				}
+			}
+		}
+
+		for j, gVal := range gains {
+			v := int64(j - maxV)
+			if u == 0 && v == 0 {
+				top[0].gain = gVal
+				continue
+			}
+			if len(top) < keepTop || gVal > top[len(top)-1].gain {
+				cand := uvCand{u: u, v: v, gain: gVal}
+				if len(top) < keepTop {
+					top = append(top, cand)
+				} else {
+					top[keepTop-1] = cand
+				}
+				for k := len(top) - 1; k > 1 && top[k].gain > top[k-1].gain; k-- {
+					top[k], top[k-1] = top[k-1], top[k]
+				}
+			}
+		}
+	}
+
+	var best *Poly
+	bestScore := math.Inf(1)
 	for _, c := range top {
 		rot, fac := normalizePoly(rotatePoly(base, c.u, c.v), n)
 		if fac != nil {
 			return nil, fac
 		}
-		if rot == nil || rot.Coeffs[0].Sign() == 0 {
-			if rot == nil {
-				continue
-			}
-			var g big.Int
-			g.GCD(nil, nil, m, n)
-			if g.Cmp(big.NewInt(1)) > 0 && g.Cmp(n) < 0 {
-				return nil, &g
-			}
+		if rot == nil {
 			continue
 		}
 		if !IsIrreducible(rot) {
@@ -1028,9 +1884,9 @@ func bestRotation(base *Poly, n *big.Int) (*Poly, *big.Int) {
 			}
 			continue
 		}
-		rot.Skew = OptimizeSkewness(rot)
+		rot.Skew = optimizeSkewnessBounded(rot, maxSkew)
 		rot.Alpha = ComputeAlpha(rot, 200)
-		sc := logNormScore(rot) + rot.Alpha
+		sc := dickmanYieldScore(rot, pr)
 		if sc < bestScore {
 			bestScore = sc
 			best = rot
@@ -1040,7 +1896,14 @@ func bestRotation(base *Poly, n *big.Int) (*Poly, *big.Int) {
 }
 
 func normalizePoly(p *Poly, n *big.Int) (*Poly, *big.Int) {
-	one := big.NewInt(1)
+	if p == nil || p.Coeffs[p.Degree].Sign() == 0 {
+		return nil, nil
+	}
+	if p.Coeffs[p.Degree].Sign() < 0 {
+		for i := range p.Coeffs {
+			p.Coeffs[i].Neg(p.Coeffs[i])
+		}
+	}
 	content := new(big.Int).Abs(p.Coeffs[0])
 	for i := 1; i <= p.Degree; i++ {
 		content.GCD(nil, nil, content, new(big.Int).Abs(p.Coeffs[i]))
@@ -1048,40 +1911,33 @@ func normalizePoly(p *Poly, n *big.Int) (*Poly, *big.Int) {
 	if content.Sign() == 0 {
 		return nil, nil
 	}
-	if content.Cmp(one) > 0 {
+	if content.Cmp(bigOne) > 0 {
 		var g big.Int
 		g.GCD(nil, nil, content, n)
-		if g.Cmp(one) > 0 && g.Cmp(n) < 0 {
+		if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
 			return nil, &g
 		}
 		for i := 0; i <= p.Degree; i++ {
 			p.Coeffs[i].Quo(p.Coeffs[i], content)
 		}
 	}
+	var gLin big.Int
+	gLin.GCD(nil, nil, new(big.Int).Abs(p.A1), new(big.Int).Abs(p.A0))
+	if gLin.Cmp(bigOne) > 0 {
+		p.A1.Quo(p.A1, &gLin)
+		p.A0.Quo(p.A0, &gLin)
+	}
+	if p.Coeffs[0].Sign() == 0 {
+		var g big.Int
+		g.GCD(nil, nil, p.A0, n)
+		if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
+			return nil, &g
+		}
+		return nil, nil
+	}
 	return p, nil
 }
 
-// rotatePoly returns base + (u*x + v)*(A1*x - A0).
 func rotatePoly(base *Poly, u, v int64) *Poly {
-	d := base.Degree
-	coeffs := make([]*big.Int, d+1)
-	for i, c := range base.Coeffs {
-		coeffs[i] = new(big.Int).Set(c)
-	}
-	// (u*x + v)*(A1*x - A0) = u*A1*x^2 + (v*A1 - u*A0)*x - v*A0
-	bu := big.NewInt(u)
-	bv := big.NewInt(v)
-	t2 := new(big.Int).Mul(bu, base.A1)
-	t1 := new(big.Int).Sub(new(big.Int).Mul(bv, base.A1), new(big.Int).Mul(bu, base.A0))
-	t0 := new(big.Int).Neg(new(big.Int).Mul(bv, base.A0))
-	coeffs[2].Add(coeffs[2], t2)
-	coeffs[1].Add(coeffs[1], t1)
-	coeffs[0].Add(coeffs[0], t0)
-	return &Poly{
-		Degree: d,
-		Coeffs: coeffs,
-		A1:     new(big.Int).Set(base.A1),
-		A0:     new(big.Int).Set(base.A0),
-		M:      new(big.Int).Set(base.M),
-	}
+	return rotatePolyBig(base, big.NewInt(u), big.NewInt(v))
 }
