@@ -147,6 +147,28 @@ func TestWorkers(t *testing.T) {
 	}
 }
 
+func TestAppendGe(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	buf := make([]byte, 261)
+	for i := range buf {
+		buf[i] = byte(rng.Intn(256))
+	}
+	buf[0], buf[7], buf[8], buf[260] = 0, 128, 127, 255
+	var got []int
+	for th := -1; th <= 257; th += 3 {
+		got = appendGe(got[:0], buf, th)
+		var want []int
+		for i, b := range buf {
+			if int(b) >= th {
+				want = append(want, i)
+			}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("appendGe(th=%d) = %v, want %v", th, got, want)
+		}
+	}
+}
+
 func BenchmarkQuadraticSieve(b *testing.B) {
 	for _, bits := range []int{30, 40, 50, 60, 70, 80} {
 		rnd := rand.New(rand.NewSource(1))

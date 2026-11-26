@@ -8,6 +8,7 @@
 package qs
 
 import (
+	"encoding/binary"
 	"math"
 	"math/big"
 	"math/bits"
@@ -33,6 +34,7 @@ const extraRelations = 20
 const (
 	blockShift    = 15 // sieve blocks are 32 KB, sized for L1 cache
 	blockSize     = 1 << blockShift
+	blockMask     = blockSize - 1
 	bucketCut     = 16384 // primes from here up are sieved through per-block buckets
 	resieveCut    = 2048  // primes from here to bucketCut are found again by resieving
 	minSievePrime = 30    // smaller primes are not sieved, only allowed for in the threshold
@@ -335,12 +337,11 @@ type sieve struct {
 	dlpCap    uint64 // cofactors up to this are split into two large primes
 
 	// Primes from bucketFrom up are sieved by walking each polynomial's
-	// interval once and filing the hits by block. A bucket entry packs
-	// log2(p) << 48 | prime index << 16 | offset in the block. Primes from
-	// resieveFrom to bucketFrom are sieved block by block, and found again
-	// for the block's candidates by walking back from their next offsets.
-	resieveFrom int
-	bucketFrom  int
+	// interval once and filing hits into a flat uint32 arena grouped by logP.
+	resieveFrom   int
+	bucketFrom    int
+	bucketGroups  []logGroup
+	expectedBKHits int
 
 	// The rest is only used by the goroutine collecting relations.
 	relations []relation
@@ -362,19 +363,25 @@ type sieve struct {
 	rate    progress.Rate // relations per second
 }
 
+type bkRoot struct {
+	p, r1, r2 uint32
+}
+
 // worker sieves polynomials. Each worker has its own copy of the roots and
 // its own buffers, so several can run at once. It passes the relations it
 // finds to emit, and stops early once stop is set.
 type worker struct {
 	s     *sieve // read only
 	roots []root
+	bk    []bkRoot
 	emit  func(found)
 	stop  *atomic.Bool
 	poly  int // index of the polynomial being sieved within its A
 
-	deltas  [][]uint32
-	buf     [blockSize]byte
-	buckets [][]uint64
+	deltas [][]uint32
+	buf    [blockSize]byte
+	arena  *qsArena
+	log2A  float64
 
 	// The current block's candidates, and the primes from resieveFrom up
 	// hitting each.
@@ -383,14 +390,20 @@ type worker struct {
 	candBits [blockSize / 64]uint64
 	candSlot [blockSize]uint16 // index in cands of each candidate's offset
 
-	scratch []int32
-	temp    big.Int
+	scratch            []int32
+	temp, sx, sy       big.Int
+	mx, my             big.Int
 }
 
 func (s *sieve) newWorker(stop *atomic.Bool, emit func(found)) *worker {
+	bk := make([]bkRoot, len(s.roots)-s.bucketFrom)
+	for i := s.bucketFrom; i < len(s.roots); i++ {
+		bk[i-s.bucketFrom].p = s.roots[i].p
+	}
 	return &worker{
 		s:     s,
 		roots: append([]root(nil), s.roots...),
+		bk:    bk,
 		emit:  emit,
 		stop:  stop,
 	}
@@ -478,6 +491,12 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 	if s.bucketFrom < s.resieveFrom {
 		s.bucketFrom = s.resieveFrom
 	}
+	s.bucketGroups = buildLogGroups(s.roots, s.bucketFrom)
+	var invSum float64
+	for i := s.bucketFrom; i < len(s.roots); i++ {
+		invSum += 2.0 / float64(s.roots[i].p)
+	}
+	s.expectedBKHits = int(float64(blockSize)*invSum) + 256
 
 	pMax := uint64(s.roots[len(s.roots)-1].p)
 	s.pMax = pMax
@@ -515,6 +534,7 @@ func (s *sieve) singlePoly(sieveRange int64) *big.Int {
 	if m.IsInt64() && 1-m.Int64() > lo {
 		lo = 1 - m.Int64()
 	}
+	w.log2A = 0
 	w.setRoots(one, m, lo)
 	s.polys = 1
 	w.sievePoly(one, m, nil, lo, sieveRange)
@@ -685,6 +705,17 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 	}
 
 	// Batch invert q_j mod p via prefix products since B_j*A^-1 ≡ gamma_j*q_j^-1 (mod p).
+	w.log2A = arith.Log2Big(a)
+	bkFrom := w.s.bucketFrom
+	for _, idx := range aIdx {
+		for v := 0; v < sLen-1; v++ {
+			w.deltas[v][idx] = 0
+		}
+		if idx >= bkFrom {
+			w.bk[idx-bkFrom].r1 = math.MaxUint32
+			w.bk[idx-bkFrom].r2 = math.MaxUint32
+		}
+	}
 	uRange := uint64(sieveRange)
 	for i := range w.roots {
 		rt := &w.roots[i]
@@ -735,8 +766,14 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 			shift %= p
 		}
 		tA := uint64(rt.t) * aInv % p
-		rt.r1 = uint32((tA + p - sumBeta + shift) % p)
-		rt.r2 = uint32((2*p - tA - sumBeta + shift) % p)
+		r1 := uint32((tA + p - sumBeta + shift) % p)
+		r2 := uint32((2*p - tA - sumBeta + shift) % p)
+		if i < bkFrom {
+			rt.r1, rt.r2 = r1, r2
+		} else {
+			w.bk[i-bkFrom].r1 = r1
+			w.bk[i-bkFrom].r2 = r2
+		}
 	}
 
 	for poly := 1; ; poly++ {
@@ -871,10 +908,15 @@ func negMod(lo int64, p uint32) uint32 {
 
 // setRoots sets r1 and r2 of every prime not in A to its first offset >= 0 from lo.
 func (w *worker) setRoots(a, b *big.Int, lo int64) {
+	bkFrom := w.s.bucketFrom
 	var r, bigP big.Int
 	for i := range w.roots {
 		rt := &w.roots[i]
 		if rt.inA {
+			if i >= bkFrom {
+				w.bk[i-bkFrom].r1 = math.MaxUint32
+				w.bk[i-bkFrom].r2 = math.MaxUint32
+			}
 			continue
 		}
 		p := uint64(rt.p)
@@ -883,32 +925,268 @@ func (w *worker) setRoots(a, b *big.Int, lo int64) {
 		bModP := r.Mod(b, &bigP).Uint64()
 		shift := uint64(negMod(lo, rt.p))
 		t := uint64(rt.t)
-		rt.r1 = uint32(((t+p-bModP)%p*aInv + shift) % p)
-		rt.r2 = uint32(((2*p-t-bModP)%p*aInv + shift) % p)
+		r1 := uint32(((t+p-bModP)%p*aInv + shift) % p)
+		r2 := uint32(((2*p-t-bModP)%p*aInv + shift) % p)
+		if i < bkFrom {
+			rt.r1, rt.r2 = r1, r2
+		} else {
+			w.bk[i-bkFrom].r1 = r1
+			w.bk[i-bkFrom].r2 = r2
+		}
 	}
 }
 
-// moveRoots adds delta[i] to both roots of each prime, or subtracts it.
+// moveRoots adds delta[i] to both roots of each prime, or subtracts it,
+// using branchless modular reduction since p < 2^31.
 func (w *worker) moveRoots(delta []uint32, add bool) {
-	for i := range w.roots {
-		rt := &w.roots[i]
-		d := delta[i]
-		if rt.inA || d == 0 {
+	bkFrom := w.s.bucketFrom
+	if add {
+		for i := 0; i < bkFrom; i++ {
+			rt := &w.roots[i]
+			if rt.inA {
+				continue
+			}
+			p := rt.p
+			d := delta[i]
+			d1 := int32(rt.r1 + d - p)
+			rt.r1 = uint32(d1) + (p & uint32(d1>>31))
+			d2 := int32(rt.r2 + d - p)
+			rt.r2 = uint32(d2) + (p & uint32(d2>>31))
+		}
+		bks := w.bk
+		del := delta[bkFrom:]
+		for k := range bks {
+			p := bks[k].p
+			d := del[k]
+			d1 := int32(bks[k].r1 + d - p)
+			bks[k].r1 = uint32(d1) + (p & uint32(d1>>31))
+			d2 := int32(bks[k].r2 + d - p)
+			bks[k].r2 = uint32(d2) + (p & uint32(d2>>31))
+		}
+	} else {
+		for i := 0; i < bkFrom; i++ {
+			rt := &w.roots[i]
+			if rt.inA {
+				continue
+			}
+			p := rt.p
+			d := delta[i]
+			d1 := int32(rt.r1 - d)
+			rt.r1 = uint32(d1) + (p & uint32(d1>>31))
+			d2 := int32(rt.r2 - d)
+			rt.r2 = uint32(d2) + (p & uint32(d2>>31))
+		}
+		bks := w.bk
+		del := delta[bkFrom:]
+		for k := range bks {
+			p := bks[k].p
+			d := del[k]
+			d1 := int32(bks[k].r1 - d)
+			bks[k].r1 = uint32(d1) + (p & uint32(d1>>31))
+			d2 := int32(bks[k].r2 - d)
+			bks[k].r2 = uint32(d2) + (p & uint32(d2>>31))
+		}
+	}
+}
+
+type logGroup struct {
+	logP       byte
+	start, end int
+}
+
+type overHit struct {
+	idx  int32
+	off  uint16
+	logP byte
+}
+
+// qsArena stores bucket hits as packed uint32 entries (idx << blockShift | off)
+// grouped by logP in a flat preallocated slab per block.
+type qsArena struct {
+	numBlocks int
+	data      []uint32
+	counts    []uint32
+	groupEnds [][]uint32
+	overflow  [][]overHit
+	hasOver   bool
+	stride    uint32
+	shift     uint
+}
+
+func buildLogGroups(roots []root, from int) []logGroup {
+	if from >= len(roots) {
+		return nil
+	}
+	var out []logGroup
+	curLog := roots[from].logP
+	start := from
+	for i := from + 1; i < len(roots); i++ {
+		lg := roots[i].logP
+		if lg != curLog {
+			out = append(out, logGroup{logP: curLog, start: start, end: i})
+			curLog = lg
+			start = i
+		}
+	}
+	return append(out, logGroup{logP: curLog, start: start, end: len(roots)})
+}
+
+func newQSArena(numBlocks, numGroups, expectedPerBlock int) *qsArena {
+	want := expectedPerBlock * 3
+	if want < 2048 {
+		want = 2048
+	}
+	shift := uint(11)
+	for (1 << shift) < want && shift < 17 {
+		shift++
+	}
+	ge := make([][]uint32, numGroups)
+	if numGroups > 0 && numBlocks > 0 {
+		geBacking := make([]uint32, numGroups*numBlocks)
+		for g := 0; g < numGroups; g++ {
+			ge[g] = geBacking[g*numBlocks : (g+1)*numBlocks]
+		}
+	}
+	return &qsArena{
+		numBlocks: numBlocks,
+		data:      make([]uint32, numBlocks<<shift),
+		counts:    make([]uint32, numBlocks),
+		groupEnds: ge,
+		overflow:  make([][]overHit, numBlocks),
+		stride:    uint32(1 << shift),
+		shift:     shift,
+	}
+}
+
+func (a *qsArena) reset(n int) {
+	clear(a.counts[:n])
+	if a.hasOver {
+		for i := 0; i < n; i++ {
+			a.overflow[i] = a.overflow[i][:0]
+		}
+		a.hasOver = false
+	}
+}
+
+func (a *qsArena) addOverflow(bi int, idx int32, off uint16, logP byte) {
+	a.hasOver = true
+	a.overflow[bi] = append(a.overflow[bi], overHit{idx: idx, off: off, logP: logP})
+}
+
+func (a *qsArena) endGroup(g, n int) {
+	copy(a.groupEnds[g][:n], a.counts[:n])
+}
+
+func (a *qsArena) drainBlock(bi int, block []byte, groups []logGroup) {
+	base := bi << a.shift
+	var cur uint32
+	for g, grp := range groups {
+		end := a.groupEnds[g][bi]
+		if end == cur {
 			continue
 		}
-		if !add {
-			d = rt.p - d
+		lg := grp.logP
+		s := a.data[base+int(cur) : base+int(end)]
+		i := 0
+		for ; i+3 < len(s); i += 4 {
+			block[s[i]&blockMask] += lg
+			block[s[i+1]&blockMask] += lg
+			block[s[i+2]&blockMask] += lg
+			block[s[i+3]&blockMask] += lg
 		}
-		rt.r1 = addMod(rt.r1, d, rt.p)
-		rt.r2 = addMod(rt.r2, d, rt.p)
+		for ; i < len(s); i++ {
+			block[s[i]&blockMask] += lg
+		}
+		cur = end
+	}
+	if a.hasOver {
+		for _, ov := range a.overflow[bi] {
+			block[ov.off] += ov.logP
+		}
 	}
 }
 
-func addMod(a, b, p uint32) uint32 {
-	if a >= p-b {
-		return a - (p - b)
+func (a *qsArena) gatherHits(bi int, candBits *[blockSize / 64]uint64, candSlot *[blockSize]uint16, dst [][]int32) {
+	base := bi << a.shift
+	s := a.data[base : base+int(a.counts[bi])]
+	for _, e := range s {
+		j := e & blockMask
+		if candBits[j>>6]&(1<<(j&63)) != 0 {
+			k := candSlot[j]
+			dst[k] = append(dst[k], int32(e>>blockShift))
+		}
 	}
-	return a + b
+	if a.hasOver {
+		for _, ov := range a.overflow[bi] {
+			if candBits[ov.off>>6]&(1<<(ov.off&63)) != 0 {
+				k := candSlot[ov.off]
+				dst[k] = append(dst[k], ov.idx)
+			}
+		}
+	}
+}
+
+func addSieveStride(block []byte, j, p int, logP byte) uint32 {
+	n := len(block)
+	p2 := p << 1
+	p3 := p2 + p
+	p4 := p << 2
+	for ; j+p3 < n; j += p4 {
+		block[j] += logP
+		block[j+p] += logP
+		block[j+p2] += logP
+		block[j+p3] += logP
+	}
+	for ; j < n; j += p {
+		block[j] += logP
+	}
+	return uint32(j - n)
+}
+
+// appendGe appends indices off where buf[off] >= thresh, scanning 8 bytes per word.
+func appendGe(dst []int, buf []byte, thresh int) []int {
+	n := len(buf)
+	if thresh > 255 || n == 0 {
+		return dst
+	}
+	if thresh <= 0 {
+		for off := 0; off < n; off++ {
+			dst = append(dst, off)
+		}
+		return dst
+	}
+	const low7 = 0x7f7f7f7f7f7f7f7f
+	const high1 = 0x8080808080808080
+	n8 := n &^ 7
+	if thresh <= 128 {
+		bias := uint64(128-thresh) * 0x0101010101010101
+		for off := 0; off < n8; off += 8 {
+			w := binary.LittleEndian.Uint64(buf[off:])
+			m := (((w & low7) + bias) | w) & high1
+			for m != 0 {
+				lane := bits.TrailingZeros64(m) >> 3
+				dst = append(dst, off+lane)
+				m &= m - 1
+			}
+		}
+	} else {
+		bias := uint64(256-thresh) * 0x0101010101010101
+		for off := 0; off < n8; off += 8 {
+			w := binary.LittleEndian.Uint64(buf[off:])
+			m := (((w & low7) + bias) & w) & high1
+			for m != 0 {
+				lane := bits.TrailingZeros64(m) >> 3
+				dst = append(dst, off+lane)
+				m &= m - 1
+			}
+		}
+	}
+	for off := n8; off < n; off++ {
+		if int(buf[off]) >= thresh {
+			dst = append(dst, off)
+		}
+	}
+	return dst
 }
 
 // sievePoly sieves Y(x) = ((ax + b)² − kN) / a for x in [lo, hi) and passes
@@ -920,18 +1198,16 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 		rt.off1 = rt.r1
 		rt.off2 = rt.r2
 	}
-	w.fillBuckets(lo, hi)
+	w.fillBuckets(lo, hi, aIdx)
 
-	var x, y big.Int
+	x, y := &w.sx, &w.sy
 	for blockStart, bi := lo, 0; blockStart < hi && !w.stop.Load(); blockStart, bi = blockStart+blockSize, bi+1 {
 		blockLen := int64(blockSize)
 		if hi-blockStart < blockLen {
 			blockLen = hi - blockStart
 		}
 		block := w.buf[:blockLen]
-		for i := range block {
-			block[i] = 0
-		}
+		clear(block)
 
 		for i := s.sieveFrom; i < s.bucketFrom; i++ {
 			rt := &w.roots[i]
@@ -939,55 +1215,41 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 				continue
 			}
 			p := int(rt.p)
-			j := int(rt.off1)
-			for ; j < len(block); j += p {
-				block[j] += rt.logP
-			}
-			rt.off1 = uint32(j - len(block))
+			rt.off1 = addSieveStride(block, int(rt.off1), p, rt.logP)
 			if rt.r2 != rt.r1 {
-				j = int(rt.off2)
-				for ; j < len(block); j += p {
-					block[j] += rt.logP
-				}
-				rt.off2 = uint32(j - len(block))
+				rt.off2 = addSieveStride(block, int(rt.off2), p, rt.logP)
 			}
 		}
-		bucket := w.buckets[bi]
-		for _, e := range bucket {
-			block[uint16(e)] += byte(e >> 48)
+		if w.arena != nil {
+			w.arena.drainBlock(bi, block, s.bucketGroups)
 		}
 
 		thresh := int(math.Ceil(w.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack))
 		if thresh < 0 {
 			thresh = 0
 		}
-		w.cands = w.cands[:0]
-		for i, score := range block {
-			if int(score) >= thresh {
-				w.cands = append(w.cands, i)
-			}
-		}
+		w.cands = appendGe(w.cands[:0], block, thresh)
 		if len(w.cands) == 0 {
 			continue
 		}
-		w.bucketHits(bucket, len(block))
+		w.bucketHits(bi, len(block))
 
 		for k, i := range w.cands {
 			off := blockStart + int64(i)
 			x.SetInt64(off)
-			x.Mul(&x, a)
-			x.Add(&x, b)
-			y.Mul(&x, &x)
-			y.Sub(&y, s.kn)
-			y.Quo(&y, a)
+			x.Mul(x, a)
+			x.Add(x, b)
+			y.Mul(x, x)
+			y.Sub(y, s.kn)
+			y.Quo(y, a)
 			if y.Sign() == 0 {
 				continue
 			}
-			factors, lp1, lp2, ok := w.tryFactorize(uint64(off-lo), &y, aIdx, w.candHits[k])
+			factors, lp1, lp2, ok := w.tryFactorize(uint64(off-lo), y, aIdx, w.candHits[k])
 			if !ok {
 				continue
 			}
-			w.emit(found{new(big.Int).Mod(&x, s.n), factors, lp1, lp2, w.poly})
+			w.emit(found{new(big.Int).Mod(x, s.n), factors, lp1, lp2, w.poly})
 			if w.stop.Load() {
 				break
 			}
@@ -998,7 +1260,7 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 // bucketHits sets w.candHits to the primes from resieveFrom up hitting
 // each candidate. It must run after the block of length blockLen is sieved,
 // when off1 and off2 hold the offsets of the next block's first hits.
-func (w *worker) bucketHits(bucket []uint64, blockLen int) {
+func (w *worker) bucketHits(bi, blockLen int) {
 	s := w.s
 	for len(w.candHits) < len(w.cands) {
 		w.candHits = append(w.candHits, nil)
@@ -1029,11 +1291,8 @@ func (w *worker) bucketHits(bucket []uint64, blockLen int) {
 			}
 		}
 	}
-	for _, e := range bucket {
-		if j := uint16(e); w.candBits[j/64]&(1<<(j%64)) != 0 {
-			k := w.candSlot[j]
-			w.candHits[k] = append(w.candHits[k], int32(uint32(e>>16)))
-		}
+	if w.arena != nil {
+		w.arena.gatherHits(bi, &w.candBits, &w.candSlot, w.candHits)
 	}
 	for _, i := range w.cands {
 		w.candBits[i/64] = 0
@@ -1041,45 +1300,102 @@ func (w *worker) bucketHits(bucket []uint64, blockLen int) {
 }
 
 // fillBuckets files every hit in [lo, hi) of the primes from bucketFrom up
-// into the bucket of its block.
-func (w *worker) fillBuckets(lo, hi int64) {
+// into the flat uint32 arena of its block.
+func (w *worker) fillBuckets(lo, hi int64, aIdx []int) {
 	s := w.s
+	if len(s.bucketGroups) == 0 {
+		return
+	}
 	n := int((hi - lo + blockSize - 1) >> blockShift)
-	for len(w.buckets) < n {
-		w.buckets = append(w.buckets, nil)
+	if w.arena == nil || w.arena.numBlocks < n {
+		w.arena = newQSArena(n, len(s.bucketGroups), s.expectedBKHits)
+	} else {
+		w.arena.reset(n)
 	}
-	for i := range w.buckets[:n] {
-		w.buckets[i] = w.buckets[i][:0]
-	}
-	total := uint64(hi - lo)
-	for i := s.bucketFrom; i < len(w.roots); i++ {
-		rt := &w.roots[i]
-		if rt.inA {
-			continue
+	bkFrom := s.bucketFrom
+	bks := w.bk
+	for _, idx := range aIdx {
+		if idx >= bkFrom {
+			bks[idx-bkFrom].r1 = math.MaxUint32
+			bks[idx-bkFrom].r2 = math.MaxUint32
 		}
-		p := uint64(rt.p)
-		tag := uint64(rt.logP)<<48 | uint64(i)<<16
-		if p >= total {
-			if off := uint64(rt.r1); off < total {
-				w.buckets[off>>blockShift] = append(w.buckets[off>>blockShift], tag|off&(blockSize-1))
+	}
+	a := w.arena
+	counts := a.counts
+	data := a.data
+	baseStride := a.stride
+	shift := a.shift
+	total := uint64(hi - lo)
+
+	for g, grp := range s.bucketGroups {
+		lg := grp.logP
+		mid := grp.start + sort.Search(grp.end-grp.start, func(k int) bool {
+			return uint64(bks[grp.start-bkFrom+k].p) >= total
+		})
+		for i := grp.start; i < mid; i++ {
+			bk := &bks[i-bkFrom]
+			p := uint64(bk.p)
+			r1, r2 := bk.r1, bk.r2
+			stride := baseStride
+			if i >= 1<<(32-blockShift) {
+				stride = 0
 			}
-			if rt.r2 != rt.r1 {
-				if off := uint64(rt.r2); off < total {
-					w.buckets[off>>blockShift] = append(w.buckets[off>>blockShift], tag|off&(blockSize-1))
+			tag := uint32(i) << blockShift
+			for off := uint64(r1); off < total; off += p {
+				bi := int(off >> blockShift)
+				bo := uint32(off & blockMask)
+				if c := counts[bi]; c < stride {
+					data[bi<<shift|int(c)] = tag | bo
+					counts[bi] = c + 1
+				} else {
+					a.addOverflow(bi, int32(i), uint16(bo), lg)
 				}
 			}
-			continue
-		}
-		for off := uint64(rt.r1); off < total; off += p {
-			b := off >> blockShift
-			w.buckets[b] = append(w.buckets[b], tag|off&(blockSize-1))
-		}
-		if rt.r2 != rt.r1 {
-			for off := uint64(rt.r2); off < total; off += p {
-				b := off >> blockShift
-				w.buckets[b] = append(w.buckets[b], tag|off&(blockSize-1))
+			if r2 != r1 {
+				for off := uint64(r2); off < total; off += p {
+					bi := int(off >> blockShift)
+					bo := uint32(off & blockMask)
+					if c := counts[bi]; c < stride {
+						data[bi<<shift|int(c)] = tag | bo
+						counts[bi] = c + 1
+					} else {
+						a.addOverflow(bi, int32(i), uint16(bo), lg)
+					}
+				}
 			}
 		}
+		for i := mid; i < grp.end; i++ {
+			bk := &bks[i-bkFrom]
+			r1, r2 := bk.r1, bk.r2
+			stride := baseStride
+			if i >= 1<<(32-blockShift) {
+				stride = 0
+			}
+			tag := uint32(i) << blockShift
+			if off := uint64(r1); off < total {
+				bi := int(off >> blockShift)
+				bo := uint32(off & blockMask)
+				if c := counts[bi]; c < stride {
+					data[bi<<shift|int(c)] = tag | bo
+					counts[bi] = c + 1
+				} else {
+					a.addOverflow(bi, int32(i), uint16(bo), lg)
+				}
+			}
+			if r2 != r1 {
+				if off := uint64(r2); off < total {
+					bi := int(off >> blockShift)
+					bo := uint32(off & blockMask)
+					if c := counts[bi]; c < stride {
+						data[bi<<shift|int(c)] = tag | bo
+						counts[bi] = c + 1
+					} else {
+						a.addOverflow(bi, int32(i), uint16(bo), lg)
+					}
+				}
+			}
+		}
+		a.endGroup(g, n)
 	}
 }
 
@@ -1087,23 +1403,23 @@ func (w *worker) fillBuckets(lo, hi int64) {
 // largest either at one end, or where ax + b = 0 if that lies in between.
 func (w *worker) maxLog2Y(a, b *big.Int, from, to int64) float64 {
 	s := w.s
-	var x, y big.Int
+	x, y := &w.mx, &w.my
 	best, signs := 0.0, 0
 	for _, off := range [2]int64{from, to - 1} {
 		x.SetInt64(off)
-		x.Mul(&x, a)
-		x.Add(&x, b)
+		x.Mul(x, a)
+		x.Add(x, b)
 		signs += x.Sign()
-		y.Mul(&x, &x)
-		y.Sub(&y, s.kn)
+		y.Mul(x, x)
+		y.Sub(y, s.kn)
 		if y.Sign() != 0 {
-			best = math.Max(best, arith.Log2Big(y.Abs(&y)))
+			best = math.Max(best, arith.Log2Big(y.Abs(y)))
 		}
 	}
 	if signs == 0 {
 		best = math.Max(best, s.log2KN)
 	}
-	return best - arith.Log2Big(a)
+	return best - w.log2A
 }
 
 // tryFactorize attempts to factor y = Y(x) over the factor base, where z = x - lo.
