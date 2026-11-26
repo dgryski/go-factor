@@ -11,27 +11,32 @@ import (
 	"time"
 
 	"github.com/dgryski/go-factor"
+	"github.com/dgryski/go-factor/gnfs"
 	"github.com/dgryski/go-factor/qs"
 )
 
 // allMethods lists the factoring methods in the order they run.
-var allMethods = []string{"trial", "brent", "p-1", "p+1", "squfof", "ecm", "qs"}
+var allMethods = []string{"trial", "brent", "p-1", "p+1", "squfof", "ecm", "qs", "gnfs"}
 
 func main() {
 	// 21251589199163473368424683523876245871651712859289
 
 	verbose := flag.Bool("v", false, "log the progress of each method's stages")
 	qsSave := flag.String("qs-save", "", "directory to save the quadratic sieve's relations in, as <n>.rel")
-	workers := flag.Int("workers", 0, "goroutines for ECM curves and quadratic sieving (0 means GOMAXPROCS)")
+	gnfsSave := flag.String("gnfs-save", "", "directory to save GNFS relations in, as <n>.gnfs.rel")
+	workers := flag.Int("workers", 0, "goroutines for ECM curves, quadratic sieving, and GNFS (0 means GOMAXPROCS)")
 	methods := flag.String("methods", strings.Join(allMethods, ","), "comma-separated methods to run, always in the order "+strings.Join(allMethods, ","))
 	flag.Parse()
 
 	if *verbose {
 		qs.Logf = log.Printf
+		gnfs.Logf = log.Printf
 		factor.Logf = log.Printf
 	}
 	qs.SaveDir = *qsSave
+	gnfs.SaveDir = *gnfsSave
 	qs.Workers = *workers
+	gnfs.Workers = *workers
 	factor.ECMWorkers = *workers
 
 	run := make(map[string]bool)
@@ -77,15 +82,21 @@ func main() {
 	// cores and 550MB, and the time doubles every 3 or 4 digits. Asking for
 	// qs by name with -methods lifts the limit.
 	const qsMaxBits = 266
+	const gnfsMaxBits = 450
 	qsRuns := func(n *big.Int) bool {
 		return run["qs"] && (methodsSet || n.BitLen() <= qsMaxBits)
+	}
+	gnfsRuns := func(n *big.Int) bool {
+		return run["gnfs"] && (methodsSet || n.BitLen() <= gnfsMaxBits)
 	}
 
 	qsWorkers := *workers
 	if qsWorkers <= 0 {
 		qsWorkers = runtime.GOMAXPROCS(0)
 	}
-	b := &budget{start: time.Now(), workers: qsWorkers, qsRuns: qsRuns}
+	b := &budget{start: time.Now(), workers: qsWorkers, qsRuns: func(n *big.Int) bool {
+		return qsRuns(n) || gnfsRuns(n)
+	}}
 
 	// each runs f on every composite left, until share of its budget is used.
 	each := func(name string, share float64, f func(context.Context, *big.Int) ([]*big.Int, []*big.Int)) {
@@ -185,6 +196,24 @@ func main() {
 			ptmp, c2 := qs.QuadraticSieve(cc)
 			if len(ptmp) > 0 {
 				log.Printf("qs=%+v\n", ptmp)
+			}
+			comps = append(comps, c2...)
+		}
+		ctmp = comps
+	}
+
+	if run["gnfs"] && len(ctmp) > 0 {
+		log.Println("starting gnfs")
+		var comps []*big.Int
+		for _, cc := range ctmp {
+			if !gnfsRuns(cc) {
+				log.Printf("skipping gnfs for %d-bit %v", cc.BitLen(), cc)
+				comps = append(comps, cc)
+				continue
+			}
+			ptmp, c2 := gnfs.Factor(cc)
+			if len(ptmp) > 0 {
+				log.Printf("gnfs=%+v\n", ptmp)
 			}
 			comps = append(comps, c2...)
 		}
