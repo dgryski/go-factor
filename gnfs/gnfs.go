@@ -2,6 +2,7 @@ package gnfs
 
 import (
 	"math/big"
+	"os"
 	"strconv"
 	"time"
 
@@ -128,6 +129,17 @@ func defaultParams(n *big.Int) *Params {
 	}
 }
 
+func computeQCMin(params *Params) uint64 {
+	qcMin := params.LpBoundAlg
+	if uint64(params.Ba) > qcMin {
+		qcMin = uint64(params.Ba)
+	}
+	if params.UseLattice && params.QMax*8 > qcMin {
+		qcMin = params.QMax * 8
+	}
+	return qcMin
+}
+
 func split(n *big.Int) (*big.Int, *big.Int) {
 	return splitWithParams(n, nil)
 }
@@ -160,135 +172,212 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 		}
 	}
 
-	polyStart := time.Now()
-	poly, fac := SelectPoly(n, params.Degree)
-	if fac != nil {
-		logf("gnfs: found factor %v during polynomial selection", fac)
-		return fac, new(big.Int).Div(n, fac)
-	}
-	if poly == nil {
-		logf("gnfs: polynomial selection failed")
-		return nil, nil
-	}
-	var g big.Int
-	g.GCD(nil, nil, poly.A1, n)
-	if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
-		return &g, new(big.Int).Div(n, &g)
-	}
-	logf("gnfs: %d bits (%d digits), deg=%d, c_d=%v, skew=%.1f, alpha=%.2f in %v",
-		n.BitLen(), len(n.String()), poly.Degree, poly.Coeffs[poly.Degree],
-		poly.Skew, poly.Alpha, time.Since(polyStart).Round(time.Millisecond))
+	qcMin := computeQCMin(params)
 
-	// Ensure QC primes exceed every algebraic prime factor and extended special-q range.
-	qcMin := params.LpBoundAlg
-	if uint64(params.Ba) > qcMin {
-		qcMin = uint64(params.Ba)
+	var poly *Poly
+	var savedPairs [][2]int64
+	var savedFree []bool
+	if SaveDir != "" {
+		path := relationsPath(n)
+		if f, err := os.Open(path); err == nil {
+			nSaved, pSaved, pairs, isFree, rerr := readPolyAndPairs(f)
+			_ = f.Close()
+			if rerr == nil && nSaved.Cmp(n) == 0 {
+				poly = pSaved
+				savedPairs = pairs
+				savedFree = isFree
+				logf("gnfs: resuming %d bits (%d digits) with %d saved pairs from %s",
+					n.BitLen(), len(n.String()), len(pairs), path)
+			} else if rerr != nil {
+				logf("gnfs: ignoring %s: %v", path, rerr)
+			}
+		}
 	}
-	if params.UseLattice && params.QMax*8 > qcMin {
-		qcMin = params.QMax * 8
+
+	if poly == nil {
+		polyStart := time.Now()
+		var fac *big.Int
+		poly, fac = SelectPoly(n, params.Degree)
+		if fac != nil {
+			logf("gnfs: found factor %v during polynomial selection", fac)
+			return fac, new(big.Int).Div(n, fac)
+		}
+		if poly == nil {
+			logf("gnfs: polynomial selection failed")
+			return nil, nil
+		}
+		var g big.Int
+		g.GCD(nil, nil, poly.A1, n)
+		if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
+			return &g, new(big.Int).Div(n, &g)
+		}
+		logf("gnfs: %d bits (%d digits), deg=%d, c_d=%v, skew=%.1f, alpha=%.2f in %v",
+			n.BitLen(), len(n.String()), poly.Degree, poly.Coeffs[poly.Degree],
+			poly.Skew, poly.Alpha, time.Since(polyStart).Round(time.Millisecond))
 	}
+
 	fb := BuildFactorBases(poly, params.Br, params.Ba, qcMin, params.NumQCs)
 	target := newRelTarget(params, extraRelations)
 	logf("gnfs: RFB=%d (Br=%d), AFB=%d (Ba=%d, bad=%d), QCB=%d (>%d), cols=%d, want excess=%d",
 		len(fb.RFB), params.Br, len(fb.AFB), params.Ba, fb.BadCount, len(fb.QCB), qcMin, fb.NumFixed, extraRelations)
-	logf("gnfs: expecting about %d relations", target.initial)
 
-	seen := make(map[[2]int64]struct{})
+	seen := make(map[[2]int64]struct{}, len(savedPairs))
 	var rels []Relation
 	var fullCount int
-	excess := 0
-	nextCheck := fb.NumFixed / 2
-	if nextCheck < 500 {
-		nextCheck = 500
-	}
-	sieveStart := time.Now()
-	lastLog := sieveStart
-	var rate progress.Rate
+	excess := -fb.NumFixed
 
-	onRel := func(rel Relation) {
-		key := [2]int64{rel.A, rel.B}
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		rels = append(rels, rel)
-		if rel.RatLPs[0] == 0 && len(rel.AlgLPs) == 0 {
-			fullCount++
-		}
-		if len(rels) >= nextCheck {
-			ex, _, _ := pruneSingletons(rels, fb)
-			excess = ex
-			// Once cycles form, excess climbs by thousands per few percent
-			// more relations, so check often to stop near the goal.
-			if excess > -fb.NumFixed {
-				nextCheck = len(rels) + len(rels)/100 + 500
-			} else {
-				nextCheck = len(rels) + len(rels)/15 + 500
+	if len(savedPairs) > 0 {
+		loadStart := time.Now()
+		for _, rel := range refactorPairs(poly, fb, params, qcMin, savedPairs, savedFree) {
+			key := [2]int64{rel.A, rel.B}
+			if _, ok := seen[key]; ok {
+				continue
 			}
-			want := target.update(len(rels), excess)
-			now := time.Now()
-			if now.Sub(lastLog) >= 5*time.Second {
-				rate.Sample(now, len(rels))
-				lastLog = now
-				wantStr, left := "?", "time left unknown"
-				if want > 0 {
-					wantStr, left = strconv.Itoa(want), rate.Left(len(rels), want)
-				}
-				logf("gnfs: %d/%s relations (excess %d/%d, %d full), %v, %s",
-					len(rels), wantStr, excess, extraRelations, fullCount,
-					now.Sub(sieveStart).Round(time.Millisecond), left)
+			seen[key] = struct{}{}
+			rels = append(rels, rel)
+			if rel.RatLPs[0] == 0 && len(rel.AlgLPs) == 0 {
+				fullCount++
 			}
 		}
+		ex, _, _ := pruneSingletons(rels, fb)
+		excess = ex
+		logf("gnfs: refactored %d/%d saved relations (excess %d/%d) in %v",
+			len(rels), len(savedPairs), excess, extraRelations, time.Since(loadStart).Round(time.Millisecond))
 	}
+	loadedCount := len(rels)
+
 	shouldStop := func() bool {
 		return excess >= extraRelations
 	}
 
-	if !params.UseLattice {
-		curParams := *params
-		var prevA, prevB int64
-		for round := 0; round < 5 && !shouldStop(); round++ {
-			sieveLine(poly, fb, &curParams, prevA, prevB, onRel, shouldStop)
-			ex, _, _ := pruneSingletons(rels, fb)
-			excess = ex
-			if !shouldStop() {
-				prevA, prevB = curParams.LineA, curParams.LineB
-				curParams.LineA *= 2
-				if curParams.LineB < 4000 {
-					curParams.LineB *= 2
+	if !shouldStop() {
+		logf("gnfs: expecting about %d relations", target.initial)
+
+		nextCheck := fb.NumFixed / 2
+		if nextCheck < 500 {
+			nextCheck = 500
+		}
+		if len(rels) >= nextCheck {
+			nextCheck = len(rels) + 500
+		}
+		sieveStart := time.Now()
+		lastLog := sieveStart
+		var rate progress.Rate
+		if len(rels) > 0 {
+			rate.Sample(sieveStart, len(rels))
+		}
+
+		onRel := func(rel Relation) {
+			key := [2]int64{rel.A, rel.B}
+			if _, ok := seen[key]; ok {
+				return
+			}
+			seen[key] = struct{}{}
+			rels = append(rels, rel)
+			if rel.RatLPs[0] == 0 && len(rel.AlgLPs) == 0 {
+				fullCount++
+			}
+			if len(rels) >= nextCheck {
+				ex, _, _ := pruneSingletons(rels, fb)
+				excess = ex
+				// Check roughly every 7% before the 2-core climbs, every 1%
+				// once climbing, and tightly once close to the goal.
+				switch {
+				case excess >= -2000:
+					step := (extraRelations - excess) * 2
+					if step < 100 {
+						step = 100
+					}
+					if step > 1000 {
+						step = 1000
+					}
+					nextCheck = len(rels) + step
+				case excess >= -fb.NumFixed/2:
+					nextCheck = len(rels) + len(rels)/100 + 200
+				default:
+					nextCheck = len(rels) + len(rels)/15 + 500
+				}
+				want := target.update(len(rels), excess)
+				now := time.Now()
+				if now.Sub(lastLog) >= 5*time.Second {
+					rate.Sample(now, len(rels))
+					lastLog = now
+					wantStr, left := "?", "time left unknown"
+					if want > 0 {
+						wantStr, left = strconv.Itoa(want), rate.Left(len(rels), want)
+					}
+					logf("gnfs: %d/%s relations (excess %d/%d, %d full), %v, %s",
+						len(rels), wantStr, excess, extraRelations, fullCount,
+						now.Sub(sieveStart).Round(time.Millisecond), left)
 				}
 			}
 		}
-	} else {
-		curParams := *params
-		for round := 0; round < 4 && !shouldStop() && curParams.QMax < qcMin; round++ {
-			sieveLattice(poly, fb, &curParams, onRel, shouldStop)
-			ex, _, _ := pruneSingletons(rels, fb)
-			excess = ex
-			if !shouldStop() {
-				curParams.QMin = curParams.QMax + 1
-				curParams.QMax *= 2
+
+		savedSoFar := loadedCount
+		if !params.UseLattice {
+			curParams := *params
+			var prevA, prevB int64
+			for round := 0; round < 8 && !shouldStop(); round++ {
+				sieveLine(poly, fb, &curParams, prevA, prevB, onRel, shouldStop)
+				ex, _, _ := pruneSingletons(rels, fb)
+				excess = ex
+				if !shouldStop() {
+					prevA, prevB = curParams.LineA, curParams.LineB
+					curParams.LineA *= 2
+					if curParams.LineB < 8000 {
+						curParams.LineB *= 2
+					}
+				}
+			}
+		} else {
+			curParams := *params
+			span := curParams.QMax - curParams.QMin
+			if span < 50000 {
+				span = 50000
+			}
+			for !shouldStop() && curParams.QMin < qcMin {
 				if curParams.QMax >= qcMin {
 					curParams.QMax = qcMin - 1
 				}
+				sieveLattice(poly, fb, &curParams, onRel, shouldStop)
+				ex, _, _ := pruneSingletons(rels, fb)
+				excess = ex
+				if SaveDir != "" && !shouldStop() && len(rels) > savedSoFar {
+					saveRelations(n, poly, rels)
+					savedSoFar = len(rels)
+				}
+				if !shouldStop() {
+					curParams.QMin = curParams.QMax + 1
+					if span < 2000000 {
+						span *= 2
+						if span > 2000000 {
+							span = 2000000
+						}
+					}
+					curParams.QMax = curParams.QMin + span
+				}
 			}
 		}
-	}
 
-	ex, _, _ := pruneSingletons(rels, fb)
-	excess = ex
-	logf("gnfs: sieved %d unique relations (%d full, excess %d) in %v",
-		len(rels), fullCount, excess, time.Since(sieveStart).Round(time.Millisecond))
+		ex, _, _ := pruneSingletons(rels, fb)
+		excess = ex
+		logf("gnfs: sieved %d unique relations (%d full, excess %d) in %v",
+			len(rels), fullCount, excess, time.Since(sieveStart).Round(time.Millisecond))
+	}
 
 	if excess <= 0 {
 		logf("gnfs: not enough relations (excess=%d), giving up", excess)
 		return nil, nil
 	}
 
-	if SaveDir != "" {
+	if SaveDir != "" && len(rels) > loadedCount {
 		saveRelations(n, poly, rels)
 	}
 
+	return solveRelations(n, poly, fb, rels)
+}
+
+func solveRelations(n *big.Int, poly *Poly, fb *FactorBases, rels []Relation) (*big.Int, *big.Int) {
 	surviving, rows, numCols := buildMatrix(poly, fb, rels)
 	logf("gnfs: filtered matrix %d×%d", len(rows), numCols)
 	if len(rows) <= numCols {

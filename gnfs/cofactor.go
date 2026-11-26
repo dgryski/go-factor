@@ -490,6 +490,273 @@ func makeLargeIdeal(poly *Poly, a, b int64, lp uint64) (LargeIdeal, bool) {
 	return LargeIdeal{P: lp, R: r}, true
 }
 
+// cofactorPair reconstructs a Relation from a saved (a, b) pair without sieve
+// hits, accepting algebraic cofactors that include a special-q below qcMin.
+func cofactorPair(
+	poly *Poly,
+	fb *FactorBases,
+	p *Params,
+	qcMin uint64,
+	a, b int64,
+	isFree bool,
+	sc *cofactorScratch,
+) (Relation, bool) {
+	if isFree {
+		if a <= 1 || b != 0 || !arith.IsPrime64(uint64(a)) {
+			return Relation{}, false
+		}
+		up := uint64(a)
+		var ratCols []int32
+		var ratLPs [2]uint64
+		if idx, ok := fb.RatLookup[uint32(up)]; ok && up <= uint64(p.Br) {
+			ratCols = []int32{idx}
+		} else if up <= p.LpBoundRat {
+			ratLPs = [2]uint64{up, 0}
+		} else {
+			return Relation{}, false
+		}
+		fp := poly.CoeffsModP(up)
+		if len(fp)-1 != poly.Degree {
+			return Relation{}, false
+		}
+		roots := arith.PolyRootsModP(fp, up)
+		if len(roots) != poly.Degree {
+			return Relation{}, false
+		}
+		var algCols []int32
+		var algLPs []LargeIdeal
+		for _, rt := range roots {
+			if isMultipleRoot(poly, rt, up) {
+				return Relation{}, false
+			}
+			if up <= uint64(p.Ba) {
+				idx, ok := fb.AlgLookup[algKey(uint32(up), uint32(rt))]
+				if !ok {
+					return Relation{}, false
+				}
+				algCols = append(algCols, idx)
+			} else if up < qcMin {
+				algLPs = append(algLPs, LargeIdeal{P: up, R: rt})
+			} else {
+				return Relation{}, false
+			}
+		}
+		return Relation{
+			A:       a,
+			B:       0,
+			RatCols: ratCols,
+			AlgCols: algCols,
+			RatLPs:  ratLPs,
+			AlgLPs:  algLPs,
+			IsFree:  true,
+		}, true
+	}
+
+	if b <= 0 {
+		return Relation{}, false
+	}
+	ua := uint64(a)
+	if a < 0 {
+		ua = uint64(-a)
+	}
+	if arith.Gcd64(ua, uint64(b)) != 1 {
+		return Relation{}, false
+	}
+
+	gVal := evalGInto(&sc.val, poly, a, b, sc)
+	if gVal.Sign() == 0 {
+		return Relation{}, false
+	}
+	temp := sc.temp.Abs(gVal)
+	var ns normState
+	initNorm(&ns, temp)
+	ratCols := sc.ratCols[:0]
+
+	for idx, id := range fb.RFB {
+		pr := uint64(id.P)
+		hit := false
+		if id.R == id.P {
+			hit = uint64(b)%pr == 0
+		} else {
+			hit = modInt64(a, pr) == (uint64(b)%pr)*uint64(id.R)%pr
+		}
+		if hit {
+			for m := ns.divAll(pr, temp, sc); m > 0; m-- {
+				ratCols = append(ratCols, int32(idx))
+			}
+		}
+	}
+	remRat, fits := ns.uint64Val()
+	if !fits {
+		return Relation{}, false
+	}
+	var ratLPs [2]uint64
+	if remRat != 1 {
+		var ok bool
+		ratLPs, ok = splitCofactor(remRat, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
+		if !ok {
+			return Relation{}, false
+		}
+	}
+
+	fVal := evalFInto(&sc.val, poly, a, b, sc)
+	if fVal.Sign() == 0 {
+		return Relation{}, false
+	}
+	temp.Abs(fVal)
+	initNorm(&ns, temp)
+	algCols := sc.algCols[:0]
+
+	for idx, id := range fb.AFB {
+		pr := uint64(id.P)
+		hit := false
+		if id.R == id.P {
+			hit = uint64(b)%pr == 0
+		} else {
+			hit = modInt64(a, pr) == (uint64(b)%pr)*uint64(id.R)%pr
+		}
+		if hit {
+			for m := ns.divAll(pr, temp, sc); m > 0; m-- {
+				algCols = append(algCols, int32(idx))
+			}
+		}
+	}
+
+	lps, ok := factorSavedAlgCofactor(&ns, temp, uint64(p.Ba), p.LpBoundAlg, qcMin, p.MaxLPAlg)
+	if !ok {
+		return Relation{}, false
+	}
+	var algLPs []LargeIdeal
+	for _, lp := range lps {
+		ideal, ok := makeLargeIdeal(poly, a, b, lp)
+		if !ok {
+			return Relation{}, false
+		}
+		algLPs = append(algLPs, ideal)
+	}
+
+	return Relation{
+		A:       a,
+		B:       b,
+		RatCols: append([]int32(nil), ratCols...),
+		AlgCols: append([]int32(nil), algCols...),
+		RatLPs:  ratLPs,
+		AlgLPs:  algLPs,
+	}, true
+}
+
+// factorSavedAlgCofactor factors the algebraic cofactor of a saved relation,
+// allowing up to maxLP primes <= lpBound plus one optional special-q < qcMin.
+func factorSavedAlgCofactor(ns *normState, temp *big.Int, ba, lpBound, qcMin uint64, maxLP int) ([]uint64, bool) {
+	if u, ok := ns.uint64Val(); ok {
+		if u == 1 {
+			return nil, true
+		}
+		if lps, ok := splitCofactor(u, ba, lpBound, maxLP, 0); ok {
+			if lps[1] != 0 {
+				return []uint64{lps[0], lps[1]}, true
+			}
+			return []uint64{lps[0]}, true
+		}
+		var facs []uint64
+		if !factorUint64Into(u, &facs) {
+			return nil, false
+		}
+		return checkSavedAlgPrimes(facs, lpBound, qcMin, maxLP)
+	}
+
+	// Cofactor > 64 bits (only possible when special-q * lp1 * lp2 >= 2^64).
+	var cur big.Int
+	if ns.use128 {
+		cur.SetUint64(ns.hi)
+		cur.Lsh(&cur, 64)
+		cur.Or(&cur, new(big.Int).SetUint64(ns.lo))
+	} else {
+		cur.Set(temp)
+	}
+	if cur.BitLen() > 96 {
+		return nil, false
+	}
+	var facs []uint64
+	for !cur.IsUint64() {
+		d := rhoBig(&cur)
+		if d == nil || !d.IsUint64() {
+			return nil, false
+		}
+		du := d.Uint64()
+		if !factorUint64Into(du, &facs) {
+			return nil, false
+		}
+		cur.Quo(&cur, d)
+	}
+	if cur.Uint64() > 1 {
+		if !factorUint64Into(cur.Uint64(), &facs) {
+			return nil, false
+		}
+	}
+	return checkSavedAlgPrimes(facs, lpBound, qcMin, maxLP)
+}
+
+func factorUint64Into(n uint64, dst *[]uint64) bool {
+	if n == 1 {
+		return true
+	}
+	if arith.IsPrime64(n) {
+		*dst = append(*dst, n)
+		return true
+	}
+	d := arith.Rho64(n)
+	if d == 0 {
+		return false
+	}
+	return factorUint64Into(d, dst) && factorUint64Into(n/d, dst)
+}
+
+func checkSavedAlgPrimes(facs []uint64, lpBound, qcMin uint64, maxLP int) ([]uint64, bool) {
+	if len(facs) > maxLP+1 {
+		return nil, false
+	}
+	aboveLP := 0
+	for _, f := range facs {
+		if f >= qcMin {
+			return nil, false
+		}
+		if f > lpBound {
+			aboveLP++
+		}
+	}
+	if aboveLP > 1 {
+		return nil, false
+	}
+	return facs, true
+}
+
+func rhoBig(n *big.Int) *big.Int {
+	if n.ProbablyPrime(20) {
+		return new(big.Int).Set(n)
+	}
+	var x, y, c, diff, g big.Int
+	for ci := int64(1); ci <= 8; ci++ {
+		c.SetInt64(ci)
+		x.SetInt64(2)
+		y.SetInt64(2)
+		g.SetInt64(1)
+		steps := 0
+		for g.Cmp(bigOne) == 0 && steps < 1<<16 {
+			x.Mul(&x, &x).Add(&x, &c).Mod(&x, n)
+			y.Mul(&y, &y).Add(&y, &c).Mod(&y, n)
+			y.Mul(&y, &y).Add(&y, &c).Mod(&y, n)
+			diff.Sub(&x, &y).Abs(&diff)
+			g.GCD(nil, nil, &diff, n)
+			steps++
+		}
+		if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
+			return new(big.Int).Set(&g)
+		}
+	}
+	return nil
+}
+
 var bigOne = big.NewInt(1)
 
 // isMultipleRoot reports whether r is a multiple root of f mod p.

@@ -7,24 +7,35 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
-// SaveDir, if set, is a directory where GNFS writes the polynomial and
-// relations for each number it factors, as <n>.gnfs.rel.
+// SaveDir, if set, stores relation files as <n>.gnfs.rel and resumes from them.
 var SaveDir string
 
+func relationsPath(n *big.Int) string {
+	return filepath.Join(SaveDir, n.String()+".gnfs.rel")
+}
+
 func saveRelations(n *big.Int, poly *Poly, rels []Relation) {
-	path := filepath.Join(SaveDir, n.String()+".gnfs.rel")
-	f, err := os.Create(path)
+	path := relationsPath(n)
+	tmpPath := path + ".tmp"
+	f, err := os.Create(tmpPath)
 	if err == nil {
 		err = writeRelations(f, n, poly, rels)
 		if cerr := f.Close(); err == nil {
 			err = cerr
 		}
+		if err == nil {
+			err = os.Rename(tmpPath, path)
+		}
 	}
 	if err != nil {
+		_ = os.Remove(tmpPath)
 		logf("gnfs: saving relations: %v", err)
 		return
 	}
@@ -58,11 +69,11 @@ func readPolyAndPairs(r io.Reader) (n *big.Int, poly *Poly, pairs [][2]int64, is
 	sc.Buffer(nil, 64<<20)
 	line := 0
 	for sc.Scan() {
-		line++
 		text := strings.TrimSpace(sc.Text())
 		if text == "" {
 			continue
 		}
+		line++
 		fields := strings.Fields(text)
 		switch line {
 		case 1:
@@ -100,6 +111,9 @@ func readPolyAndPairs(r io.Reader) (n *big.Int, poly *Poly, pairs [][2]int64, is
 				poly.Coeffs[i] = c
 			}
 		default:
+			if len(fields) < 2 {
+				return nil, nil, nil, nil, fmt.Errorf("line %d: invalid pair", line)
+			}
 			a, err := strconv.ParseInt(fields[0], 10, 64)
 			if err != nil {
 				return nil, nil, nil, nil, err
@@ -119,4 +133,54 @@ func readPolyAndPairs(r io.Reader) (n *big.Int, poly *Poly, pairs [][2]int64, is
 		return nil, nil, nil, nil, fmt.Errorf("incomplete relation file")
 	}
 	return n, poly, pairs, isFree, nil
+}
+
+// refactorPairs reconstructs Relation entries in parallel from saved (a, b) pairs.
+func refactorPairs(poly *Poly, fb *FactorBases, params *Params, qcMin uint64, pairs [][2]int64, isFree []bool) []Relation {
+	if len(pairs) == 0 {
+		return nil
+	}
+	nw := Workers
+	if nw <= 0 {
+		nw = runtime.GOMAXPROCS(0)
+	}
+	if nw > len(pairs) {
+		nw = len(pairs)
+	}
+	if nw < 1 {
+		nw = 1
+	}
+
+	parsed := make([]Relation, len(pairs))
+	valid := make([]bool, len(pairs))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < nw; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sc := newCofactorScratch(poly.Degree)
+			for {
+				idx := int(next.Add(1) - 1)
+				if idx >= len(pairs) {
+					return
+				}
+				ab := pairs[idx]
+				rel, ok := cofactorPair(poly, fb, params, qcMin, ab[0], ab[1], isFree[idx], sc)
+				if ok {
+					parsed[idx] = rel
+					valid[idx] = true
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	out := make([]Relation, 0, len(pairs))
+	for i, ok := range valid {
+		if ok {
+			out = append(out, parsed[i])
+		}
+	}
+	return out
 }

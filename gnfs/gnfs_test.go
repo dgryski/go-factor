@@ -2,13 +2,101 @@ package gnfs
 
 import (
 	"bytes"
+	"flag"
 	"math/big"
 	"math/rand"
+	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/dgryski/go-factor/internal/linalg"
 	"github.com/dgryski/go-factor/internal/testutil"
 )
+
+var relationsFile = flag.String("relations", "", "relations file saved by factor -gnfs-save, for TestSavedRelations")
+
+func TestSavedRelations(t *testing.T) {
+	if *relationsFile == "" {
+		t.Skip("no -relations file")
+	}
+	f, err := os.Open(*relationsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	start := time.Now()
+	n, poly, pairs, isFree, err := readPolyAndPairs(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := defaultParams(n)
+	qcMin := computeQCMin(params)
+	fb := BuildFactorBases(poly, params.Br, params.Ba, qcMin, params.NumQCs)
+	rels := refactorPairs(poly, fb, params, qcMin, pairs, isFree)
+	t.Logf("read %d/%d relations for %d-bit n in %v", len(rels), len(pairs), n.BitLen(), time.Since(start))
+
+	Logf = t.Logf
+	defer func() { Logf = nil }()
+	f1, f2 := solveRelations(n, poly, fb, rels)
+	if f1 == nil || new(big.Int).Mul(f1, f2).Cmp(n) != 0 {
+		t.Fatalf("solveRelations(%v) = %v, %v", n, f1, f2)
+	}
+	t.Logf("factors: %v * %v", f1, f2)
+}
+
+func TestSaveAndResume(t *testing.T) {
+	dir := t.TempDir()
+	defer func(prev string) { SaveDir = prev }(SaveDir)
+	SaveDir = dir
+
+	rnd := rand.New(rand.NewSource(21))
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 68), testutil.RandomPrime(rnd, 68))
+
+	f1, f2 := split(n)
+	if f1 == nil || new(big.Int).Mul(f1, f2).Cmp(n) != 0 {
+		t.Fatalf("initial split(%v) failed: %v, %v", n, f1, f2)
+	}
+	path := relationsPath(n)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("missing saved relations %s: %v", path, err)
+	}
+
+	var logs []string
+	Logf = func(format string, args ...interface{}) {
+		logs = append(logs, format)
+	}
+	r1, r2 := split(n)
+	Logf = nil
+	if r1 == nil || new(big.Int).Mul(r1, r2).Cmp(n) != 0 {
+		t.Fatalf("full resume split(%v) failed: %v, %v", n, r1, r2)
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "resuming") || strings.Contains(joined, "sieved") {
+		t.Fatalf("expected full resume to skip sieving, logs:\n%s", joined)
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	keep := 3 + (len(lines)-3)/2
+	if err := os.WriteFile(path, []byte(strings.Join(lines[:keep], "\n")+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	logs = nil
+	Logf = func(format string, args ...interface{}) {
+		logs = append(logs, format)
+	}
+	p1, p2 := split(n)
+	Logf = nil
+	if p1 == nil || new(big.Int).Mul(p1, p2).Cmp(n) != 0 {
+		t.Fatalf("partial resume split(%v) failed: %v, %v", n, p1, p2)
+	}
+	joined = strings.Join(logs, "\n")
+	if !strings.Contains(joined, "resuming") || !strings.Contains(joined, "sieved") {
+		t.Fatalf("expected partial resume to continue sieving, logs:\n%s", joined)
+	}
+}
 
 func TestFactorLineSieve30To42Digits(t *testing.T) {
 	Logf = t.Logf
