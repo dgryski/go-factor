@@ -27,23 +27,23 @@ type Relation struct {
 
 // Params holds the tuning parameters for a GNFS factorization.
 type Params struct {
-	Degree     int
-	Br, Ba     int64  // rational and algebraic factor base bounds
-	LpBoundRat uint64 // rational large prime bound
-	LpBoundAlg uint64 // algebraic large prime bound
-	MfbRat     int    // max cofactor bits on rational side
-	MfbAlg     int    // max cofactor bits on algebraic side
-	MaxLPRat   int    // 1 or 2 large primes on rational side
-	MaxLPAlg   int    // 1 or 2 large primes on algebraic side
-	QMin, QMax uint64 // special-q range (if lattice sieve is used)
-	IHalf      int    // lattice sieve i in [-IHalf, IHalf)
-	JMax       int    // lattice sieve j in [1, JMax)
-	UseLattice bool   // false = line sieve, true = special-q lattice sieve
-	LineA      int64  // line sieve half-width a in [-LineA, LineA)
-	LineB      int64  // line sieve b in [1, LineB]
-	SlackRat   float64
-	SlackAlg   float64
-	NumQCs     int
+	Degree         int
+	Br, Ba         int64  // rational and algebraic factor base bounds
+	LpBoundRat     uint64 // rational large prime bound
+	LpBoundAlg     uint64 // algebraic large prime bound
+	MfbRat         int    // max cofactor bits on rational side
+	MfbAlg         int    // max cofactor bits on algebraic side
+	MaxLPRat       int    // 1 or 2 large primes on rational side
+	MaxLPAlg       int    // 1 or 2 large primes on algebraic side
+	QMin, QMax     uint64 // special-q range (if lattice sieve is used)
+	IHalf          int    // lattice sieve i in [-IHalf, IHalf)
+	JMax           int    // lattice sieve j in [1, JMax)
+	UseLattice     bool   // false = line sieve, true = special-q lattice sieve
+	LineA          int64  // line sieve half-width a in [-LineA, LineA)
+	LineB          int64  // line sieve b in [1, LineB]
+	SlackRat       float64
+	SlackAlg       float64
+	NumQCs         int
 }
 
 // splitCofactor splits c (already divided by all primes <= pMax) into 1 or 2
@@ -68,9 +68,284 @@ func splitCofactor(c, pMax, lpBound uint64, maxLP int, mfb int) ([2]uint64, bool
 	return [2]uint64{lp1, lp2}, true
 }
 
+// divRem128 divides (hi, lo) by d (d > 0) and returns quotient (qHi, qLo) and remainder r.
+func divRem128(hi, lo, d uint64) (qHi, qLo, r uint64) {
+	if hi == 0 {
+		return 0, lo / d, lo % d
+	}
+	if hi < d {
+		qLo, r = bits.Div64(hi, lo, d)
+		return 0, qLo, r
+	}
+	qHi = hi / d
+	qLo, r = bits.Div64(hi%d, lo, d)
+	return qHi, qLo, r
+}
+
+func bigToU128(v *big.Int) (hi, lo uint64, ok bool) {
+	if bits.UintSize == 64 {
+		words := v.Bits()
+		switch len(words) {
+		case 0:
+			return 0, 0, true
+		case 1:
+			return 0, uint64(words[0]), true
+		case 2:
+			return uint64(words[1]), uint64(words[0]), true
+		default:
+			return 0, 0, false
+		}
+	}
+	if v.BitLen() > 128 {
+		return 0, 0, false
+	}
+	lo = v.Uint64()
+	var top big.Int
+	top.Rsh(v, 64)
+	return top.Uint64(), lo, true
+}
+
+// normState holds a positive integer being trial-divided, switching from big.Int
+// to 128-bit and 64-bit arithmetic as soon as it fits.
+type normState struct {
+	hi, lo uint64
+	use128 bool
+}
+
+func initNorm(n *normState, v *big.Int) {
+	if hi, lo, ok := bigToU128(v); ok {
+		n.hi, n.lo, n.use128 = hi, lo, true
+	} else {
+		n.use128 = false
+	}
+}
+
+func (n *normState) divAll(p uint64, temp *big.Int, sc *cofactorScratch) int {
+	mult := 0
+	if !n.use128 {
+		sc.bigP.SetUint64(p)
+		for {
+			sc.q.QuoRem(temp, &sc.bigP, &sc.rem)
+			if sc.rem.Sign() != 0 {
+				break
+			}
+			mult++
+			temp.Set(&sc.q)
+			if hi, lo, ok := bigToU128(temp); ok {
+				n.hi, n.lo, n.use128 = hi, lo, true
+				break
+			}
+		}
+		if !n.use128 {
+			return mult
+		}
+	}
+	for n.hi != 0 {
+		qh, ql, r := divRem128(n.hi, n.lo, p)
+		if r != 0 {
+			return mult
+		}
+		n.hi, n.lo = qh, ql
+		mult++
+	}
+	for n.lo >= p && n.lo%p == 0 {
+		n.lo /= p
+		mult++
+	}
+	return mult
+}
+
+func (n *normState) uint64Val() (uint64, bool) {
+	if !n.use128 || n.hi != 0 {
+		return 0, false
+	}
+	return n.lo, true
+}
+
+// cofactorRatLattice factors G(a, b) for a lattice-sieve candidate at (i, j)
+// with normalized coprime (a, b), b > 0.
+func cofactorRatLattice(
+	poly *Poly,
+	fb *FactorBases,
+	p *Params,
+	i, j int,
+	a, b int64,
+	ratSmall []int32,
+	ratLines []linePrime,
+	ratVerts []vertPrime,
+	ratAll []int32,
+	ratHits []int32,
+	sc *cofactorScratch,
+) (ratCols []int32, ratLPs [2]uint64, ok bool) {
+	gVal := evalGInto(&sc.val, poly, a, b, sc)
+	if gVal.Sign() == 0 {
+		return nil, [2]uint64{}, false
+	}
+	temp := sc.temp.Abs(gVal)
+	var ns normState
+	initNorm(&ns, temp)
+	cols := sc.ratCols[:0]
+
+	addMult := func(idx int32, pr uint64) {
+		for m := ns.divAll(pr, temp, sc); m > 0; m-- {
+			cols = append(cols, idx)
+		}
+	}
+
+	for _, idx := range ratAll {
+		addMult(idx, uint64(fb.RFB[idx].P))
+	}
+	for _, idx := range ratSmall {
+		id := fb.RFB[idx]
+		pr := uint64(id.P)
+		if id.R == id.P {
+			if uint64(b)%pr == 0 {
+				addMult(idx, pr)
+			}
+		} else if modInt64(a, pr) == (uint64(b)%pr)*uint64(id.R)%pr {
+			addMult(idx, pr)
+		}
+	}
+	i64, j64 := int64(i), int64(j)
+	for _, vp := range ratVerts {
+		if j%int(vp.p) == 0 {
+			addMult(vp.idx, uint64(vp.p))
+		}
+	}
+	for k := range ratLines {
+		lp := &ratLines[k]
+		if (i64-j64*int64(lp.lambda))%int64(lp.p) == 0 {
+			addMult(lp.idx, uint64(lp.p))
+		}
+	}
+	for _, idx := range ratHits {
+		addMult(idx, uint64(fb.RFB[idx].P))
+	}
+
+	rem64, fits := ns.uint64Val()
+	if !fits {
+		return nil, [2]uint64{}, false
+	}
+	if rem64 != 1 {
+		ratLPs, ok = splitCofactor(rem64, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
+		if !ok {
+			return nil, [2]uint64{}, false
+		}
+	}
+	return append([]int32(nil), cols...), ratLPs, true
+}
+
+// cofactorAlgLattice factors F(a, b) for a lattice-sieve candidate that already
+// passed rational cofactorization.
+func cofactorAlgLattice(
+	poly *Poly,
+	fb *FactorBases,
+	p *Params,
+	i, j int,
+	a, b int64,
+	ratCols []int32,
+	ratLPs [2]uint64,
+	algSmall []int32,
+	algLines []linePrime,
+	algVerts []vertPrime,
+	algAll []int32,
+	algHits []int32,
+	sq *LatticeQ,
+	sc *cofactorScratch,
+) (Relation, bool) {
+	fVal := evalFInto(&sc.val, poly, a, b, sc)
+	if fVal.Sign() == 0 {
+		return Relation{}, false
+	}
+	temp := sc.temp.Abs(fVal)
+	var ns normState
+	initNorm(&ns, temp)
+	algCols := sc.algCols[:0]
+	var algLPs []LargeIdeal
+
+	addMult := func(idx int32, pr uint64) {
+		for m := ns.divAll(pr, temp, sc); m > 0; m-- {
+			algCols = append(algCols, idx)
+		}
+	}
+
+	if sq != nil && sq.Q != 0 {
+		m := ns.divAll(uint64(sq.Q), temp, sc)
+		if sq.AFBIdx >= 0 {
+			for ; m > 0; m-- {
+				algCols = append(algCols, sq.AFBIdx)
+			}
+		} else {
+			sqIdeal := LargeIdeal{P: uint64(sq.Q), R: uint64(sq.R)}
+			for ; m > 0; m-- {
+				algLPs = append(algLPs, sqIdeal)
+			}
+		}
+	}
+
+	for _, idx := range algAll {
+		addMult(idx, uint64(fb.AFB[idx].P))
+	}
+	for _, idx := range algSmall {
+		id := fb.AFB[idx]
+		pr := uint64(id.P)
+		if id.R == id.P {
+			if uint64(b)%pr == 0 {
+				addMult(idx, pr)
+			}
+		} else if modInt64(a, pr) == (uint64(b)%pr)*uint64(id.R)%pr {
+			addMult(idx, pr)
+		}
+	}
+	i64, j64 := int64(i), int64(j)
+	for _, vp := range algVerts {
+		if j%int(vp.p) == 0 {
+			addMult(vp.idx, uint64(vp.p))
+		}
+	}
+	for k := range algLines {
+		lp := &algLines[k]
+		if (i64-j64*int64(lp.lambda))%int64(lp.p) == 0 {
+			addMult(lp.idx, uint64(lp.p))
+		}
+	}
+	for _, idx := range algHits {
+		addMult(idx, uint64(fb.AFB[idx].P))
+	}
+
+	rem64, fits := ns.uint64Val()
+	if !fits {
+		return Relation{}, false
+	}
+	if rem64 != 1 {
+		lps, ok := splitCofactor(rem64, uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
+		if !ok {
+			return Relation{}, false
+		}
+		for _, lp := range lps {
+			if lp == 0 {
+				continue
+			}
+			ideal, ok := makeLargeIdeal(poly, a, b, lp)
+			if !ok {
+				return Relation{}, false
+			}
+			algLPs = append(algLPs, ideal)
+		}
+	}
+
+	return Relation{
+		A:       a,
+		B:       b,
+		RatCols: ratCols,
+		AlgCols: append([]int32(nil), algCols...),
+		RatLPs:  ratLPs,
+		AlgLPs:  algLPs,
+	}, true
+}
+
 // cofactorCandidate attempts to factor G(a, b) and F(a, b) for coprime (a, b) with b > 0.
-// ratHits are RFB indices >= smallRatCut hitting (a, b); algHits are AFB indices >= smallAlgCut.
-// specialQ (if sq.Q != 0) is known to divide F(a, b).
+// Used by the line sieve.
 func cofactorCandidate(
 	poly *Poly,
 	fb *FactorBases,
@@ -79,27 +354,20 @@ func cofactorCandidate(
 	ratSmall []int32, ratHits []int32,
 	algSmall []int32, algHits []int32,
 	sq *LatticeQ,
-	scratch *cofactorScratch,
+	sc *cofactorScratch,
 ) (Relation, bool) {
-	// Rational side first (much smaller numbers than F(a, b)).
-	gVal := evalGInto(&scratch.val, poly, a, b)
+	gVal := evalGInto(&sc.val, poly, a, b, sc)
 	if gVal.Sign() == 0 {
 		return Relation{}, false
 	}
-	temp := scratch.temp.Abs(gVal)
-	ratCols := scratch.ratCols[:0]
+	temp := sc.temp.Abs(gVal)
+	var ns normState
+	initNorm(&ns, temp)
+	ratCols := sc.ratCols[:0]
 
-	var bigP, q, rem big.Int
-	divRat := func(idx int32) {
-		pr := fb.RFB[idx].P
-		bigP.SetUint64(uint64(pr))
-		for {
-			q.QuoRem(temp, &bigP, &rem)
-			if rem.Sign() != 0 {
-				break
-			}
+	divRat := func(idx int32, pr uint64) {
+		for m := ns.divAll(pr, temp, sc); m > 0; m-- {
 			ratCols = append(ratCols, idx)
-			temp.Set(&q)
 		}
 	}
 
@@ -108,75 +376,54 @@ func cofactorCandidate(
 		pr := uint64(id.P)
 		if id.R == id.P {
 			if uint64(b)%pr == 0 {
-				divRat(idx)
+				divRat(idx, pr)
 			}
-		} else {
-			am := modInt64(a, pr)
-			bm := uint64(b) % pr
-			if am == bm*uint64(id.R)%pr {
-				divRat(idx)
-			}
+		} else if modInt64(a, pr) == (uint64(b)%pr)*uint64(id.R)%pr {
+			divRat(idx, pr)
 		}
 	}
 	for _, idx := range ratHits {
-		divRat(idx)
+		divRat(idx, uint64(fb.RFB[idx].P))
 	}
 
+	remRat, fits := ns.uint64Val()
+	if !fits {
+		return Relation{}, false
+	}
 	var ratLPs [2]uint64
-	if temp.Cmp(bigOne) != 0 {
-		if !temp.IsUint64() {
-			return Relation{}, false
-		}
+	if remRat != 1 {
 		var ok bool
-		ratLPs, ok = splitCofactor(temp.Uint64(), uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
+		ratLPs, ok = splitCofactor(remRat, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
 		if !ok {
 			return Relation{}, false
 		}
 	}
 
-	// Algebraic side.
-	fVal := evalFInto(&scratch.val, poly, a, b, scratch.aPows, scratch.bPows)
+	fVal := evalFInto(&sc.val, poly, a, b, sc)
 	if fVal.Sign() == 0 {
 		return Relation{}, false
 	}
 	temp.Abs(fVal)
-	algCols := scratch.algCols[:0]
+	initNorm(&ns, temp)
+	algCols := sc.algCols[:0]
 	var algLPs []LargeIdeal
 
-	divAlg := func(idx int32) {
-		pr := fb.AFB[idx].P
-		bigP.SetUint64(uint64(pr))
-		for {
-			q.QuoRem(temp, &bigP, &rem)
-			if rem.Sign() != 0 {
-				break
-			}
+	divAlg := func(idx int32, pr uint64) {
+		for m := ns.divAll(pr, temp, sc); m > 0; m-- {
 			algCols = append(algCols, idx)
-			temp.Set(&q)
 		}
 	}
 
-	// Divide out special-q if present.
 	if sq != nil && sq.Q != 0 {
-		bigP.SetUint64(uint64(sq.Q))
+		m := ns.divAll(uint64(sq.Q), temp, sc)
 		if sq.AFBIdx >= 0 {
-			for {
-				q.QuoRem(temp, &bigP, &rem)
-				if rem.Sign() != 0 {
-					break
-				}
+			for ; m > 0; m-- {
 				algCols = append(algCols, sq.AFBIdx)
-				temp.Set(&q)
 			}
 		} else {
 			sqIdeal := LargeIdeal{P: uint64(sq.Q), R: uint64(sq.R)}
-			for {
-				q.QuoRem(temp, &bigP, &rem)
-				if rem.Sign() != 0 {
-					break
-				}
+			for ; m > 0; m-- {
 				algLPs = append(algLPs, sqIdeal)
-				temp.Set(&q)
 			}
 		}
 	}
@@ -186,25 +433,22 @@ func cofactorCandidate(
 		pr := uint64(id.P)
 		if id.R == id.P {
 			if uint64(b)%pr == 0 {
-				divAlg(idx)
+				divAlg(idx, pr)
 			}
-		} else {
-			am := modInt64(a, pr)
-			bm := uint64(b) % pr
-			if am == bm*uint64(id.R)%pr {
-				divAlg(idx)
-			}
+		} else if modInt64(a, pr) == (uint64(b)%pr)*uint64(id.R)%pr {
+			divAlg(idx, pr)
 		}
 	}
 	for _, idx := range algHits {
-		divAlg(idx)
+		divAlg(idx, uint64(fb.AFB[idx].P))
 	}
 
-	if temp.Cmp(bigOne) != 0 {
-		if !temp.IsUint64() {
-			return Relation{}, false
-		}
-		lps, ok := splitCofactor(temp.Uint64(), uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
+	remAlg, fits := ns.uint64Val()
+	if !fits {
+		return Relation{}, false
+	}
+	if remAlg != 1 {
+		lps, ok := splitCofactor(remAlg, uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
 		if !ok {
 			return Relation{}, false
 		}
@@ -212,35 +456,38 @@ func cofactorCandidate(
 			if lp == 0 {
 				continue
 			}
-			bm := uint64(b) % lp
-			if bm == 0 {
-				// Projective large prime (lp | c_d); shouldn't happen when c_d is smooth <= Ba.
-				algLPs = append(algLPs, LargeIdeal{P: lp, R: lp})
-			} else {
-				invB, ok := arith.InvMod64(bm, lp)
-				if !ok {
-					return Relation{}, false
-				}
-				r := arith.MulMod64(modInt64(a, lp), invB, lp)
-				if isMultipleRoot(poly, r, lp) {
-					// v_lp(F) need not be the ideal's valuation, and no
-					// character covers it.
-					return Relation{}, false
-				}
-				algLPs = append(algLPs, LargeIdeal{P: lp, R: r})
+			ideal, ok := makeLargeIdeal(poly, a, b, lp)
+			if !ok {
+				return Relation{}, false
 			}
+			algLPs = append(algLPs, ideal)
 		}
 	}
 
-	rel := Relation{
+	return Relation{
 		A:       a,
 		B:       b,
 		RatCols: append([]int32(nil), ratCols...),
 		AlgCols: append([]int32(nil), algCols...),
 		RatLPs:  ratLPs,
 		AlgLPs:  algLPs,
+	}, true
+}
+
+func makeLargeIdeal(poly *Poly, a, b int64, lp uint64) (LargeIdeal, bool) {
+	bm := uint64(b) % lp
+	if bm == 0 {
+		return LargeIdeal{P: lp, R: lp}, true
 	}
-	return rel, true
+	invB, ok := arith.InvMod64(bm, lp)
+	if !ok {
+		return LargeIdeal{}, false
+	}
+	r := arith.MulMod64(modInt64(a, lp), invB, lp)
+	if isMultipleRoot(poly, r, lp) {
+		return LargeIdeal{}, false
+	}
+	return LargeIdeal{P: lp, R: r}, true
 }
 
 var bigOne = big.NewInt(1)
@@ -252,11 +499,15 @@ func isMultipleRoot(poly *Poly, r, p uint64) bool {
 }
 
 type cofactorScratch struct {
-	val, temp big.Int
-	aPows     []big.Int
-	bPows     []big.Int
-	ratCols   []int32
-	algCols   []int32
+	val, temp       big.Int
+	t1, t2          big.Int
+	bigA, bigB      big.Int
+	term            big.Int
+	bigP, q, rem    big.Int
+	aPows           []big.Int
+	bPows           []big.Int
+	ratCols         []int32
+	algCols         []int32
 }
 
 func newCofactorScratch(deg int) *cofactorScratch {
@@ -266,31 +517,29 @@ func newCofactorScratch(deg int) *cofactorScratch {
 	}
 }
 
-func evalGInto(dst *big.Int, poly *Poly, a, b int64) *big.Int {
-	var t1, t2 big.Int
-	t1.SetInt64(a)
-	t1.Mul(&t1, poly.A1)
-	t2.SetInt64(b)
-	t2.Mul(&t2, poly.A0)
-	return dst.Sub(&t1, &t2)
+func evalGInto(dst *big.Int, poly *Poly, a, b int64, sc *cofactorScratch) *big.Int {
+	sc.t1.SetInt64(a)
+	sc.t1.Mul(&sc.t1, poly.A1)
+	sc.t2.SetInt64(b)
+	sc.t2.Mul(&sc.t2, poly.A0)
+	return dst.Sub(&sc.t1, &sc.t2)
 }
 
-func evalFInto(dst *big.Int, poly *Poly, a, b int64, aPows, bPows []big.Int) *big.Int {
+func evalFInto(dst *big.Int, poly *Poly, a, b int64, sc *cofactorScratch) *big.Int {
 	d := poly.Degree
-	aPows[0].SetInt64(1)
-	bPows[0].SetInt64(1)
-	var bigA, bigB, term big.Int
-	bigA.SetInt64(a)
-	bigB.SetInt64(b)
+	sc.aPows[0].SetInt64(1)
+	sc.bPows[0].SetInt64(1)
+	sc.bigA.SetInt64(a)
+	sc.bigB.SetInt64(b)
 	for i := 1; i <= d; i++ {
-		aPows[i].Mul(&aPows[i-1], &bigA)
-		bPows[i].Mul(&bPows[i-1], &bigB)
+		sc.aPows[i].Mul(&sc.aPows[i-1], &sc.bigA)
+		sc.bPows[i].Mul(&sc.bPows[i-1], &sc.bigB)
 	}
 	dst.SetInt64(0)
 	for i := 0; i <= d; i++ {
-		term.Mul(poly.Coeffs[i], &aPows[i])
-		term.Mul(&term, &bPows[d-i])
-		dst.Add(dst, &term)
+		sc.term.Mul(poly.Coeffs[i], &sc.aPows[i])
+		sc.term.Mul(&sc.term, &sc.bPows[d-i])
+		dst.Add(dst, &sc.term)
 	}
 	return dst
 }

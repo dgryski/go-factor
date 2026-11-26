@@ -171,10 +171,10 @@ func buildMatrix(poly *Poly, fb *FactorBases, rels []Relation) (surviving []Rela
 		factors = factors[:0]
 		if !rel.IsFree {
 			factors = append(factors, ColAllOnes)
-			if evalGInto(&scratchVal.val, poly, rel.A, rel.B).Sign() < 0 {
+			if evalGInto(&scratchVal.val, poly, rel.A, rel.B, scratchVal).Sign() < 0 {
 				factors = append(factors, ColRatSign)
 			}
-			if evalFInto(&scratchVal.val, poly, rel.A, rel.B, scratchVal.aPows, scratchVal.bPows).Sign() < 0 {
+			if evalFInto(&scratchVal.val, poly, rel.A, rel.B, scratchVal).Sign() < 0 {
 				factors = append(factors, ColAlgSign)
 			}
 		}

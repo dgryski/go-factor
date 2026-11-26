@@ -43,9 +43,9 @@ func tryDependency(n *big.Int, poly *Poly, fb *FactorBases, rels []Relation, dep
 	ratExps := make([]int, len(fb.RFB))
 	ratLPExps := make(map[uint64]int)
 	negRat := 0
-	var gTmp big.Int
+	gSc := newCofactorScratch(poly.Degree)
 	for _, rel := range selected {
-		if !rel.IsFree && evalGInto(&gTmp, poly, rel.A, rel.B).Sign() < 0 {
+		if !rel.IsFree && evalGInto(&gSc.val, poly, rel.A, rel.B, gSc).Sign() < 0 {
 			negRat++
 		}
 		for _, idx := range rel.RatCols {

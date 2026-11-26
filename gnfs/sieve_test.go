@@ -10,49 +10,151 @@ import (
 )
 
 func TestFrankeKleinjungMatchesBruteForce(t *testing.T) {
-	const I, J = 32, 24
-	W := 2 * I
-	total := (J - 1) * W
-	numBlocks := (total + blockSize - 1) >> blockShift
+	for _, I := range []int{30, 31, 32} {
+		const J = 24
+		W := 2 * I
+		total := (J - 1) * W
+		numBlocks := (total + blockSize - 1) >> blockShift
 
-	primes := arith.PrimesUpTo(400)
-	for _, p64 := range primes {
-		p := uint32(p64)
-		if int(p) < W {
-			continue
-		}
-		for lam := uint32(0); lam < p; lam += 7 {
-			buckets := make([][]uint64, numBlocks)
-			addFKHits(p, lam, I, J, uint64(p)<<16, buckets)
-			got := make(map[[2]int]bool)
-			for bi, bkt := range buckets {
-				for _, e := range bkt {
-					gPos := bi*blockSize + int(uint16(e))
-					j := 1 + gPos/W
-					i := (gPos % W) - I
-					pos := [2]int{i, j}
-					if got[pos] {
-						t.Fatalf("duplicate hit (%d,%d) for p=%d lam=%d", i, j, p, lam)
+		primes := arith.PrimesUpTo(400)
+		for _, p64 := range primes {
+			p := uint32(p64)
+			if int(p) < W {
+				continue
+			}
+			for lam := uint32(0); lam < p; lam += 7 {
+				buckets := make([][]uint64, numBlocks)
+				addFKHits(p, lam, I, J, uint64(p)<<16, buckets)
+				got := make(map[[2]int]bool)
+				for bi, bkt := range buckets {
+					for _, e := range bkt {
+						gPos := bi*blockSize + int(uint16(e))
+						j := 1 + gPos/W
+						i := (gPos % W) - I
+						if (i|j)&1 == 0 {
+							t.Fatalf("emitted both-even (%d,%d) for I=%d p=%d lam=%d", i, j, I, p, lam)
+						}
+						pos := [2]int{i, j}
+						if got[pos] {
+							t.Fatalf("duplicate hit (%d,%d) for I=%d p=%d lam=%d", i, j, I, p, lam)
+						}
+						got[pos] = true
 					}
-					got[pos] = true
+				}
+
+				want := make(map[[2]int]bool)
+				for j := 1; j < J; j++ {
+					for i := -I; i < I; i++ {
+						if (i|j)&1 == 0 {
+							continue
+						}
+						diff := (int64(i) - int64(lam)*int64(j)) % int64(p)
+						if diff == 0 {
+							want[[2]int{i, j}] = true
+						}
+					}
+				}
+				if len(got) != len(want) {
+					t.Fatalf("I=%d p=%d lam=%d: got %d hits, want %d", I, p, lam, len(got), len(want))
+				}
+				for pos := range want {
+					if !got[pos] {
+						t.Fatalf("I=%d p=%d lam=%d: missing hit %v", I, p, lam, pos)
+					}
 				}
 			}
+		}
+	}
+}
 
-			want := make(map[[2]int]bool)
-			for j := 1; j < J; j++ {
-				for i := -I; i < I; i++ {
-					diff := (int64(i) - int64(lam)*int64(j)) % int64(p)
-					if diff == 0 {
-						want[[2]int{i, j}] = true
-					}
+func TestSWARByteScans(t *testing.T) {
+	rng := rand.New(rand.NewSource(99))
+	ab := make([]byte, 259)
+	rb := make([]byte, 259)
+	for i := range ab {
+		ab[i] = byte(rng.Intn(256))
+		rb[i] = byte(rng.Intn(256))
+	}
+	ab[0], rb[0] = 0, 255
+	ab[7], rb[7] = 128, 128
+	ab[8], rb[8] = 127, 129
+	ab[258], rb[258] = 255, 255
+
+	var got []int
+	for aT := -1; aT <= 257; aT += 3 {
+		wantHas := false
+		for _, v := range ab {
+			if int(v) >= aT {
+				wantHas = true
+				break
+			}
+		}
+		if hasByteGe(ab, aT) != wantHas {
+			t.Fatalf("hasByteGe(aT=%d) = %v, want %v", aT, !wantHas, wantHas)
+		}
+		for rT := -1; rT <= 257; rT += 5 {
+			got = appendBothGe(got[:0], ab, rb, aT, rT)
+			var want []int
+			for idx := range ab {
+				if int(ab[idx]) >= aT && int(rb[idx]) >= rT {
+					want = append(want, idx)
 				}
 			}
 			if len(got) != len(want) {
-				t.Fatalf("p=%d lam=%d: got %d hits, want %d", p, lam, len(got), len(want))
+				t.Fatalf("appendBothGe(%d,%d): got %v, want %v", aT, rT, got, want)
 			}
-			for pos := range want {
-				if !got[pos] {
-					t.Fatalf("p=%d lam=%d: missing hit %v", p, lam, pos)
+			for k := range got {
+				if got[k] != want[k] {
+					t.Fatalf("appendBothGe(%d,%d)[%d] = %d, want %d", aT, rT, k, got[k], want[k])
+				}
+			}
+		}
+	}
+}
+
+func TestSieveBlockLinesMatchesBruteForce(t *testing.T) {
+	lines := []linePrime{
+		{idx: 0, p: 29, lambda: 0, logP: 5},
+		{idx: 1, p: 31, lambda: 17, logP: 5},
+		{idx: 2, p: 37, lambda: 36, logP: 5},
+	}
+	verts := []vertPrime{
+		{idx: 3, p: 5, logP: 2},
+	}
+	for _, I := range []int{64, 60} { // 64 hits aligned fast path, 60 hits general path
+		W := 2 * I
+		const J = 20
+		total := (J - 1) * W
+		got := make([]byte, total)
+		step := 512
+		for bStart := 0; bStart < total; bStart += step {
+			bEnd := bStart + step
+			if bEnd > total {
+				bEnd = total
+			}
+			sieveBlockLines(got[bStart:bEnd], bStart, bEnd, I, W, lines, verts, 3)
+		}
+
+		for j := 1; j < J; j++ {
+			for i := -I; i < I; i++ {
+				pos := (j-1)*W + (i + I)
+				if (i|j)&1 != 0 {
+					want := byte(3)
+					for _, vp := range verts {
+						if j%int(vp.p) == 0 {
+							want += vp.logP
+						}
+					}
+					for _, lp := range lines {
+						if (int64(i)-int64(j)*int64(lp.lambda))%int64(lp.p) == 0 {
+							want += lp.logP
+						}
+					}
+					if got[pos] != want {
+						t.Fatalf("I=%d (i,j)=(%d,%d): got %d, want %d", I, i, j, got[pos], want)
+					}
+				} else if got[pos] != 3 {
+					t.Fatalf("I=%d both-even (i,j)=(%d,%d) was sieved: got %d, want 3", I, i, j, got[pos])
 				}
 			}
 		}
