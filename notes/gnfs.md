@@ -8,7 +8,7 @@ Section 4 collects the formulas the pipeline depends on, with their derivations,
 
 ## 0. Status (2026-11-26)
 
-The package exists and factors end to end: `gnfs.Factor`, wired into `factor/main.go` after `qs` (methods list, `gnfsMaxBits = 450`, `-v`, `-workers`, `-gnfs-save`, separate GNFS pretest budget above `qsMaxBits`). `go test ./gnfs` takes about 13.5s.
+The package exists and factors end to end: `gnfs.Factor`, wired into `factor/main.go` after `qs` (methods list, `gnfsMaxBits = 450`, `-v`, `-workers`, `-gnfs-save`, separate GNFS pretest budget above `qsMaxBits`). `go test ./gnfs` takes about 11.4s.
 
 ### Baselines (Apple M5 Pro, 15 cores)
 
@@ -19,7 +19,11 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 - **`BenchmarkQuadraticSieve` pre vs post refactor:** unchanged within noise (60 bits 382µs vs 376µs, 120 bits 4.11ms vs 4.16ms, 160 bits 34.2ms vs 34.1ms).
 - **`BenchmarkBlockLanczos` (row weight 40):** 0.19s / 21 MB at 10k cols, 2.45s / 123 MB at 50k cols, 16.7s / 540 MB at 150k cols.
 - **`BenchmarkBigMul` (`math/big`):** 8.1ms at 1 Mbit, 24.3ms at 2 Mbit, 102ms at 5 Mbit, 309ms at 10 Mbit.
-- **80-digit (265-bit) GNFS profile:** before sieve/cofactor optimizations (`160k_21`), 9m53.8s wall (9m30.6s sieve = 96.1%, 11.4s LA = 1.9%, 9.0s sqrt = 1.5%); CPU was 35.5% line sieving, 22.5% `addFKHits`, 16.3% byte-by-byte threshold scan, 4.7% `transformRoot` Fermat inversion, and 3.3% + GC in `big.Int` cofactoring. After prime-outer line sieving with carried offsets, skipping both-even $(i, j)$ in line and FK sieving, 8-byte SWAR threshold scans, 32-bit Euclidean `invMod32`, two-stage 128/64-bit cofactoring, and starting `QMin` inside the upper factor base (`250k_q80k`), the same 265-bit number dropped to 4m34.0s wall (3m56.4s sieve, 10.2s LA).
+- **80-digit (265-bit) GNFS progression:**
+  1. Initial `160k_21` baseline: 9m53.8s wall (9m30.6s sieve = 96.1%, 11.4s LA, 9.0s sqrt).
+  2. Prime-outer line sieving, skipping both-even $(i, j)$, 8-byte SWAR threshold scans, `invMod32`, two-stage 128/64-bit cofactoring, and `250k_q80k`: 4m34.0s wall (3m56.4s sieve, 10.2s LA).
+  3. Skewed fixed-$c_d$ and non-monic Kleinjung polynomials, translation + $2\times 2$ rotation size optimisation, bounded skewness, parallel prime-power root sieve, 16 KB blocks, and flat `uint32` `fkArena` buckets grouped by `LogP`: **54.0s wall (40.3s sieve, 4.7s LA, 7.2s sqrt)**, 11× faster than baseline.
+- **Expected `qs` / `gnfs` crossover:** `gnfs` is 54.0s at 80 digits (3.4× `qs`) and 3m53s at 89 digits (~1.8× `qs` at 90 digits), projecting crossover around 95–97 digits (~315–322 bits).
 
 ### Milestones
 
@@ -29,9 +33,9 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | **M0** | Done. `internal/arith` and `internal/linalg` shared with `qs` with no benchmark regression. |
 | **M1** | Done. Base-$m$, coarse bad ideals, QCs, line sieve, square root by Hensel lifting, and all 4.7 checks. Zero bad squares observed across all runs up to 295 bits. |
 | **M2** | Done. Dedup, singleton pruning on $(p, r)$ ideals, `Reducer`, parallel Block Lanczos benchmarked to 150k columns. |
-| **M3** | Mostly done. Gauss reduction, $\lambda_p$, prime-outer line sieving, Franke–Kleinjung buckets, both-even skipping, SWAR candidate scan, two-stage 128/64-bit 2LP cofactoring, extended special-$q$ sieving. Verified up to 295 bits (89 digits); 305–365 bits (92–110 digits) still needs tuning runs. |
-| **M4** | Partial. Smooth $c_d$ search, Murphy $\alpha$, skewness, small rotation search ($u \in [-2, 2]$, $v \in [-8, 8]$ from 140 bits), and `-gnfs-save` checkpointing + full/partial resume + `TestSavedRelations`. Translation and root sieve are not done. |
-| **M5** | Partial. Product-tree square root and $d = 5$ parameter row exist. Exact bad ideals, Kleinjung, P−1/ECM cofactoring and runs at 95–110+ digits are not done. |
+| **M3** | Mostly done. Gauss reduction, $\lambda_p$, 16 KB prime-outer line sieving, flat `uint32` Franke–Kleinjung bucket arena grouped by `LogP`, both-even skipping, SWAR candidate scan, two-stage 128/64-bit 2LP cofactoring, extended special-$q$ sieving. Verified up to 295 bits (89 digits); 305–365 bits (92–110 digits) still needs tuning runs. |
+| **M4** | Done. Skewed fixed-$c_d$ search, bounded skewness, translation + $2\times 2$ rotation size optimisation, parallel prime-power root sieve, Murphy $\alpha$ + Dickman yield scoring, and `-gnfs-save` checkpointing + full/partial resume + `TestSavedRelations`. |
+| **M5** | Partial. Non-monic Kleinjung polynomial selection, product-tree square root, and $d = 5$ parameter row exist. Exact bad ideals, P−1/ECM cofactoring and runs at 95–110+ digits are not done. |
 
 ### Parameter table (`defaultParams`)
 
@@ -40,41 +44,39 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | < 115 | Line sieve, $d = 3$, Br 1200, Ba 1800, LP 32k/48k, ratio 0.80. 80–96ms at 95 bits, 134–272ms at 114 bits (down from 603ms with Br 800, Ba 1200). |
 | 115–150 | $d = 4$, Br = Ba = 8000, LP $2^{17}$, ratio 0.80. 0.3s at 115 bits, 0.6s at 149 bits. |
 | 150–200 | $d = 4$, Br = Ba = 30000, LP $2^{18}$, $Q_{\min} = 20\text{k}$, $I = 1024$, $J = 512$, ratio 0.85. 1.6s at 151 bits, 3–4s at 195 bits. |
-| 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $Q_{\min} = 60\text{k}$, $I = J = 1024$, ratio 0.95. Four seeds at 230 and 249 bits all passed (before sieve speedups: 26–33s at 230 bits, 1m53s–3m02s at 249 bits; after sieve speedups: 12.0s sieve / 17s total at 230 bits). |
-| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.92. 4m34s at 265 bits / 80 digits (3m56s sieve, 10.2s LA). |
-| 275–305 | $d = 4$, Br = Ba = 400000, LP $2^{22}$, mfb 44, $Q_{\min} = 150\text{k}$, $I = J = 2048$, ratio 1.08. 21m51s at 295 bits / 89 digits (20m35s sieve, 41.6s LA, 27.9s sqrt, 0 bad squares). |
-| 305–365 | $d = 4$, Br = 550000, Ba = 600000, LP $2^{23}$, mfb 46, $Q_{\min} = 250\text{k}$, $I = J = 2048$, ratio 1.08. Extrapolated from 265 and 295 bits; not yet timed. |
+| 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $Q_{\min} = 60\text{k}$, $I = J = 1024$, ratio 0.82. 11.0s total (6.98s sieve) at 230 bits / 70 digits (down from 17s before poly+arena, and 26–33s originally). |
+| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.82. 54.0s at 265 bits / 80 digits (40.3s sieve, 4.7s LA, 7.2s sqrt; down from 4m34s). |
+| 275–305 | $d = 4$, Br = Ba = 400000, LP $2^{22}$, mfb 44, $Q_{\min} = 150\text{k}$, $I = J = 2048$, ratio 0.84. 3m53s at 295 bits / 89 digits (3m19s sieve, 14.1s LA, 16.5s sqrt, 0 bad squares; down from 21m51s). |
+| 305–365 | $d = 4$, Br = 550000, Ba = 600000, LP $2^{23}$, mfb 46, $Q_{\min} = 250\text{k}$, $I = J = 2048$, ratio 0.88. Extrapolated from 265 and 295 bits; not yet timed. |
 | ≥ 365 | $d = 5$, Br = 500000, Ba = 800000, LP $2^{26}$, mfb 52. Not tested. |
 
 `chooseDegree` reads the degree from this table.
 
 ### Differences from the plan
 
-- **Skewness** minimises the product of the $F$ and $G$ norms, not $\int F^2$ alone. For base-$m$ polynomials the product is nearly flat in $s$, so the search can return a large skew. On the one polynomial checked, the $\int F^2$ optimum was similar (2.2e7 against 3.6e7) and the yield was the same.
+- **Skewness** minimises $\log\operatorname{RMS}(F) + \log\operatorname{RMS}(G)$ capped near $1.5\sqrt{Q_{\min} Q_{\max}}$ so $|b| \ge 1$ is realisable on the integer special-$q$ lattice.
 - **Bad ideals** are flagged for any multiple root of $f \bmod p$, which is a little more than $p^2 \mid \operatorname{disc}(f)$ requires.
 - **Multiple roots above $B_a$** have no QC, so special-$q$ roots and algebraic large primes at multiple roots are skipped.
 - **Small composite factors** that fit in 64 bits go to rho instead of back into GNFS.
 - **Progress** is measured in relations against a per-row `RelTargetRatio` times $\pi(\text{LP}_{\text{rat}}) + \pi(\text{LP}_{\text{alg}})$, switching to slope extrapolation once the 2-core slope reaches 0.2 (ignoring tiny pre-percolation slopes).
-- **Overshoot:** excess is checked every ~7% before $-\#\text{fixed}/2$, every ~1% while climbing, and every `2*(goal - excess)` (clamped to `[100, 1000]`) above $-2000$. Recent runs stopped at excess 36–703 against a goal of 32.
+- **Overshoot:** excess is checked every ~7% before $-\#\text{fixed}/2$, every ~1% while climbing, and every `2*(goal - excess)` (clamped to `[100, 1000]`) above $-2000$. Recent runs stopped at excess 57–70 against a goal of 32.
 
 ### Remaining work
 
-Priority 1 covers tuning and verification at 92–100 digits. Priority 2 covers algorithmic polynomial selection and sieve yield improvements needed to overtake `qs` (~2m11s at 90d, ~9m06s at 95d, ~38m extrapolated at 100d). Priority 3 covers larger M5 scaling and low-level vectorisation.
+Priority 1 covers tuning and crossover verification at 92–100 digits. Priority 2 covers $d = 5$ scaling to 100–110+ digits. Priority 3 covers larger M5 cofactoring, exact bad ideals, and low-level vectorisation.
 
-Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped without `-tune` and prints live 15s progress lines. For example, `GNFS_BITS=265 GNFS_CANDS=default GNFS_SEEDS=2 go test ./gnfs -run Sweep -v -tune -timeout 120m`. The package path has to come before `-tune`.
+Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped without `-tune` and prints live 15s progress lines. For example, `GNFS_BITS=266 GNFS_CANDS=default GNFS_SEEDS=2 go test ./gnfs -run Sweep -v -tune -timeout 120m`. The package path has to come before `-tune`.
 
 | Priority | Task | Size | Notes |
 | :--- | :--- | :--- | :--- |
-| 1 | Time and tune the 305–365 bit row (92–100 digits) | M | Verify 95- and 100-digit semiprimes end to end and measure the crossover gap against `qs`. |
-| 1 | Check 250–275 and 275–305 bit rows on more seeds | S | One seed each at 265 and 295 bits so far. |
-| 2 | Translation and root sieve (M4) | L | Current polynomials use base-$m$ over smooth $c_d$ with small rotations ($u \in [-2, 2]$, $v \in [-8, 8]$). Better size + root optimisation directly shrinks $F(a, b)$ norms and cuts sieve time at 90–110 digits. |
-| 2 | Bucket layout and cache blocking for FK hits | M | `sieveBlockLines` (39% CPU) and `addFKHits` (32% CPU) dominate the 80-digit profile. Pre-allocated flat arena buckets and prime-bucket cache blocking would cut memory traffic. |
-| 2 | $d = 5$ tuning and 100–110 digit runs (M5) | M | Mostly machine time once polynomial selection is stronger. |
+| 1 | Time and tune the 305–365 bit row (92–100 digits) | M | Verify 95- and 100-digit semiprimes end to end, measure the exact crossover against `qs` (projected around 95–97 digits), and raise `qsMaxBits` accordingly. |
+| 1 | Check 250–275 and 275–305 bit rows on more seeds | S | One seed each timed with Kleinjung + root sieve + `fkArena` so far. |
+| 2 | $d = 5$ tuning and 100–110 digit runs (M5) | M | Tune degree-5 polynomial selection (`kleinjungCandidates` $d=5$ and skewness bounds) and factor base parameters at 105–115 digits. |
+| 2 | Cache-blocked bucket sieving above L2 | M | Partition `fkArena` into two-level superblocks if `numBlocks * stride` outgrows L2/SLC at 110+ digits. |
 | 3 | P−1/ECM cofactoring for mfb above 64 bits | M | Needed once 2LP/3LP cofactor bounds exceed 64 bits above ~105 digits. |
-| 3 | Kleinjung polynomial selection | L | Non-monic $g$ ($a_1 \ne 1$); measure yield gain after Phase 1B translation + root sieve first. |
 | 3 | Exact bad ideals | L | Only if coarse handling shows dependencies failing $\beta^2 = \gamma$ at larger sizes; 0 bad squares seen so far. |
 | 3 | Free relations | S | `cofactorPair` already supports them; small gain (about $1/|\mathrm{Gal}|$ of primes). |
-| 3 | Skewness from $\int F^2$ alone | S | Matches the plan; made no difference on the one polynomial checked. |
+| 3 | Skewness from $\int F^2$ alone | S | Matches the plan; made no difference on the polynomials checked once skewness is bounded by $\sqrt{Q_{\min}Q_{\max}}$. |
 | 3 | SIMD / `avo` core sieving loop | M | After algorithmic improvements are done; rewrite the inner sieve and threshold scan loops using Go's `simd` package or [`avo`](https://github.com/mmcloughlin/avo). |
 
 GNFS trial-divides only up to $\max(B_r, B_a)$. That is enough for correctness, and `factor/main.go` runs rho and ECM first.
@@ -245,17 +247,21 @@ Choose $f$ (irreducible, primitive) and $g(x) = a_1 x - a_0$ with common root $m
   - Pick $c_d$ (1 for monic) and set $m = \lfloor (N / c_d)^{1/d} \rfloor$, $g(x) = x - m$ ($a_1 = 1$, $a_0 = m$). Expand $N$ in base $m$, so $f(m) = N$ exactly, and balance the digits into $[-m/2, m/2]$ by carrying, which may move $c_d$ by ±1.
   - Not $N^{1/(d+1)}$: with $m = \lfloor N^{1/(d+1)} \rfloor$ we get $N \ge m^{d+1}$, and the expansion has degree $d+1$.
   - Because $f(m) = N$ exactly, a reducible $f = hk$ gives $N = h(m)k(m)$. Report that factor instead of rejecting the polynomial.
-- **Phase 1B — Chosen leading coefficient, rotation and root sieve (M4):**
-  - Search smooth small $c_d$ with $m = \lfloor (N/c_d)^{1/d} \rfloor$ (Murphy's base-$m$ variant). For each, size-optimise with translation $x \mapsto x + k$ (common root $m - k$) and rotation $f + (ux + v)g$; rotation keeps $f(m) \equiv 0$ since $g(m) = 0$, and the degree stays $d$ for $d \ge 2$.
-  - Score with **Murphy's $\alpha(f)$** over small primes (about $p \le 200$) combined with the size of $F$ over the skewed region. Skewness $s \approx |c_0 / c_d|^{1/d}$ is the starting point; optimise $s$ by minimising the integral of $F^2$ over the skewed region.
+- **Phase 1B — Skewed fixed-$c_d$, size optimisation, and root sieve (M4):**
+  - **Fixed-$c_d$ skewed expansion:** sample smooth products of $\{2, 3, 5, 7, 11, 13\}$ logarithmically up to $\approx 2^{40}$. Keep $c_d$ fixed so its smoothness is not lost to a carry, pick nearest $m = \lfloor (N / c_d)^{1/d} \rceil$, and expand $R = N - c_d m^d$ in balanced base $m$ into $c_0 \dots c_{d-2}$ with the top remainder in $c_{d-1}$. Since $|m - (N/c_d)^{1/d}| \le 1/2$, $|c_{d-1}| \le \frac{d}{2} c_d \ll m$.
+  - **Size optimisation (`sizeOptimizePoly`):** alternate translation $x \mapsto x + k_t$ ($k_t = \lfloor -c_{d-1}/(d c_d) \rceil$, updating $a_0 \leftarrow a_0 - k_t a_1$) with the exact $2\times 2$ quadratic-form minimum over $(u, v)$ in $f + (ux + v)(a_1 x - a_0)$ at current skewness $s$, accepting steps monotonically.
+  - **Bounded skewness:** cap $s$ near $1.5\sqrt{Q_{\min} Q_{\max}}$ so $|b| \approx A/\sqrt{s} \ge 1$ is realisable on the integer special-$q$ lattice instead of drifting to unphysical $s \gg q$.
+  - **Prime-power root sieve (`rootSieveOptimize`):** for the top size-optimised candidates in parallel, sieve $v \in [-V, V]$ across $u \in [-U, U]$ (up to $U \le 12, V \le 768$) over all prime powers $p^k \le 97$. For each $x \in [0, p^k)$ with $p \nmid g(x)$, hits lie on the single arithmetic progression $v \equiv -f_u(x) g(x)^{-1} \pmod{p^k}$ with weight $\frac{\log p}{(p+1) p^{k-1}}$, summing identically to $\frac{p}{p^2-1}\log p$ on simple roots and handling ramified roots without special cases.
+  - **Dickman yield scoring (`dickmanYieldScore`):** rank survivors by $u_F \ln u_F + u_G \ln u_G$ at typical lattice scale $A = \sqrt{I (J/2) q_{\text{typ}}}$, with $u_F = (\ln\operatorname{RMS}(F) + d\ln A - \ln q_{\text{typ}} + \alpha(f))/\ln B_a$ and $u_G = (\ln\operatorname{RMS}(G) + \ln A)/\ln B_r$.
   - **$\alpha(f)$ definition.** $\alpha$ compares the expected $p$-adic valuation of a random integer, $1/(p-1)$, with that of $F(a, b)$ over coprime pairs:
     $$\alpha(f) = \sum_{p \le B} \left(\frac{1}{p-1} - \mathbb{E}[v_p(F(a, b))]\right) \log p.$$
     $F(a, b)$ behaves like a number $e^{\alpha}$ times its size for smoothness, so negative $\alpha$ is better.
     - For $p \nmid \operatorname{disc}(f)$ with $n_p$ roots mod $p$, counting the projective root when $p \mid c_d$: over coprime $(a, b)$, $p \mid F$ with probability $n_p/(p+1)$, and the expected valuation is $n_p\,p/(p^2-1)$. So the term is
       $$\left(1 - \frac{n_p\, p}{p + 1}\right) \frac{\log p}{p - 1}.$$
     - For $p \mid \operatorname{disc}(f)$, roots can be multiple and that formula is wrong. Compute $\mathbb{E}[v_p(F)]$ by lifting the roots mod $p^k$ (Hensel, branching at multiple roots) until the contribution is negligible.
-    - Signs are easy to get backwards. One educational implementation (elliptic1/General-Number-Field-Sieve) has a per-prime term that grows more positive with more roots and has no $1/(p-1)$ baseline. Test against brute force: the average of $v_p(F(a, b))$ over many random coprime pairs should match $\mathbb{E}[v_p(F)]$ for each small $p$. Also, a polynomial with no roots mod any small $p$ should get $\alpha = \sum \log p/(p-1) > 0$. CADO-NFS's polyselect prints $\alpha$ and can serve as a cross-check.
-- **Phase 1C — Kleinjung (M5, optional):** non-monic $g$ ($a_1 \ne 1$) via Kleinjung's 2006 algorithm. This is a sizeable piece of work, so do it only if measurements show polynomial quality limits yield. Once $a_1 \neq 1$, the $a_1^{-|S|/2}$ factor in $X_{\text{rat}}$ (4.5) is exercised, so test it on polynomials with $a_1 \ne 1$ before relying on it.
+- **Phase 1C — Non-monic Kleinjung candidates (`kleinjungCandidates`):**
+  - For smooth $c_d$, find small primes $p_j \nmid d c_d$ where $c_d x^d \equiv N \pmod{p_j}$ splits into $d$ roots, Hensel-lift each root to $\bmod p_j^2$, and combine $k \in \{3, 4\}$ primes into $a_1 = \prod p_j$ ($a_1^2 < 2^{62}$) giving $d^k$ roots $r \bmod a_1^2$ by CRT in `uint64`.
+  - For each root, pick $a_0 \equiv r \pmod{a_1^2}$ closest to $(N/c_d)^{1/d}$, let $M = (N - c_d a_0^d)/a_1^2$, and select the roots with smallest $|M - t_{d-1} a_0^{d-1}|$ so both $c_{d-1} = a_1 t_{d-1}$ and $c_{d-2}$ are small simultaneously. Expand the remaining coefficients so $\sum_{i=0}^d c_i a_0^i a_1^{d-i} = N$ identically, then pass through the same Stage 1B size optimisation and root sieve.
 
 ---
 
@@ -290,9 +296,11 @@ Choose $f$ (irreducible, primitive) and $g(x) = a_1 x - a_0$ with common root $m
   $$i \equiv \lambda_p\, j, \qquad \lambda_p = (r_p v_2 - v_1)(u_1 - r_p u_2)^{-1} \bmod p.$$
   - If $u_1 - r_p u_2 \equiv 0 \pmod p$, the hits are the lines $j \equiv 0 \pmod p$. Both factors cannot vanish together, since $\det(\mathbf{u}, \mathbf{v}) = \pm q$ and $p \ne q$.
   - Projective roots transform the same way with $(r_p : 1)$ replaced by $(1 : 0)$.
-- **Enumerating hits:**
-  - $p < 2I$: line by line, starting at $i \equiv \lambda_p j \pmod p$ on each line $j$.
-  - $p \ge 2I$: a line has a hit with probability only $2I/p$, so computing a start for every line costs $J$ operations per prime per special-$q$, about $2 \cdot 10^9$ at $J = 2048$ with a million primes. Use the **Franke–Kleinjung** algorithm instead: it walks the $p$-lattice in the flattened $(i, j)$ order using two precomputed basis vectors and emits each hit into the bucket for its block.
+- **Enumerating hits and bucket layout:**
+  - **16 KB L1-resident blocks (`blockShift = 14`):** both `algBuf` and `ratBuf` fit in 32 KB total, block boundaries align with full lines of width $W = 2I$ for $I \le 8192$, and block offsets fit in 14 bits.
+  - $p < 2I$ (**prime-outer block line sieving**): loop prime-outer over each 16 KB block with carried per-line offsets (`off += lambda; if off >= p { off -= p }`, no per-line `% p`), stepping by $2p$ on even-$j$ lines to skip both-even $(i, j)$ and unrolling 4×.
+  - $p \ge 2I$ (**flat `uint32` Franke–Kleinjung arena `fkArena`**): group FK ideals by `LogP` (~7 groups), walk the $p$-lattice skipping both-even $(i, j)$ via `pos & (W|1) != 0`, and write 4-byte `uint32(idx)<<14 | off` entries into a single pre-allocated power-of-2-stride slab per block (`counts` in L1 cache, overflow slice fallback for safety). Draining iterates each `LogP` slice with constant register `lg` and 4× unrolling, cutting bucket memory traffic in half compared with `[][]uint64` slices.
+  - **Candidate scan and two-stage cofactoring:** scan 8 bytes per word (`binary.LittleEndian.Uint64` SWAR mask), gather rational bucket hits and cofactor $G(a, b)$ in 128/64-bit arithmetic first, and scan algebraic bucket hits only on blocks with Stage 1 survivors.
 - **Coprimality and sign:**
   - Skip $(i, j)$ with both even (a quarter of the area), and those with $\gcd(i, j) \ne 1$.
   - $\gcd(i, j) = 1$ is necessary for $\gcd(a, b) = 1$ but not sufficient, since $a$ and $b$ can still share the factor $q$. So check $\gcd(a, b) = 1$ on the survivors too.
