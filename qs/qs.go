@@ -372,11 +372,9 @@ type worker struct {
 	stop  *atomic.Bool
 	poly  int // index of the polynomial being sieved within its A
 
-	aInv    []uint32
 	deltas  [][]uint32
 	buf     [blockSize]byte
 	buckets [][]uint64
-	small   []smallRoot // primes below resieveCut not dividing a
 
 	// The current block's candidates, and the primes from resieveFrom up
 	// hitting each.
@@ -395,7 +393,6 @@ func (s *sieve) newWorker(stop *atomic.Bool, emit func(found)) *worker {
 		roots: append([]root(nil), s.roots...),
 		emit:  emit,
 		stop:  stop,
-		aInv:  make([]uint32, len(s.roots)),
 	}
 }
 
@@ -512,14 +509,13 @@ func (s *sieve) singlePoly(sieveRange int64) *big.Int {
 			stop.Store(true)
 		}
 	})
-	w.setRoots(one, m)
-
 	// Stop before X reaches zero, since X and −X give the same Y and would
 	// only add duplicate rows (and so trivial dependencies).
 	lo := -sieveRange
 	if m.IsInt64() && 1-m.Int64() > lo {
 		lo = 1 - m.Int64()
 	}
+	w.setRoots(one, m, lo)
 	s.polys = 1
 	w.sievePoly(one, m, nil, lo, sieveRange)
 	return factor
@@ -654,38 +650,94 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 	// B = Σ B_j with B_j ≡ ±t_j (mod q_j) and B_j ≡ 0 (mod A/q_j), so
 	// B² ≡ kN (mod A). Flipping the signs of B_0..B_{s−2} gives
 	// 2^(s−1) polynomials for this A.
+	sLen := len(aIdx)
 	var bigP, r, aq, twoBv big.Int
-	bj := make([]*big.Int, len(aIdx))
+	bj := make([]*big.Int, sLen)
+	qSlice := make([]uint64, sLen)
+	gammaSlice := make([]uint64, sLen)
 	b := new(big.Int)
 	for j, idx := range aIdx {
 		q := uint64(w.roots[idx].p)
+		qSlice[j] = q
 		bigP.SetUint64(q)
 		aq.Quo(a, &bigP)
-		gamma := uint64(w.roots[idx].t) * arith.InvMod(r.Mod(&aq, &bigP).Uint64(), q) % q
+		gamma := uint64(w.roots[idx].t) * uint64(invMod32(uint32(r.Mod(&aq, &bigP).Uint64()), uint32(q))) % q
 		if gamma > q/2 {
 			gamma = q - gamma
 		}
+		gammaSlice[j] = gamma
 		bj[j] = new(big.Int).Mul(new(big.Int).SetUint64(gamma), &aq)
 		b.Add(b, bj[j])
 	}
 
-	// When the sign of B_v flips, every root moves by 2·B_v·A⁻¹ (mod p).
-	for len(w.deltas) < len(aIdx)-1 {
+	for len(w.deltas) < sLen-1 {
 		w.deltas = append(w.deltas, make([]uint32, len(w.roots)))
 	}
+	var qmBuf, prefBuf [32]uint64
+	qm := qmBuf[:0]
+	pref := prefBuf[:0]
+	if sLen <= len(qmBuf) {
+		qm = qmBuf[:sLen]
+		pref = prefBuf[:sLen]
+	} else {
+		qm = make([]uint64, sLen)
+		pref = make([]uint64, sLen)
+	}
+
+	// Batch invert q_j mod p via prefix products since B_j*A^-1 ≡ gamma_j*q_j^-1 (mod p).
+	uRange := uint64(sieveRange)
 	for i := range w.roots {
 		rt := &w.roots[i]
 		if rt.inA {
 			continue
 		}
 		p := uint64(rt.p)
-		bigP.SetUint64(p)
-		w.aInv[i] = uint32(arith.InvMod(r.Mod(a, &bigP).Uint64(), p))
-		for v := 0; v < len(aIdx)-1; v++ {
-			w.deltas[v][i] = uint32(2 * r.Mod(bj[v], &bigP).Uint64() * uint64(w.aInv[i]) % p)
+		for j := 0; j < sLen; j++ {
+			q := qSlice[j]
+			if q >= p {
+				q %= p
+			}
+			qm[j] = q
+			if j == 0 {
+				pref[0] = q
+			} else {
+				pref[j] = pref[j-1] * q % p
+			}
 		}
+		inv := uint64(invMod32(uint32(pref[sLen-1]), rt.p))
+		aInv := inv
+		var sumBeta uint64
+		for j := sLen - 1; j >= 0; j-- {
+			var qInv uint64
+			if j > 0 {
+				qInv = inv * pref[j-1] % p
+				inv = inv * qm[j] % p
+			} else {
+				qInv = inv
+			}
+			g := gammaSlice[j]
+			if g >= p {
+				g %= p
+			}
+			beta := g * qInv % p
+			sumBeta += beta
+			if j < sLen-1 {
+				d := beta << 1
+				if d >= p {
+					d -= p
+				}
+				w.deltas[j][i] = uint32(d)
+			}
+		}
+		sumBeta %= p
+		shift := uRange
+		if shift >= p {
+			shift %= p
+		}
+		tA := uint64(rt.t) * aInv % p
+		rt.r1 = uint32((tA + p - sumBeta + shift) % p)
+		rt.r2 = uint32((2*p - tA - sumBeta + shift) % p)
 	}
-	w.setRootsInv(b, w.aInv)
 
 	for poly := 1; ; poly++ {
 		w.poly = poly - 1
@@ -792,31 +844,47 @@ func chooseA(rng *rand.Rand, roots []root, pool []int, log2Target float64, seen 
 	return nil, nil
 }
 
-// setRoots computes the roots of every prime not in A for the polynomial
-// with coefficients a and b.
-func (w *worker) setRoots(a, b *big.Int) {
-	var r, bigP big.Int
-	for i := range w.roots {
-		if !w.roots[i].inA {
-			p := uint64(w.roots[i].p)
-			w.aInv[i] = uint32(arith.InvMod(r.Mod(a, bigP.SetUint64(p)).Uint64(), p))
-		}
+func invMod32(a, p uint32) uint32 {
+	if p >= 1<<31 {
+		return uint32(arith.InvMod(uint64(a), uint64(p)))
 	}
-	w.setRootsInv(b, w.aInv)
+	t, newT := int32(0), int32(1)
+	r, newR := int32(p), int32(a)
+	for newR != 0 {
+		q := r / newR
+		t, newT = newT, t-q*newT
+		r, newR = newR, r-q*newR
+	}
+	if t < 0 {
+		t += int32(p)
+	}
+	return uint32(t)
 }
 
-// setRootsInv is setRoots with A⁻¹ mod p already computed for each prime.
-func (w *worker) setRootsInv(b *big.Int, aInv []uint32) {
+func negMod(lo int64, p uint32) uint32 {
+	m := (-lo) % int64(p)
+	if m < 0 {
+		m += int64(p)
+	}
+	return uint32(m)
+}
+
+// setRoots sets r1 and r2 of every prime not in A to its first offset >= 0 from lo.
+func (w *worker) setRoots(a, b *big.Int, lo int64) {
 	var r, bigP big.Int
 	for i := range w.roots {
 		rt := &w.roots[i]
 		if rt.inA {
 			continue
 		}
-		p, t := uint64(rt.p), uint64(rt.t)
-		bModP := r.Mod(b, bigP.SetUint64(p)).Uint64()
-		rt.r1 = uint32((t + p - bModP) % p * uint64(aInv[i]) % p)
-		rt.r2 = uint32((2*p - t - bModP) % p * uint64(aInv[i]) % p)
+		p := uint64(rt.p)
+		bigP.SetUint64(p)
+		aInv := uint64(invMod32(uint32(r.Mod(a, &bigP).Uint64()), rt.p))
+		bModP := r.Mod(b, &bigP).Uint64()
+		shift := uint64(negMod(lo, rt.p))
+		t := uint64(rt.t)
+		rt.r1 = uint32(((t+p-bModP)%p*aInv + shift) % p)
+		rt.r2 = uint32(((2*p-t-bModP)%p*aInv + shift) % p)
 	}
 }
 
@@ -847,16 +915,10 @@ func addMod(a, b, p uint32) uint32 {
 // the relations it finds to w.emit. aIdx lists the primes dividing a.
 func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 	s := w.s
-	w.small = w.small[:0]
-	for i := 0; i < s.resieveFrom; i++ {
-		if rt := &w.roots[i]; !rt.inA {
-			w.small = append(w.small, smallRoot{idx: int32(i), p: rt.p, r1: rt.r1, r2: rt.r2})
-		}
-	}
 	for i := s.sieveFrom; i < s.bucketFrom; i++ {
 		rt := &w.roots[i]
-		rt.off1 = nextOffset(lo, rt.r1, rt.p)
-		rt.off2 = nextOffset(lo, rt.r2, rt.p)
+		rt.off1 = rt.r1
+		rt.off2 = rt.r2
 	}
 	w.fillBuckets(lo, hi)
 
@@ -921,7 +983,7 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 			if y.Sign() == 0 {
 				continue
 			}
-			factors, lp1, lp2, ok := w.tryFactorize(off, &y, aIdx, w.candHits[k])
+			factors, lp1, lp2, ok := w.tryFactorize(uint64(off-lo), &y, aIdx, w.candHits[k])
 			if !ok {
 				continue
 			}
@@ -997,12 +1059,23 @@ func (w *worker) fillBuckets(lo, hi int64) {
 		}
 		p := uint64(rt.p)
 		tag := uint64(rt.logP)<<48 | uint64(i)<<16
-		for off := uint64(nextOffset(lo, rt.r1, rt.p)); off < total; off += p {
+		if p >= total {
+			if off := uint64(rt.r1); off < total {
+				w.buckets[off>>blockShift] = append(w.buckets[off>>blockShift], tag|off&(blockSize-1))
+			}
+			if rt.r2 != rt.r1 {
+				if off := uint64(rt.r2); off < total {
+					w.buckets[off>>blockShift] = append(w.buckets[off>>blockShift], tag|off&(blockSize-1))
+				}
+			}
+			continue
+		}
+		for off := uint64(rt.r1); off < total; off += p {
 			b := off >> blockShift
 			w.buckets[b] = append(w.buckets[b], tag|off&(blockSize-1))
 		}
 		if rt.r2 != rt.r1 {
-			for off := uint64(nextOffset(lo, rt.r2, rt.p)); off < total; off += p {
+			for off := uint64(rt.r2); off < total; off += p {
 				b := off >> blockShift
 				w.buckets[b] = append(w.buckets[b], tag|off&(blockSize-1))
 			}
@@ -1033,37 +1106,90 @@ func (w *worker) maxLog2Y(a, b *big.Int, from, to int64) float64 {
 	return best - arith.Log2Big(a)
 }
 
-// nextOffset returns the smallest off >= 0 with start+off ≡ root (mod p).
-func nextOffset(start int64, root, p uint32) uint32 {
-	off := (int64(root) - start) % int64(p)
-	if off < 0 {
-		off += int64(p)
-	}
-	return uint32(off)
-}
-
-// tryFactorize attempts to factor y = Y(x) over the factor base. It divides
-// by the small primes whose roots match x and by the larger primes in hits.
-// A relation's Y is a·Y(x), so each prime of a is counted once more. A
-// cofactor made of one or two primes up to lpBound is returned as lp1, lp2.
-func (w *worker) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp1, lp2 uint64, ok bool) {
+// tryFactorize attempts to factor y = Y(x) over the factor base, where z = x - lo.
+// A relation's Y is a·Y(x), so each prime of a is counted once more.
+func (w *worker) tryFactorize(z uint64, y *big.Int, aIdx []int, hits []int32) (factors []int32, lp1, lp2 uint64, ok bool) {
 	s := w.s
 	factors = w.scratch[:0]
-	temp := w.temp.Abs(y)
 	if y.Sign() < 0 {
 		factors = append(factors, 0)
 	}
 
-	var bigP, q, r big.Int
+	if y.BitLen() > 384 {
+		return w.tryFactorizeBig(z, y, aIdx, hits, factors)
+	}
+
+	var w32 [12]uint32
+	n32 := 0
+	words := y.Bits()
+	if bits.UintSize == 64 {
+		for idx, wd := range words {
+			u := uint64(wd)
+			w32[2*idx] = uint32(u)
+			w32[2*idx+1] = uint32(u >> 32)
+		}
+		n32 = 2 * len(words)
+		if n32 > 0 && w32[n32-1] == 0 {
+			n32--
+		}
+	} else {
+		for idx, wd := range words {
+			w32[idx] = uint32(wd)
+		}
+		n32 = len(words)
+	}
+
+	in64 := false
+	var v64 uint64
+	if n32 <= 2 {
+		in64 = true
+		if n32 >= 1 {
+			v64 = uint64(w32[0])
+		}
+		if n32 == 2 {
+			v64 |= uint64(w32[1]) << 32
+		}
+	}
+
 	divide := func(i int32) {
-		bigP.SetUint64(uint64(w.roots[i].p))
+		p64 := uint64(w.roots[i].p)
+		if in64 {
+			for v64 >= p64 && v64%p64 == 0 {
+				factors = append(factors, i+1)
+				v64 /= p64
+			}
+			return
+		}
 		for {
-			q.QuoRem(temp, &bigP, &r)
-			if r.Sign() != 0 {
-				break
+			var rem uint64
+			var q32 [12]uint32
+			for k := n32 - 1; k >= 0; k-- {
+				cur := (rem << 32) | uint64(w32[k])
+				q32[k] = uint32(cur / p64)
+				rem = cur % p64
+			}
+			if rem != 0 {
+				return
 			}
 			factors = append(factors, i+1)
-			temp.Set(&q)
+			for n32 > 0 && q32[n32-1] == 0 {
+				n32--
+			}
+			if n32 <= 2 {
+				in64 = true
+				v64 = uint64(q32[0])
+				if n32 == 2 {
+					v64 |= uint64(q32[1]) << 32
+				}
+				for v64 >= p64 && v64%p64 == 0 {
+					factors = append(factors, i+1)
+					v64 /= p64
+				}
+				return
+			}
+			for k := 0; k < n32; k++ {
+				w32[k] = q32[k]
+			}
 		}
 	}
 
@@ -1071,28 +1197,43 @@ func (w *worker) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fa
 		factors = append(factors, int32(i+1))
 		divide(int32(i))
 	}
-	for i := range w.small {
-		sr := &w.small[i]
-		xr := x % int64(sr.p)
-		if xr < 0 {
-			xr += int64(sr.p)
+	if z <= math.MaxUint32 {
+		z32 := uint32(z)
+		for i := 0; i < s.resieveFrom && !(in64 && v64 == 1); i++ {
+			rt := &w.roots[i]
+			if rt.inA {
+				continue
+			}
+			zm := z32 % rt.p
+			if zm == rt.r1 || zm == rt.r2 {
+				divide(int32(i))
+			}
 		}
-		if uint32(xr) == sr.r1 || uint32(xr) == sr.r2 {
-			divide(sr.idx)
+	} else {
+		for i := 0; i < s.resieveFrom && !(in64 && v64 == 1); i++ {
+			rt := &w.roots[i]
+			if rt.inA {
+				continue
+			}
+			zm := uint32(z % uint64(rt.p))
+			if zm == rt.r1 || zm == rt.r2 {
+				divide(int32(i))
+			}
 		}
 	}
 	for _, i := range hits {
+		if in64 && v64 == 1 {
+			break
+		}
 		divide(i)
 	}
 	w.scratch = factors[:0]
 
-	// Every prime up to the largest base prime has been divided out, so a
-	// cofactor below its square is prime.
-	if temp.Cmp(one) != 0 {
-		if !temp.IsUint64() {
-			return nil, 0, 0, false
-		}
-		c := temp.Uint64()
+	if !in64 {
+		return nil, 0, 0, false
+	}
+	if v64 != 1 {
+		c := v64
 		switch {
 		case c <= s.lpBound && (c < s.pMax*s.pMax || arith.IsPrime64(c)):
 			lp1 = c
@@ -1107,10 +1248,58 @@ func (w *worker) tryFactorize(x int64, y *big.Int, aIdx []int, hits []int32) (fa
 	return append([]int32(nil), factors...), lp1, lp2, true
 }
 
-// smallRoot packs what tryFactorize needs to test a small prime.
-type smallRoot struct {
-	idx       int32
-	p, r1, r2 uint32
+func (w *worker) tryFactorizeBig(z uint64, y *big.Int, aIdx []int, hits []int32, factors []int32) ([]int32, uint64, uint64, bool) {
+	s := w.s
+	temp := w.temp.Abs(y)
+	var bigP, q, r big.Int
+	divide := func(i int32) {
+		bigP.SetUint64(uint64(w.roots[i].p))
+		for {
+			q.QuoRem(temp, &bigP, &r)
+			if r.Sign() != 0 {
+				break
+			}
+			factors = append(factors, i+1)
+			temp.Set(&q)
+		}
+	}
+	for _, i := range aIdx {
+		factors = append(factors, int32(i+1))
+		divide(int32(i))
+	}
+	for i := 0; i < s.resieveFrom; i++ {
+		rt := &w.roots[i]
+		if rt.inA {
+			continue
+		}
+		zm := uint32(z % uint64(rt.p))
+		if zm == rt.r1 || zm == rt.r2 {
+			divide(int32(i))
+		}
+	}
+	for _, i := range hits {
+		divide(i)
+	}
+	w.scratch = factors[:0]
+	var lp1, lp2 uint64
+	if temp.Cmp(one) != 0 {
+		if !temp.IsUint64() {
+			return nil, 0, 0, false
+		}
+		c := temp.Uint64()
+		switch {
+		case c <= s.lpBound && (c < s.pMax*s.pMax || arith.IsPrime64(c)):
+			lp1 = c
+		case c <= s.dlpCap:
+			var ok bool
+			if lp1, lp2, ok = arith.SplitCofactor(c, s.pMax, s.lpBound); !ok {
+				return nil, 0, 0, false
+			}
+		default:
+			return nil, 0, 0, false
+		}
+	}
+	return append([]int32(nil), factors...), lp1, lp2, true
 }
 
 // addRelation records a full relation, or a partial one with large primes
