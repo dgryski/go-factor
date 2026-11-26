@@ -44,6 +44,7 @@ type Params struct {
 	SlackRat       float64
 	SlackAlg       float64
 	NumQCs         int
+	RelTargetRatio float64 // expected relations / LP ideals (0 uses defaultRelTargetRatio)
 }
 
 // splitCofactor splits c (already divided by all primes <= pMax) into 1 or 2

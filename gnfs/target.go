@@ -2,43 +2,41 @@ package gnfs
 
 import "github.com/dgryski/go-factor/internal/arith"
 
-// relTargetRatio is the number of relations needed as a fraction of the
-// large-prime ideals, π(LpBoundRat) + π(LpBoundAlg), measured on test runs.
-const relTargetRatio = 0.9
+const defaultRelTargetRatio = 0.95
 
-// relTarget estimates how many relations the sieve needs. Excess makes a
-// poor progress count: it stays at -NumFixed until large-prime cycles
-// form, dips, then climbs steeply. The number of relations grows steadily,
-// so progress is measured in relations against this target instead.
-//
-// The first estimate comes from the large-prime bounds. Once excess is
-// rising, the target extrapolates its slope against the relation count.
-// Excess grows faster than linearly, so this overestimates and then
-// converges as the sieve nears the goal.
+// relTarget estimates the relation count needed from LP bounds first,
+// then extrapolates excess slope once the 2-core starts climbing.
 type relTarget struct {
 	initial    int
-	goal       int // excess wanted
+	goal       int
 	prevRels   int
 	prevExcess int
 	havePrev   bool
-	want       int // current estimate, 0 if unknown
+	want       int
 }
 
 func newRelTarget(p *Params, goal int) *relTarget {
+	ratio := p.RelTargetRatio
+	if ratio <= 0 {
+		ratio = defaultRelTargetRatio
+	}
 	ideals := len(arith.PrimesUpTo(int64(p.LpBoundRat))) + len(arith.PrimesUpTo(int64(p.LpBoundAlg)))
-	initial := int(relTargetRatio * float64(ideals))
+	initial := int(ratio * float64(ideals))
 	return &relTarget{initial: initial, goal: goal, want: initial}
 }
 
-// update records the excess after rels relations and returns the target,
-// or 0 if there is no usable estimate.
 func (t *relTarget) update(rels, excess int) int {
 	rising := t.havePrev && excess > t.prevExcess && rels > t.prevRels
 	if rising {
 		slope := float64(excess-t.prevExcess) / float64(rels-t.prevRels)
-		t.want = rels + int(float64(t.goal-excess)/slope+0.5)
+		est := rels + int(float64(t.goal-excess)/slope+0.5)
+		// Ignore tiny pre-percolation slopes before reaching the initial target.
+		if rels < t.initial && est > t.initial && slope < 0.2 {
+			t.want = t.initial
+		} else {
+			t.want = est
+		}
 	} else if t.want <= rels {
-		// The initial estimate was too low and excess isn't climbing yet.
 		t.want = 0
 	}
 	t.prevRels, t.prevExcess, t.havePrev = rels, excess, true

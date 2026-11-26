@@ -20,6 +20,18 @@ var tune = flag.Bool("tune", false, "run the slow tuning sweeps")
 // tuneCands are parameter sets to compare in TestSweep. "default" uses
 // defaultParams for each number.
 var tuneCands = map[string]Params{
+	"line_1200": {Degree: 3, Br: 1200, Ba: 1800, LpBoundRat: 32000, LpBoundAlg: 48000,
+		MfbRat: 30, MfbAlg: 32, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: false, LineA: 65536, LineB: 1000,
+		SlackRat: 34, SlackAlg: 36, NumQCs: 64},
+	"line_2000": {Degree: 3, Br: 2000, Ba: 2500, LpBoundRat: 48000, LpBoundAlg: 64000,
+		MfbRat: 32, MfbAlg: 32, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: false, LineA: 65536, LineB: 1000,
+		SlackRat: 34, SlackAlg: 36, NumQCs: 64},
+	"lat_110": {Degree: 3, Br: 3000, Ba: 3000, LpBoundRat: 1 << 16, LpBoundAlg: 1 << 16,
+		MfbRat: 32, MfbAlg: 32, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 3000, QMax: 24000, IHalf: 512, JMax: 256,
+		SlackRat: 34, SlackAlg: 34, NumQCs: 64},
 	// The 200-250 bit row before 2026-11-25.
 	"old250": {Degree: 4, Br: 10000, Ba: 20000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
 		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
@@ -33,6 +45,58 @@ var tuneCands = map[string]Params{
 		MfbRat: 40, MfbAlg: 40, MaxLPRat: 2, MaxLPAlg: 2,
 		UseLattice: true, QMin: 100000, QMax: 400000, IHalf: 1024, JMax: 1024,
 		SlackRat: 46, SlackAlg: 46, NumQCs: 64},
+	"160k_21": {Degree: 4, Br: 160000, Ba: 160000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
+		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 160000, QMax: 800000, IHalf: 2048, JMax: 1024,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+	"160k_21_1k": {Degree: 4, Br: 160000, Ba: 160000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
+		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 160000, QMax: 800000, IHalf: 1024, JMax: 1024,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+	"200k_21_1k": {Degree: 4, Br: 200000, Ba: 200000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
+		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 200000, QMax: 1000000, IHalf: 1024, JMax: 1024,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+	"200k_21": {Degree: 4, Br: 200000, Ba: 200000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
+		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 200000, QMax: 1000000, IHalf: 2048, JMax: 1024,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+	"200k_q80k": {Degree: 4, Br: 200000, Ba: 200000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
+		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 80000, QMax: 800000, IHalf: 2048, JMax: 1024,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+	"250k_q80k": {Degree: 4, Br: 250000, Ba: 250000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
+		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 80000, QMax: 800000, IHalf: 2048, JMax: 1024,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+	"300k_22_q120k": {Degree: 4, Br: 300000, Ba: 300000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 120000, QMax: 1500000, IHalf: 2048, JMax: 1024,
+		SlackRat: 50, SlackAlg: 50, NumQCs: 64},
+	"400k_22_q150k": {Degree: 4, Br: 400000, Ba: 400000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 150000, QMax: 2000000, IHalf: 2048, JMax: 2048,
+		SlackRat: 50, SlackAlg: 50, NumQCs: 64},
+	"250k_22_1k": {Degree: 4, Br: 250000, Ba: 250000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 250000, QMax: 1500000, IHalf: 1024, JMax: 1024,
+		SlackRat: 50, SlackAlg: 50, NumQCs: 64},
+	"200k_22": {Degree: 4, Br: 200000, Ba: 250000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 250000, QMax: 1200000, IHalf: 2048, JMax: 1024,
+		SlackRat: 50, SlackAlg: 50, NumQCs: 64},
+	"300k_22": {Degree: 4, Br: 300000, Ba: 300000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 300000, QMax: 2000000, IHalf: 2048, JMax: 1024,
+		SlackRat: 50, SlackAlg: 50, NumQCs: 64},
+	"350k_22": {Degree: 4, Br: 350000, Ba: 400000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 400000, QMax: 2500000, IHalf: 2048, JMax: 1024,
+		SlackRat: 50, SlackAlg: 50, NumQCs: 64},
+	"300k_23": {Degree: 4, Br: 300000, Ba: 350000, LpBoundRat: 1 << 23, LpBoundAlg: 1 << 23,
+		MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 350000, QMax: 2000000, IHalf: 2048, JMax: 2048,
+		SlackRat: 52, SlackAlg: 52, NumQCs: 64},
 }
 
 // TestSweep times splitWithParams on random semiprimes of each GNFS_BITS
@@ -70,7 +134,8 @@ func TestSweep(t *testing.T) {
 				} else {
 					t.Fatalf("unknown candidate %q: want default or one of %s", name, candNames())
 				}
-				var fbLine, sieved string
+				var fbLine, sieved, laLine, sqrtLine string
+				lastPrint := time.Now()
 				Logf = func(f string, a ...interface{}) {
 					s := fmt.Sprintf(f, a...)
 					switch {
@@ -78,14 +143,23 @@ func TestSweep(t *testing.T) {
 						fbLine = s
 					case strings.Contains(s, "sieved"):
 						sieved = s
+					case strings.Contains(s, "dependencies in"):
+						laLine = s
+					case strings.Contains(s, "sqrt time"):
+						sqrtLine = s
+					case strings.Contains(s, "relations (excess"):
+						if time.Since(lastPrint) >= 15*time.Second {
+							lastPrint = time.Now()
+							fmt.Printf("  [%d bits seed %d %s] %s\n", n.BitLen(), seed, name, s)
+						}
 					}
 				}
 				st := time.Now()
 				f1, _ := splitWithParams(n, &p)
 				Logf = nil
 				ideals := len(arith.PrimesUpTo(int64(p.LpBoundRat))) + len(arith.PrimesUpTo(int64(p.LpBoundAlg)))
-				t.Logf("%d bits seed %d %s: ok=%v %v, LP ideals %d | %s | %s",
-					n.BitLen(), seed, name, f1 != nil, time.Since(st).Round(time.Millisecond), ideals, fbLine, sieved)
+				t.Logf("%d bits (%d digits) seed %d %s: ok=%v %v, LP ideals %d | %s | %s | %s | %s",
+					n.BitLen(), len(n.String()), seed, name, f1 != nil, time.Since(st).Round(time.Millisecond), ideals, fbLine, sieved, laLine, sqrtLine)
 			}
 		}
 	}
