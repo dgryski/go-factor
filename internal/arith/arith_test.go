@@ -1,6 +1,7 @@
 package arith
 
 import (
+	"fmt"
 	"math"
 	"math/big"
 	"math/rand"
@@ -249,5 +250,22 @@ func TestNthRoot(t *testing.T) {
 				t.Fatalf("NthRoot(%v, %d) = %v wrong", n, d, r)
 			}
 		}
+	}
+}
+
+func BenchmarkBigMul(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	one := big.NewInt(1)
+	for _, mbits := range []int{1, 2, 5, 10} {
+		nbits := mbits * 1_000_000
+		lim := new(big.Int).Lsh(one, uint(nbits))
+		x := new(big.Int).Rand(rng, lim)
+		y := new(big.Int).Rand(rng, lim)
+		var z big.Int
+		b.Run(fmt.Sprintf("Mbit=%d", mbits), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				z.Mul(x, y)
+			}
+		})
 	}
 }
