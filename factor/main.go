@@ -94,18 +94,21 @@ func main() {
 	if qsWorkers <= 0 {
 		qsWorkers = runtime.GOMAXPROCS(0)
 	}
-	b := &budget{start: time.Now(), workers: qsWorkers, qsRuns: func(n *big.Int) bool {
-		return qsRuns(n) || gnfsRuns(n)
-	}}
+	b := &budget{
+		start:    time.Now(),
+		workers:  qsWorkers,
+		qsRuns:   qsRuns,
+		gnfsRuns: gnfsRuns,
+	}
 
 	// each runs f on every composite left, until share of its budget is used.
 	each := func(name string, share float64, f func(context.Context, *big.Int) ([]*big.Int, []*big.Int)) {
 		log.Printf("starting %s", name)
 		var comps []*big.Int
 		for _, cc := range ctmp {
-			ctx, cancel, ok := b.context(cc, share)
+			ctx, cancel, sieveName, ok := b.context(cc, share)
 			if !ok {
-				log.Printf("skipping %s for %d digits: its share of the time before qs is used", name, len(cc.String()))
+				log.Printf("skipping %s for %d digits: its share of the time before %s is used", name, len(cc.String()), sieveName)
 				comps = append(comps, cc)
 				continue
 			}

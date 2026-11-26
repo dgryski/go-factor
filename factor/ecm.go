@@ -25,13 +25,14 @@ const ecmNoQSDigits = 25
 // curves after that are likely to cost more than they save.
 func ecmPretest(n *big.Int, b *budget) (primes, composites []*big.Int) {
 	todo := []*big.Int{n}
+	_, _, hasSieve := b.sieveEstimate(n)
 	for _, lv := range ecmLevels {
-		if len(todo) == 0 || !b.qsRuns(n) && lv.digits > ecmNoQSDigits {
+		if len(todo) == 0 || !hasSieve && lv.digits > ecmNoQSDigits {
 			break
 		}
 		var next []*big.Int
 		for _, c := range todo {
-			ctx, cancel, ok := b.context(c, shareECM)
+			ctx, cancel, sieveName, ok := b.context(c, shareECM)
 			if !ok {
 				next = append(next, c)
 				continue
@@ -39,7 +40,7 @@ func ecmPretest(n *big.Int, b *budget) (primes, composites []*big.Int) {
 			log.Printf("starting ecm(b1=%v, b2=%v, curves=%v) on %d digits", lv.b1, lv.b2, lv.curves, len(c.String()))
 			p, co := factor.ECMContext(ctx, c, lv.b1, lv.b2, lv.curves)
 			if ctx.Err() != nil {
-				log.Printf("ecm stopped %v after brent started, leaving the rest to qs", time.Since(b.start).Round(time.Millisecond))
+				log.Printf("ecm stopped %v after brent started, leaving the rest to %s", time.Since(b.start).Round(time.Millisecond), sieveName)
 			}
 			cancel()
 			primes = append(primes, p...)
