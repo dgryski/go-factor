@@ -273,3 +273,66 @@ func TestFactor59Digits(t *testing.T) {
 		t.Fatalf("split(%v) = %v, %v", n, f1, f2)
 	}
 }
+
+func TestFreeRelationsAndLPFilter(t *testing.T) {
+	rnd := rand.New(rand.NewSource(37))
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 55), testutil.RandomPrime(rnd, 55))
+	poly, fac := BaseMPoly(n, 3, 6)
+	if fac != nil {
+		t.Skip("got lucky factor")
+	}
+	params := &Params{
+		Degree: 3, Br: 2000, Ba: 2000,
+		LpBoundRat: 32000, LpBoundAlg: 32000,
+		MfbRat: 30, MfbAlg: 30, MaxLPRat: 2, MaxLPAlg: 2,
+		NumQCs: 64,
+	}
+	const qcMin = 100000
+	fb := BuildFactorBases(poly, params.Br, params.Ba, qcMin, params.NumQCs)
+	free := freeRelations(poly, fb)
+	if len(free) == 0 {
+		t.Fatalf("expected free relations for Br=Ba=2000")
+	}
+
+	sc := newCofactorScratch(poly.Degree)
+	for _, rel := range free {
+		if !rel.IsFree || rel.B != 0 || len(rel.RatCols) != 1 || len(rel.AlgCols) != poly.Degree {
+			t.Fatalf("malformed free relation %+v", rel)
+		}
+		got, ok := cofactorPair(poly, fb, params, qcMin, rel.A, rel.B, true, sc)
+		if !ok || len(got.AlgCols) != poly.Degree {
+			t.Fatalf("cofactorPair rejected free relation p=%d", rel.A)
+		}
+		dup := []Relation{rel, rel}
+		surv, rows, numCols := buildMatrix(poly, fb, dup)
+		if len(rows) != 2 || len(rows[0]) == 0 {
+			t.Fatalf("unexpected rows for free relation p=%d", rel.A)
+		}
+		deps := linalg.FindDependencies(rows, numCols, nil)
+		if len(deps) != 1 {
+			t.Fatalf("expected 1 dependency for duplicate free relation, got %d", len(deps))
+		}
+		if _, sqOk := tryDependency(n, poly, fb, surv, deps[0]); !sqOk {
+			t.Fatalf("duplicate free relation p=%d failed square check", rel.A)
+		}
+	}
+
+	// Verify incremental lpFilter recounts match pruneSingletons across steps.
+	synth := []Relation{
+		{A: 3, B: 1},
+		{A: 5, B: 1, RatLPs: [2]uint64{20011, 0}},
+		{A: 7, B: 1, RatLPs: [2]uint64{20011, 20021}},
+		{A: 9, B: 1, RatLPs: [2]uint64{20021, 0}, AlgLPs: []LargeIdeal{{P: 20029, R: 4}}},
+		{A: 11, B: 1, AlgLPs: []LargeIdeal{{P: 20029, R: 4}}},
+		{A: 13, B: 1, AlgLPs: []LargeIdeal{{P: 20029, R: 5}}},
+	}
+	filt := newLPFilter(len(synth))
+	for i := range synth {
+		filt.add(&synth[i])
+		got := filt.excess(fb.NumFixed)
+		want, _, _ := pruneSingletons(synth[:i+1], fb)
+		if got != want {
+			t.Fatalf("step %d: filt.excess=%d, want %d", i, got, want)
+		}
+	}
+}

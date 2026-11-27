@@ -19,117 +19,200 @@ func algLPKey(id LargeIdeal) lpKey {
 	return lpKey{p: id.P, r: id.R + 1}
 }
 
-// oddLPKeys returns the distinct large-prime keys appearing an odd number of
-// times in rel.
-func oddLPKeys(rel *Relation) []lpKey {
-	var keys [5]lpKey
-	n := 0
+func oddLPKeysInto(dst []lpKey, rel *Relation) []lpKey {
 	for _, lp := range rel.RatLPs {
 		if lp != 0 {
-			keys[n] = ratLPKey(lp)
-			n++
+			dst = append(dst, ratLPKey(lp))
 		}
 	}
 	for _, id := range rel.AlgLPs {
-		if n < len(keys) {
-			keys[n] = algLPKey(id)
-			n++
-		}
+		dst = append(dst, algLPKey(id))
 	}
-	if n == 0 {
-		return nil
+	if len(dst) <= 1 {
+		return dst
 	}
-	if n == 1 {
-		return []lpKey{keys[0]}
+	for i := 1; i < len(dst); i++ {
+		v := dst[i]
+		j := i - 1
+		for j >= 0 && (dst[j].p > v.p || (dst[j].p == v.p && dst[j].r > v.r)) {
+			dst[j+1] = dst[j]
+			j--
+		}
+		dst[j+1] = v
 	}
-	if len(rel.AlgLPs)+2 > len(keys) {
-		all := make([]lpKey, 0, len(rel.AlgLPs)+2)
-		for _, lp := range rel.RatLPs {
-			if lp != 0 {
-				all = append(all, ratLPKey(lp))
-			}
-		}
-		for _, id := range rel.AlgLPs {
-			all = append(all, algLPKey(id))
-		}
-		return oddLPKeySlice(all)
-	}
-	return oddLPKeySlice(keys[:n])
-}
-
-func oddLPKeySlice(s []lpKey) []lpKey {
-	sort.Slice(s, func(i, j int) bool {
-		if s[i].p != s[j].p {
-			return s[i].p < s[j].p
-		}
-		return s[i].r < s[j].r
-	})
-	var out []lpKey
-	for i := 0; i < len(s); {
-		j := i
-		for j < len(s) && s[j] == s[i] {
+	out := 0
+	for i := 0; i < len(dst); {
+		j := i + 1
+		for j < len(dst) && dst[j] == dst[i] {
 			j++
 		}
 		if (j-i)&1 != 0 {
-			out = append(out, s[i])
+			dst[out] = dst[i]
+			out++
 		}
 		i = j
 	}
-	return out
+	return dst[:out]
 }
 
-// pruneSingletons iteratively removes relations containing a large-prime ideal
-// of weight 1 until a 2-core remains. It returns the excess (surviving relations
-// minus active LP ideals minus fb.NumFixed), alive flags, and column map for
-// surviving LP ideals starting at fb.NumFixed.
-func pruneSingletons(rels []Relation, fb *FactorBases) (excess int, alive []bool, lpCols map[lpKey]int32) {
-	degree := make(map[lpKey]int, len(rels))
-	byKey := make(map[lpKey][]int32, len(rels))
-	relKeys := make([][]lpKey, len(rels))
+// oddLPKeys returns the distinct large prime keys appearing an odd number of
+// times in rel.
+func oddLPKeys(rel *Relation) []lpKey {
+	var buf [8]lpKey
+	keys := oddLPKeysInto(buf[:0], rel)
+	if len(keys) == 0 {
+		return nil
+	}
+	return append([]lpKey(nil), keys...)
+}
 
-	for i := range rels {
-		keys := oddLPKeys(&rels[i])
-		relKeys[i] = keys
-		for _, k := range keys {
-			degree[k]++
-			byKey[k] = append(byKey[k], int32(i))
+// lpFilter interns large prime ideals to dense IDs so singleton recounts during
+// sieving run in flat reusable buffers without heap allocations.
+type lpFilter struct {
+	idMap    map[lpKey]int32
+	keys     []lpKey
+	totalDeg []int32
+	relOff   []int32
+	relIDs   []int32
+
+	deg   []int32
+	head  []int32
+	cur   []int32
+	adj   []int32
+	dead  []uint64
+	queue []int32
+}
+
+func newLPFilter(capHint int) *lpFilter {
+	if capHint < 64 {
+		capHint = 64
+	}
+	relOff := make([]int32, 1, capHint+1)
+	return &lpFilter{
+		idMap:  make(map[lpKey]int32, capHint),
+		relOff: relOff,
+	}
+}
+
+func (f *lpFilter) add(rel *Relation) {
+	var buf [8]lpKey
+	keys := oddLPKeysInto(buf[:0], rel)
+	for _, k := range keys {
+		id, ok := f.idMap[k]
+		if !ok {
+			id = int32(len(f.keys))
+			f.idMap[k] = id
+			f.keys = append(f.keys, k)
+			f.totalDeg = append(f.totalDeg, 0)
+		}
+		f.totalDeg[id]++
+		f.relIDs = append(f.relIDs, id)
+	}
+	f.relOff = append(f.relOff, int32(len(f.relIDs)))
+}
+
+func ensureInt32Len(s []int32, n int) []int32 {
+	if cap(s) < n {
+		return make([]int32, n)
+	}
+	return s[:n]
+}
+
+func (f *lpFilter) excess(numFixed int) int {
+	numRels := len(f.relOff) - 1
+	numLP := len(f.keys)
+	words := (numRels + 63) >> 6
+	if cap(f.dead) < words {
+		f.dead = make([]uint64, words)
+	} else {
+		f.dead = f.dead[:words]
+		clear(f.dead)
+	}
+	if numLP == 0 {
+		return numRels - numFixed
+	}
+
+	f.deg = ensureInt32Len(f.deg, numLP)
+	copy(f.deg, f.totalDeg)
+	f.head = ensureInt32Len(f.head, numLP+1)
+	f.cur = ensureInt32Len(f.cur, numLP)
+	f.adj = ensureInt32Len(f.adj, len(f.relIDs))
+	f.queue = f.queue[:0]
+
+	var sum int32
+	activeLPs := 0
+	for id := 0; id < numLP; id++ {
+		f.head[id] = sum
+		f.cur[id] = sum
+		d := f.deg[id]
+		sum += d
+		if d > 0 {
+			activeLPs++
+			if d == 1 {
+				f.queue = append(f.queue, int32(id))
+			}
+		}
+	}
+	f.head[numLP] = sum
+
+	for r := 0; r < numRels; r++ {
+		start, end := f.relOff[r], f.relOff[r+1]
+		for p := start; p < end; p++ {
+			id := f.relIDs[p]
+			pos := f.cur[id]
+			f.adj[pos] = int32(r)
+			f.cur[id] = pos + 1
 		}
 	}
 
-	alive = make([]bool, len(rels))
-	for i := range alive {
-		alive[i] = true
-	}
-
-	var queue []lpKey
-	for k, d := range degree {
-		if d == 1 {
-			queue = append(queue, k)
-		}
-	}
-
-	for len(queue) > 0 {
-		k := queue[len(queue)-1]
-		queue = queue[:len(queue)-1]
-		if degree[k] != 1 {
+	numDead := 0
+	for len(f.queue) > 0 {
+		id := f.queue[len(f.queue)-1]
+		f.queue = f.queue[:len(f.queue)-1]
+		if f.deg[id] != 1 {
 			continue
 		}
-		for _, i := range byKey[k] {
-			if !alive[i] {
+		hStart, hEnd := f.head[id], f.head[id+1]
+		for pos := hStart; pos < hEnd; pos++ {
+			r := f.adj[pos]
+			w, bit := r>>6, uint64(1)<<(uint(r)&63)
+			if f.dead[w]&bit != 0 {
 				continue
 			}
-			alive[i] = false
-			for _, q := range relKeys[i] {
-				if degree[q]--; degree[q] == 1 {
-					queue = append(queue, q)
+			f.dead[w] |= bit
+			numDead++
+			rStart, rEnd := f.relOff[r], f.relOff[r+1]
+			for p := rStart; p < rEnd; p++ {
+				q := f.relIDs[p]
+				f.deg[q]--
+				if f.deg[q] == 0 {
+					activeLPs--
+				} else if f.deg[q] == 1 {
+					f.queue = append(f.queue, q)
 				}
 			}
 		}
 	}
+	return (numRels - numDead) - activeLPs - numFixed
+}
+
+// pruneSingletons iteratively removes relations containing a large prime ideal
+// of weight 1 until a 2-core remains.
+func pruneSingletons(rels []Relation, fb *FactorBases) (excess int, alive []bool, lpCols map[lpKey]int32) {
+	f := newLPFilter(len(rels))
+	for i := range rels {
+		f.add(&rels[i])
+	}
+	excess = f.excess(fb.NumFixed)
+
+	alive = make([]bool, len(rels))
+	for i := range rels {
+		alive[i] = f.dead[i>>6]&(1<<(uint(i)&63)) == 0
+	}
 
 	var active []lpKey
-	for k, d := range degree {
-		if d > 0 {
+	for id, k := range f.keys {
+		if f.deg[id] > 0 {
 			active = append(active, k)
 		}
 	}
@@ -143,14 +226,6 @@ func pruneSingletons(rels []Relation, fb *FactorBases) (excess int, alive []bool
 	for i, k := range active {
 		lpCols[k] = int32(fb.NumFixed + i)
 	}
-
-	numAlive := 0
-	for _, a := range alive {
-		if a {
-			numAlive++
-		}
-	}
-	excess = numAlive - len(lpCols) - fb.NumFixed
 	return excess, alive, lpCols
 }
 
@@ -161,6 +236,7 @@ func buildMatrix(poly *Poly, fb *FactorBases, rels []Relation) (surviving []Rela
 
 	var scratchVal = newCofactorScratch(poly.Degree)
 	var factors []int32
+	var lpBuf [8]lpKey
 	for i := range rels {
 		if !alive[i] {
 			continue
@@ -185,7 +261,7 @@ func buildMatrix(poly *Poly, fb *FactorBases, rels []Relation) (surviving []Rela
 			factors = append(factors, int32(fb.ColAFB)+idx)
 		}
 		factors = fb.QCBits(rel.A, rel.B, factors)
-		for _, k := range oddLPKeys(&rel) {
+		for _, k := range oddLPKeysInto(lpBuf[:0], &rel) {
 			factors = append(factors, lpCols[k])
 		}
 		rows = append(rows, linalg.OddColumns(factors))

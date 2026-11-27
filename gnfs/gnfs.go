@@ -241,34 +241,52 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 	}
 
 	fb := BuildFactorBases(poly, params.Br, params.Ba, qcMin, params.NumQCs)
+	freeRels := freeRelations(poly, fb)
 	target := newRelTarget(params, extraRelations)
-	logf("gnfs: RFB=%d (Br=%d), AFB=%d (Ba=%d, bad=%d), QCB=%d (>%d), cols=%d, want excess=%d",
-		len(fb.RFB), params.Br, len(fb.AFB), params.Ba, fb.BadCount, len(fb.QCB), qcMin, fb.NumFixed, extraRelations)
+	logf("gnfs: RFB=%d (Br=%d), AFB=%d (Ba=%d, bad=%d), QCB=%d (>%d), free=%d, cols=%d, want excess=%d",
+		len(fb.RFB), params.Br, len(fb.AFB), params.Ba, fb.BadCount, len(fb.QCB), qcMin, len(freeRels), fb.NumFixed, extraRelations)
 
-	seen := make(map[[2]int64]struct{}, len(savedPairs))
-	var rels []Relation
+	initCap := target.initial
+	if len(savedPairs) > initCap {
+		initCap = len(savedPairs)
+	}
+	seen := make(map[[2]int64]struct{}, initCap)
+	rels := make([]Relation, 0, initCap)
+	filt := newLPFilter(initCap)
 	var fullCount int
 	excess := -fb.NumFixed
+
+	addRel := func(rel Relation) bool {
+		key := [2]int64{rel.A, rel.B}
+		if _, ok := seen[key]; ok {
+			return false
+		}
+		seen[key] = struct{}{}
+		rels = append(rels, rel)
+		filt.add(&rels[len(rels)-1])
+		if rel.RatLPs[0] == 0 && len(rel.AlgLPs) == 0 {
+			fullCount++
+		}
+		return true
+	}
 
 	if len(savedPairs) > 0 {
 		loadStart := time.Now()
 		for _, rel := range refactorPairs(poly, fb, params, qcMin, savedPairs, savedFree) {
-			key := [2]int64{rel.A, rel.B}
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			seen[key] = struct{}{}
-			rels = append(rels, rel)
-			if rel.RatLPs[0] == 0 && len(rel.AlgLPs) == 0 {
-				fullCount++
-			}
+			addRel(rel)
 		}
-		ex, _, _ := pruneSingletons(rels, fb)
-		excess = ex
+		excess = filt.excess(fb.NumFixed)
 		logf("gnfs: refactored %d/%d saved relations (excess %d/%d) in %v",
 			len(rels), len(savedPairs), excess, extraRelations, time.Since(loadStart).Round(time.Millisecond))
 	}
 	loadedCount := len(rels)
+
+	for _, rel := range freeRels {
+		addRel(rel)
+	}
+	if len(rels) > loadedCount {
+		excess = filt.excess(fb.NumFixed)
+	}
 
 	shouldStop := func() bool {
 		return excess >= extraRelations
@@ -292,18 +310,11 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 		}
 
 		onRel := func(rel Relation) {
-			key := [2]int64{rel.A, rel.B}
-			if _, ok := seen[key]; ok {
+			if !addRel(rel) {
 				return
 			}
-			seen[key] = struct{}{}
-			rels = append(rels, rel)
-			if rel.RatLPs[0] == 0 && len(rel.AlgLPs) == 0 {
-				fullCount++
-			}
 			if len(rels) >= nextCheck {
-				ex, _, _ := pruneSingletons(rels, fb)
-				excess = ex
+				excess = filt.excess(fb.NumFixed)
 				// Check roughly every 7% before the 2-core climbs, every 1%
 				// once climbing, and tightly once close to the goal.
 				switch {
@@ -343,8 +354,7 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 			var prevA, prevB int64
 			for round := 0; round < 8 && !shouldStop(); round++ {
 				sieveLine(poly, fb, &curParams, prevA, prevB, onRel, shouldStop)
-				ex, _, _ := pruneSingletons(rels, fb)
-				excess = ex
+				excess = filt.excess(fb.NumFixed)
 				if !shouldStop() {
 					prevA, prevB = curParams.LineA, curParams.LineB
 					curParams.LineA *= 2
@@ -364,8 +374,7 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 					curParams.QMax = qcMin - 1
 				}
 				sieveLattice(poly, fb, &curParams, onRel, shouldStop)
-				ex, _, _ := pruneSingletons(rels, fb)
-				excess = ex
+				excess = filt.excess(fb.NumFixed)
 				if SaveDir != "" && !shouldStop() && len(rels) > savedSoFar {
 					saveRelations(n, poly, rels)
 					savedSoFar = len(rels)
@@ -383,8 +392,7 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 			}
 		}
 
-		ex, _, _ := pruneSingletons(rels, fb)
-		excess = ex
+		excess = filt.excess(fb.NumFixed)
 		logf("gnfs: sieved %d unique relations (%d full, excess %d) in %v",
 			len(rels), fullCount, excess, time.Since(sieveStart).Round(time.Millisecond))
 	}

@@ -161,6 +161,68 @@ func BuildFactorBases(poly *Poly, br, ba int64, qcMin uint64, numQCs int) *Facto
 	return fb
 }
 
+// freeRelations returns free relations (p, 0) for primes p <= min(Br, Ba)
+// not dividing c_d where f mod p splits into d distinct roots.
+func freeRelations(poly *Poly, fb *FactorBases) []Relation {
+	d := poly.Degree
+	if d <= 0 || len(fb.AFB) == 0 || len(fb.RFB) == 0 {
+		return nil
+	}
+	var count int
+	for i := 0; i < len(fb.AFB); {
+		p := fb.AFB[i].P
+		hasProj := fb.AFB[i].R == p
+		j := i + 1
+		for j < len(fb.AFB) && fb.AFB[j].P == p {
+			if fb.AFB[j].R == p {
+				hasProj = true
+			}
+			j++
+		}
+		if !hasProj && j-i == d {
+			if _, ok := fb.RatLookup[p]; ok {
+				count++
+			}
+		}
+		i = j
+	}
+	if count == 0 {
+		return nil
+	}
+
+	out := make([]Relation, 0, count)
+	colsBuf := make([]int32, 0, count*(d+1))
+	for i := 0; i < len(fb.AFB); {
+		p := fb.AFB[i].P
+		hasProj := fb.AFB[i].R == p
+		j := i + 1
+		for j < len(fb.AFB) && fb.AFB[j].P == p {
+			if fb.AFB[j].R == p {
+				hasProj = true
+			}
+			j++
+		}
+		if !hasProj && j-i == d {
+			if ratIdx, ok := fb.RatLookup[p]; ok {
+				base := len(colsBuf)
+				colsBuf = append(colsBuf, ratIdx)
+				for k := i; k < j; k++ {
+					colsBuf = append(colsBuf, int32(k))
+				}
+				out = append(out, Relation{
+					A:       int64(p),
+					B:       0,
+					RatCols: colsBuf[base : base+1],
+					AlgCols: colsBuf[base+1 : base+1+d],
+					IsFree:  true,
+				})
+			}
+		}
+		i = j
+	}
+	return out
+}
+
 // QCBits appends the matrix column indices for quadratic characters of (a, b)
 // whose Legendre symbol ((a - b*s)/q) == -1.
 func (fb *FactorBases) QCBits(a, b int64, dst []int32) []int32 {
