@@ -19,9 +19,9 @@ import (
 var allMethods = []string{"trial", "brent", "p-1", "p+1", "squfof", "ecm", "qs", "gnfs"}
 
 // Sieve bit limits when -methods is not explicitly set. QS hands off to GNFS
-// above 332 bits (100 digits), near their extrapolated crossover.
+// above 342 bits (103 digits), near their measured 2LP crossover.
 const (
-	qsMaxBits   = 332
+	qsMaxBits   = 342
 	gnfsMaxBits = 450
 )
 

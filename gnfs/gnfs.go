@@ -124,14 +124,23 @@ func defaultParams(n *big.Int) *Params {
 			SlackRat: 45, SlackAlg: 45, NumQCs: 64,
 			RelTargetRatio: 0.84,
 		}
-	case bits < 365:
+	case bits < 325:
 		return &Params{
 			Degree: 4, Br: 550000, Ba: 600000,
 			LpBoundRat: 1 << 23, LpBoundAlg: 1 << 23,
 			MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
-			UseLattice: true, QMin: 250000, QMax: 3500000, IHalf: 2048, JMax: 2048,
+			UseLattice: true, QMin: 220000, QMax: 3500000, IHalf: 2048, JMax: 2048,
 			SlackRat: 47, SlackAlg: 47, NumQCs: 64,
-			RelTargetRatio: 0.88,
+			RelTargetRatio: 0.77,
+		}
+	case bits < 365:
+		return &Params{
+			Degree: 4, Br: 700000, Ba: 800000,
+			LpBoundRat: 12000000, LpBoundAlg: 12000000,
+			MfbRat: 47, MfbAlg: 47, MaxLPRat: 2, MaxLPAlg: 2,
+			UseLattice: true, QMin: 280000, QMax: 5000000, IHalf: 2048, JMax: 2048,
+			SlackRat: 48, SlackAlg: 48, NumQCs: 64,
+			RelTargetRatio: 0.80,
 		}
 	default:
 		return &Params{
@@ -410,8 +419,10 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 }
 
 func solveRelations(n *big.Int, poly *Poly, fb *FactorBases, rels []Relation) (*big.Int, *big.Int) {
+	filtStart := time.Now()
+	logf("gnfs: starting filtering on %d relations", len(rels))
 	surviving, rows, numCols := buildMatrix(poly, fb, rels)
-	logf("gnfs: filtered matrix %d×%d", len(rows), numCols)
+	logf("gnfs: filtered matrix %d×%d in %v, starting linear algebra", len(rows), numCols, time.Since(filtStart).Round(time.Millisecond))
 	if len(rows) <= numCols {
 		logf("gnfs: matrix has no surplus rows, giving up")
 		return nil, nil
@@ -421,11 +432,12 @@ func solveRelations(n *big.Int, poly *Poly, fb *FactorBases, rels []Relation) (*
 	deps := linalg.FindDependencies(rows, numCols, func(f string, a ...interface{}) {
 		logf("gnfs: "+f, a...)
 	})
-	logf("gnfs: %d dependencies in %v", len(deps), time.Since(laStart).Round(time.Millisecond))
+	logf("gnfs: %d dependencies in %v, starting square root", len(deps), time.Since(laStart).Round(time.Millisecond))
 
 	sqrtStart := time.Now()
 	badSq := 0
 	for i, dep := range deps {
+		logf("gnfs: trying dependency %d/%d", i+1, len(deps))
 		fac, sqOk := tryDependency(n, poly, fb, surviving, dep)
 		if !sqOk {
 			badSq++

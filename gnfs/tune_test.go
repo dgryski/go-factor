@@ -97,6 +97,46 @@ var tuneCands = map[string]Params{
 		MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
 		UseLattice: true, QMin: 350000, QMax: 2000000, IHalf: 2048, JMax: 2048,
 		SlackRat: 52, SlackAlg: 52, NumQCs: 64},
+	"m3_295_j1k": {Degree: 4, Br: 400000, Ba: 400000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 120000, QMax: 2000000, IHalf: 2048, JMax: 1024,
+		SlackRat: 45, SlackAlg: 45, NumQCs: 64, RelTargetRatio: 0.84},
+	"m3_295_320k": {Degree: 4, Br: 320000, Ba: 350000, LpBoundRat: 3200000, LpBoundAlg: 3200000,
+		MfbRat: 43, MfbAlg: 43, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 120000, QMax: 1600000, IHalf: 2048, JMax: 1024,
+		SlackRat: 44, SlackAlg: 44, NumQCs: 64, RelTargetRatio: 0.84},
+	"m3_315_4m_j2k": {Degree: 4, Br: 450000, Ba: 500000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
+		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 180000, QMax: 2500000, IHalf: 2048, JMax: 2048,
+		SlackRat: 45, SlackAlg: 45, NumQCs: 64, RelTargetRatio: 0.86},
+	"m3_315_6m_j1k": {Degree: 4, Br: 480000, Ba: 520000, LpBoundRat: 6000000, LpBoundAlg: 6000000,
+		MfbRat: 45, MfbAlg: 45, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 180000, QMax: 3000000, IHalf: 2048, JMax: 1024,
+		SlackRat: 46, SlackAlg: 46, NumQCs: 64, RelTargetRatio: 0.85},
+	"m3_315_6m_j2k": {Degree: 4, Br: 480000, Ba: 520000, LpBoundRat: 6000000, LpBoundAlg: 6000000,
+		MfbRat: 45, MfbAlg: 45, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 200000, QMax: 3000000, IHalf: 2048, JMax: 2048,
+		SlackRat: 46, SlackAlg: 46, NumQCs: 64, RelTargetRatio: 0.85},
+	"m3_315_550k_6m": {Degree: 4, Br: 550000, Ba: 650000, LpBoundRat: 6000000, LpBoundAlg: 6000000,
+		MfbRat: 45, MfbAlg: 45, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 180000, QMax: 3000000, IHalf: 2048, JMax: 2048,
+		SlackRat: 46, SlackAlg: 46, NumQCs: 64, RelTargetRatio: 0.85},
+	"m3_332_700k_23": {Degree: 4, Br: 650000, Ba: 750000, LpBoundRat: 1 << 23, LpBoundAlg: 1 << 23,
+		MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 250000, QMax: 4500000, IHalf: 2048, JMax: 2048,
+		SlackRat: 47, SlackAlg: 47, NumQCs: 64, RelTargetRatio: 0.78},
+	"m3_332_750k_12m": {Degree: 4, Br: 700000, Ba: 800000, LpBoundRat: 12000000, LpBoundAlg: 12000000,
+		MfbRat: 47, MfbAlg: 47, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 280000, QMax: 5000000, IHalf: 2048, JMax: 2048,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64, RelTargetRatio: 0.78},
+	"m3_332_700k_j1k": {Degree: 4, Br: 650000, Ba: 750000, LpBoundRat: 1 << 23, LpBoundAlg: 1 << 23,
+		MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 250000, QMax: 4500000, IHalf: 2048, JMax: 1024,
+		SlackRat: 47, SlackAlg: 47, NumQCs: 64, RelTargetRatio: 0.86},
+	"m3_332_800k_11m": {Degree: 4, Br: 750000, Ba: 850000, LpBoundRat: 11000000, LpBoundAlg: 11000000,
+		MfbRat: 47, MfbAlg: 47, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 2048, JMax: 2048,
+		SlackRat: 48, SlackAlg: 48, NumQCs: 64, RelTargetRatio: 0.86},
 }
 
 // TestSweep times splitWithParams on random semiprimes of each GNFS_BITS
@@ -147,11 +187,14 @@ func TestSweep(t *testing.T) {
 						laLine = s
 					case strings.Contains(s, "sqrt time"):
 						sqrtLine = s
-					case strings.Contains(s, "relations (excess"):
+					}
+					if strings.Contains(s, "relations (excess") {
 						if time.Since(lastPrint) >= 15*time.Second {
 							lastPrint = time.Now()
 							fmt.Printf("  [%d bits seed %d %s] %s\n", n.BitLen(), seed, name, s)
 						}
+					} else {
+						fmt.Printf("  [%d bits seed %d %s] %s\n", n.BitLen(), seed, name, s)
 					}
 				}
 				st := time.Now()
