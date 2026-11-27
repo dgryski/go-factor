@@ -13,12 +13,12 @@ import (
 )
 
 const (
-	blockShift     = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
-	blockSize      = 1 << blockShift
-	blockMask      = blockSize - 1
-	minSievePrime  = 29
-	minSievePower  = 32
-	maxSievePower  = 256
+	blockShift    = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
+	blockSize     = 1 << blockShift
+	blockMask     = blockSize - 1
+	minSievePrime = 29
+	minSievePower = 32
+	maxSievePower = 256
 )
 
 // oddModInv32 returns p^-1 mod 2^32 and floor((2^32-1)/p) for exact uint32
@@ -139,7 +139,7 @@ func newFKArena(numBlocks, numGroups, expectedPerBlock int) *fkArena {
 		want = 2048
 	}
 	shift := uint(11)
-	for (1 << shift) < want && shift < 17 {
+	for (1<<shift) < want && shift < 17 {
 		shift++
 	}
 	stride := uint32(1 << shift)

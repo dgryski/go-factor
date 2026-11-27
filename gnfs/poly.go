@@ -853,6 +853,141 @@ func maxSkewForParams(pr *Params) float64 {
 	return qMid * 1.5
 }
 
+const (
+	rhoMaxU      = 20
+	rhoSteps     = 1024
+	alphaLinearG = 0.5699609931
+)
+
+var (
+	rhoOnce  sync.Once
+	rhoTable [rhoMaxU*rhoSteps + 1]float64
+)
+
+func initDickmanRho() {
+	h := 1.0 / float64(rhoSteps)
+	for i := 0; i <= rhoSteps; i++ {
+		rhoTable[i] = 1.0
+	}
+	for i := rhoSteps + 1; i <= 2*rhoSteps; i++ {
+		rhoTable[i] = 1.0 - math.Log(float64(i)*h)
+	}
+	var inner float64
+	for k := rhoSteps + 1; k < 2*rhoSteps; k++ {
+		inner += rhoTable[k]
+	}
+	for i := 2*rhoSteps + 1; i <= rhoMaxU*rhoSteps; i++ {
+		inner += rhoTable[i-1] - rhoTable[i-rhoSteps]
+		rhoTable[i] = h * (0.5*rhoTable[i-rhoSteps] + inner) / ((float64(i) - 0.5) * h)
+	}
+}
+
+// dickmanRho evaluates Dickman's rho(u) from the trapezoid rule on u*rho(u) = integral of rho over [u-1, u],
+// which keeps relative error bounded (Knuth, TAOCP Vol. 2, Section 4.5.4).
+func dickmanRho(u float64) float64 {
+	if u <= 1.0 {
+		return 1.0
+	}
+	rhoOnce.Do(initDickmanRho)
+	if u < rhoMaxU {
+		pos := u * rhoSteps
+		idx := int(pos)
+		frac := pos - float64(idx)
+		return rhoTable[idx]*(1.0-frac) + rhoTable[idx+1]*frac
+	}
+	asymp := func(x float64) float64 {
+		lx := math.Log(x)
+		llx := math.Log(lx)
+		return -x * (lx + llx - 1.0 + (llx-1.0)/lx)
+	}
+	logAnchor := math.Log(rhoTable[rhoMaxU*rhoSteps])
+	return math.Exp(logAnchor + asymp(u) - asymp(rhoMaxU))
+}
+
+// murphyE computes Murphy's directional yield score E(f, g) across 128 angles
+// in [0, pi] (Murphy 1999, Section 5.1.3, Eq. 5.7).
+func murphyE(p *Poly, pr *Params) float64 {
+	const numAngles = 128
+	s := p.Skew
+	if s < 1.0 {
+		s = 1.0
+	}
+	sqrtS := math.Sqrt(s)
+
+	var aTyp, logQ float64
+	if pr.UseLattice {
+		qTyp := math.Sqrt(float64(pr.QMin) * float64(pr.QMax))
+		if qTyp < 2 {
+			qTyp = 2
+		}
+		logQ = math.Log(qTyp)
+		aTyp = math.Sqrt(float64(pr.IHalf) * float64(max(1, pr.JMax/2)) * qTyp)
+	} else {
+		aTyp = math.Sqrt(float64(pr.LineA) * float64(max(1, pr.LineB/2)))
+	}
+
+	lnBa := math.Log(float64(max(int64(100), pr.Ba)))
+	lnBr := math.Log(float64(max(int64(100), pr.Br)))
+
+	maxF := 0
+	for _, c := range p.Coeffs {
+		if b := c.BitLen(); b > maxF {
+			maxF = b
+		}
+	}
+	shF := max(0, maxF-200)
+	cf := make([]float64, p.Degree+1)
+	for i, c := range p.Coeffs {
+		cf[i] = scaledFloat(c, shF)
+	}
+	lnShiftF := float64(shF) * math.Ln2
+
+	maxG := max(p.A1.BitLen(), p.A0.BitLen())
+	shG := max(0, maxG-200)
+	a1f := scaledFloat(p.A1, shG)
+	a0f := scaledFloat(p.A0, shG)
+	lnShiftG := float64(shG) * math.Ln2
+
+	d := p.Degree
+	rA := aTyp * sqrtS
+	rB := aTyp / sqrtS
+	var sum float64
+	for k := 0; k < numAngles; k++ {
+		theta := math.Pi * (float64(k) + 0.5) / numAngles
+		ak := rA * math.Cos(theta)
+		bk := rB * math.Sin(theta)
+
+		fVal := cf[d]
+		bPow := 1.0
+		for i := d - 1; i >= 0; i-- {
+			bPow *= bk
+			fVal = fVal*ak + cf[i]*bPow
+		}
+		var uF float64
+		if fVal != 0 {
+			lnF := math.Log(math.Abs(fVal)) + lnShiftF
+			uF = (lnF - logQ + p.Alpha) / lnBa
+		}
+
+		gVal := a1f*ak - a0f*bk
+		var uG float64
+		if gVal != 0 {
+			lnG := math.Log(math.Abs(gVal)) + lnShiftG
+			uG = (lnG + alphaLinearG) / lnBr
+		}
+		sum += dickmanRho(uF) * dickmanRho(uG)
+	}
+	return sum / numAngles
+}
+
+func murphyYieldScore(p *Poly, pr *Params) float64 {
+	e := murphyE(p, pr)
+	if e <= 1e-300 {
+		return dickmanYieldScore(p, pr) + 700
+	}
+	return -math.Log(e)
+}
+
 // dickmanYieldScore returns u_F*ln(u_F) + u_G*ln(u_G) at typical sieve scale.
 func dickmanYieldScore(p *Poly, pr *Params) float64 {
 	logRMSF, logRMSG := logNormParts(p)
@@ -984,14 +1119,14 @@ func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 			continue
 		}
 		opt.Alpha = projectiveAlphaBonus(opt.Coeffs[degree])
-		sized = append(sized, sizedCand{poly: opt, sizeScore: dickmanYieldScore(opt, pr)})
+		sized = append(sized, sizedCand{poly: opt, sizeScore: murphyYieldScore(opt, pr)})
 	}
 	if len(sized) == 0 {
 		return BaseMPoly(n, degree, 1)
 	}
 
 	sort.Slice(sized, func(i, j int) bool { return sized[i].sizeScore < sized[j].sizeScore })
-	topN := 24
+	topN := 32
 	if len(sized) < topN {
 		topN = len(sized)
 	}
@@ -1046,7 +1181,7 @@ func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 		if cand == nil {
 			continue
 		}
-		sc := dickmanYieldScore(cand, pr)
+		sc := murphyYieldScore(cand, pr)
 		if sc < bestScore {
 			bestScore = sc
 			best = cand
@@ -1196,22 +1331,17 @@ func fixedCDBaseMPoly(n *big.Int, d int, cd uint64) (*Poly, *big.Int) {
 	return normalizePoly(p, n)
 }
 
-// kleinjungCandidates builds non-monic g(x) = a_1*x - a_0 pairs with c_d*a_0^d ≡ N (mod a_1^2),
-// following Kleinjung, Math. Comp. 75 (2006), Section 2.1.
+// kleinjungCandidates builds polynomial pairs with c_d*a_0^d ≡ N (mod a_1^2) via
+// fractional collision on a_1 = P_1*P_2 (Kleinjung, Math. Comp. 75, 2006, Section 2.2).
 func kleinjungCandidates(n *big.Int, d int) ([]*Poly, *big.Int) {
-	bits := n.BitLen()
-	maxA1Bits := (bits/d - 16) / 2
-	if maxA1Bits < 12 {
+	if n.BitLen()/d < 36 {
 		return nil, nil
-	}
-	if maxA1Bits > 29 {
-		maxA1Bits = 29
 	}
 
 	var splitCandPrimes []uint64
 	var bigP, rTmp big.Int
-	for _, sp := range arith.PrimesUpTo(600) {
-		if sp < 11 || int64(d)%sp == 0 {
+	for _, sp := range arith.PrimesUpTo(800) {
+		if sp < 5 || int64(d)%sp == 0 {
 			continue
 		}
 		up := uint64(sp)
@@ -1223,177 +1353,343 @@ func kleinjungCandidates(n *big.Int, d int) ([]*Poly, *big.Int) {
 
 	cds := []uint64{
 		60, 120, 210, 420, 840, 1260, 2520, 5040, 7560, 10080,
-		15120, 25200, 27720, 50400, 60060, 110880, 180180, 360360, 720720,
-	}
-
-	type primeRoots struct {
-		p  uint64
-		p2 uint64
-		rs []uint64
+		15120, 25200, 27720, 50400, 60060, 110880, 180180, 360360,
+		540540, 720720, 1081080, 1441440,
 	}
 
 	var out []*Poly
 	dBig := big.NewInt(int64(d))
 	for _, cd := range cds {
-		var prs []primeRoots
+		cdBig := new(big.Int).SetUint64(cd)
+		q := new(big.Int).Quo(n, cdBig)
+		if q.Sign() <= 0 {
+			continue
+		}
+		m0 := arith.NthRoot(q, d)
+		// Keep c_d * a_1^2 <= m_0 / 4096 so second order terms in M / a_0^(d-1) mod 1 stay near 1e-3.
+		maxA1Sq := new(big.Int).Quo(m0, new(big.Int).SetUint64(cd<<12))
+		if maxA1Sq.Cmp(big.NewInt(1<<20)) < 0 {
+			continue
+		}
+		maxA1 := new(big.Int).Sqrt(maxA1Sq)
+		const a1HardCap = uint64(1) << 36
+		var maxA1U uint64 = a1HardCap
+		if maxA1.IsUint64() && maxA1.Uint64() < maxA1U {
+			maxA1U = maxA1.Uint64()
+		}
+		if maxA1U < 1000 {
+			continue
+		}
+
+		var prs []kjPrimeRoots
 		for _, p := range splitCandPrimes {
 			if cd%p == 0 {
 				continue
 			}
 			rs := rootsNthModP2(cd, n, d, p)
 			if len(rs) == d {
-				prs = append(prs, primeRoots{p: p, p2: p * p, rs: rs})
-				if len(prs) >= 8 {
+				prs = append(prs, kjPrimeRoots{p: p, p2: p * p, rs: rs})
+				if len(prs) >= 10 {
 					break
 				}
 			}
 		}
-		numFactors := 3
-		if (d == 4 && maxA1Bits >= 21 || d == 3 && maxA1Bits >= 20) && len(prs) >= 4 {
-			numFactors = 4
-		}
-		if len(prs) < numFactors {
+		if len(prs) < 3 {
 			continue
 		}
 
-		for offset := 0; offset+numFactors <= len(prs) && offset < 2; offset++ {
-			tuple := prs[offset : offset+numFactors]
-			a1 := uint64(1)
-			tooBig := false
-			for _, pr := range tuple {
-				if a1 > (uint64(1)<<uint(maxA1Bits))/pr.p {
-					tooBig = true
-					break
-				}
-				a1 *= pr.p
+		tuples := chooseKleinjungTuples(prs, maxA1U)
+		for _, tuple := range tuples {
+			polys, fac := searchKleinjungTuple(n, d, cd, cdBig, m0, dBig, tuple)
+			if fac != nil {
+				return nil, fac
 			}
-			if tooBig || a1 <= 1 {
-				continue
+			out = append(out, polys...)
+		}
+	}
+	return out, nil
+}
+
+type kjPrimeRoots struct {
+	p  uint64
+	p2 uint64
+	rs []uint64
+}
+
+func chooseKleinjungTuples(prs []kjPrimeRoots, maxA1 uint64) [][]kjPrimeRoots {
+	var bestK int
+	for k := min(6, len(prs)); k >= 3; k-- {
+		prod := uint64(1)
+		ok := true
+		for i := 0; i < k; i++ {
+			if prod > maxA1/prs[i].p {
+				ok = false
+				break
 			}
-			a1Sq := a1 * a1
+			prod *= prs[i].p
+		}
+		if ok {
+			bestK = k
+			break
+		}
+	}
+	if bestK == 0 {
+		return nil
+	}
 
-			rems := []uint64{0}
-			mod := uint64(1)
-			for _, pr := range tuple {
-				invM, ok := arith.InvMod64(mod%pr.p2, pr.p2)
-				if !ok {
-					rems = nil
-					break
-				}
-				next := make([]uint64, 0, len(rems)*len(pr.rs))
-				for _, r0 := range rems {
-					r0m := r0 % pr.p2
-					for _, r1 := range pr.rs {
-						diff := (r1 + pr.p2 - r0m) % pr.p2
-						k := arith.MulMod64(diff, invM, pr.p2)
-						next = append(next, r0+k*mod)
-					}
-				}
-				rems = next
-				mod *= pr.p2
+	var out [][]kjPrimeRoots
+	for start := 0; start+bestK <= len(prs) && len(out) < 3; start++ {
+		cand := prs[start : start+bestK]
+		if tupleProductFits(cand, maxA1) {
+			out = append(out, cand)
+		}
+	}
+	if bestK < len(prs) && len(out) < 4 {
+		alt := make([]kjPrimeRoots, bestK)
+		copy(alt, prs[:bestK-1])
+		alt[bestK-1] = prs[bestK]
+		if tupleProductFits(alt, maxA1) {
+			out = append(out, alt)
+		}
+	}
+	return out
+}
+
+func tupleProductFits(tuple []kjPrimeRoots, maxA1 uint64) bool {
+	prod := uint64(1)
+	for _, pr := range tuple {
+		if prod > maxA1/pr.p {
+			return false
+		}
+		prod *= pr.p
+	}
+	return prod > 1
+}
+
+func buildHalfCRT(tuple []kjPrimeRoots) (mod uint64, modSq uint64, rems []uint64) {
+	mod = 1
+	modSq = 1
+	rems = []uint64{0}
+	for _, pr := range tuple {
+		invM, ok := arith.InvMod64(modSq%pr.p2, pr.p2)
+		if !ok {
+			return 0, 0, nil
+		}
+		next := make([]uint64, 0, len(rems)*len(pr.rs))
+		for _, r0 := range rems {
+			r0m := r0 % pr.p2
+			for _, r1 := range pr.rs {
+				diff := (r1 + pr.p2 - r0m) % pr.p2
+				k := arith.MulMod64(diff, invM, pr.p2)
+				next = append(next, r0+k*modSq)
 			}
-			if len(rems) == 0 {
-				continue
+		}
+		rems = next
+		mod *= pr.p
+		modSq *= pr.p2
+	}
+	return mod, modSq, rems
+}
+
+type kjHalfEntry struct {
+	frac float64
+	u1   uint64
+}
+
+func circFracDist(a, b float64) float64 {
+	d := math.Abs(a - b)
+	if d > 0.5 {
+		d = 1.0 - d
+	}
+	return d
+}
+
+// searchKleinjungTuple finds roots r mod (P1*P2)^2 minimizing |M - t_{d-1}*a_0^{d-1}|
+// by colliding fractional parts across the P1^2 and P2^2 halves.
+func searchKleinjungTuple(n *big.Int, d int, cd uint64, cdBig, m0, dBig *big.Int, tuple []kjPrimeRoots) ([]*Poly, *big.Int) {
+	mid := len(tuple) / 2
+	p1, p1Sq, rems1 := buildHalfCRT(tuple[:mid])
+	p2, p2Sq, rems2 := buildHalfCRT(tuple[mid:])
+	if len(rems1) == 0 || len(rems2) == 0 {
+		return nil, nil
+	}
+
+	a1 := p1 * p2
+	a1Big := new(big.Int).SetUint64(a1)
+	p1SqBig := new(big.Int).SetUint64(p1Sq)
+	p2SqBig := new(big.Int).SetUint64(p2Sq)
+	a1SqBig := new(big.Int).Mul(p1SqBig, p2SqBig)
+	halfA1Sq := new(big.Int).Rsh(a1SqBig, 1)
+	negHalfA1Sq := new(big.Int).Neg(halfA1Sq)
+
+	c1, ok1 := arith.InvMod64(p2Sq%p1Sq, p1Sq)
+	c2, ok2 := arith.InvMod64(p1Sq%p2Sq, p2Sq)
+	if !ok1 || !ok2 {
+		return nil, nil
+	}
+
+	// Compute target tau = frac((N - c_d*m0^d)/(a1^2 * m0^(d-1)) + d*c_d*(m0 mod a1^2)/a1^2).
+	m0d1 := new(big.Int).Exp(m0, big.NewInt(int64(d-1)), nil)
+	m0d := new(big.Int).Mul(m0d1, m0)
+	r0 := new(big.Int).Sub(n, new(big.Int).Mul(cdBig, m0d))
+	denom := new(big.Int).Mul(a1SqBig, m0d1)
+	r0Mod := new(big.Int).Mod(r0, denom)
+	f0, _ := new(big.Float).SetPrec(128).Quo(
+		new(big.Float).SetPrec(128).SetInt(r0Mod),
+		new(big.Float).SetPrec(128).SetInt(denom),
+	).Float64()
+
+	m0ModA1Sq := new(big.Int).Mod(m0, a1SqBig)
+	dcd := uint64(d) * cd
+	dcdM0 := new(big.Int).Mul(new(big.Int).SetUint64(dcd), m0ModA1Sq)
+	dcdM0.Mod(dcdM0, a1SqBig)
+	fShift, _ := new(big.Float).SetPrec(128).Quo(
+		new(big.Float).SetPrec(128).SetInt(dcdM0),
+		new(big.Float).SetPrec(128).SetInt(a1SqBig),
+	).Float64()
+
+	tau := f0 + fShift
+	tau -= math.Floor(tau)
+
+	table1 := make([]kjHalfEntry, len(rems1))
+	dcdMod1 := dcd % p1Sq
+	invP1SqF := 1.0 / float64(p1Sq)
+	for i, r1 := range rems1 {
+		u1 := arith.MulMod64(r1, c1, p1Sq)
+		t1 := arith.MulMod64(dcdMod1, u1, p1Sq)
+		table1[i] = kjHalfEntry{frac: float64(t1) * invP1SqF, u1: u1}
+	}
+	sort.Slice(table1, func(i, j int) bool { return table1[i].frac < table1[j].frac })
+
+	type pairCand struct {
+		u1, u2 uint64
+		dist   float64
+	}
+	const keepPairs = 32
+	bestPairs := make([]pairCand, 0, keepPairs)
+	dcdMod2 := dcd % p2Sq
+	invP2SqF := 1.0 / float64(p2Sq)
+	n1 := len(table1)
+
+	tryPair := func(u1, u2 uint64, dist float64) {
+		if len(bestPairs) < keepPairs {
+			bestPairs = append(bestPairs, pairCand{u1: u1, u2: u2, dist: dist})
+			for k := len(bestPairs) - 1; k > 0 && bestPairs[k].dist < bestPairs[k-1].dist; k-- {
+				bestPairs[k], bestPairs[k-1] = bestPairs[k-1], bestPairs[k]
 			}
+			return
+		}
+		if dist >= bestPairs[keepPairs-1].dist {
+			return
+		}
+		bestPairs[keepPairs-1] = pairCand{u1: u1, u2: u2, dist: dist}
+		for k := keepPairs - 1; k > 0 && bestPairs[k].dist < bestPairs[k-1].dist; k-- {
+			bestPairs[k], bestPairs[k-1] = bestPairs[k-1], bestPairs[k]
+		}
+	}
 
-			cdBig := new(big.Int).SetUint64(cd)
-			targetA0 := arith.NthRoot(new(big.Int).Quo(n, cdBig), d)
-			if targetA0.BitLen() <= maxA1Bits*2+4 {
-				continue
+	for _, r2 := range rems2 {
+		u2 := arith.MulMod64(r2, c2, p2Sq)
+		t2 := arith.MulMod64(dcdMod2, u2, p2Sq)
+		alpha2 := float64(t2) * invP2SqF
+		beta2 := tau - alpha2
+		beta2 -= math.Floor(beta2)
+
+		idx := sort.Search(n1, func(i int) bool { return table1[i].frac >= beta2 })
+		checkCount := min(6, n1)
+		startOff := -checkCount / 2
+		for off := 0; off < checkCount; off++ {
+			pos := (idx + startOff + off + n1) % n1
+			e := table1[pos]
+			tryPair(e.u1, u2, circFracDist(e.frac, beta2))
+		}
+	}
+
+	type rootCand struct {
+		a0     *big.Int
+		M      *big.Int
+		td1    *big.Int
+		remAbs *big.Int
+	}
+	var bestRoots []rootCand
+	var rBig, term2, delta, a0, a0d1, a0d, num, M, remCheck, td1, rem3, remAbs, rTmp big.Int
+
+	for _, pc := range bestPairs {
+		rBig.SetUint64(pc.u1)
+		rBig.Mul(&rBig, p2SqBig)
+		term2.SetUint64(pc.u2)
+		term2.Mul(&term2, p1SqBig)
+		rBig.Add(&rBig, &term2)
+		rBig.Mod(&rBig, a1SqBig)
+
+		delta.Sub(&rBig, m0ModA1Sq)
+		if delta.Cmp(halfA1Sq) > 0 {
+			delta.Sub(&delta, a1SqBig)
+		} else if delta.Cmp(negHalfA1Sq) <= 0 {
+			delta.Add(&delta, a1SqBig)
+		}
+		a0.Add(m0, &delta)
+		if a0.Sign() <= 0 {
+			continue
+		}
+		a0ModA1 := rTmp.Mod(&a0, a1Big).Uint64()
+		if arith.Gcd64(a0ModA1, a1) != 1 {
+			continue
+		}
+
+		a0d1.Exp(&a0, big.NewInt(int64(d-1)), nil)
+		a0d.Mul(&a0d1, &a0)
+		num.Mul(cdBig, &a0d)
+		num.Sub(n, &num)
+		M.QuoRem(&num, a1SqBig, &remCheck)
+		if remCheck.Sign() != 0 {
+			continue
+		}
+
+		roundQuoRem(&td1, &rem3, &M, &a0d1)
+		remAbs.Abs(&rem3)
+
+		if len(bestRoots) < 2 {
+			bestRoots = append(bestRoots, rootCand{
+				a0:     new(big.Int).Set(&a0),
+				M:      new(big.Int).Set(&M),
+				td1:    new(big.Int).Set(&td1),
+				remAbs: new(big.Int).Set(&remAbs),
+			})
+			sort.Slice(bestRoots, func(i, j int) bool { return bestRoots[i].remAbs.Cmp(bestRoots[j].remAbs) < 0 })
+		} else if remAbs.Cmp(bestRoots[1].remAbs) < 0 {
+			bestRoots[1] = rootCand{
+				a0:     new(big.Int).Set(&a0),
+				M:      new(big.Int).Set(&M),
+				td1:    new(big.Int).Set(&td1),
+				remAbs: new(big.Int).Set(&remAbs),
 			}
-			a1SqBig := new(big.Int).SetUint64(a1Sq)
-			tMod := new(big.Int).Mod(targetA0, a1SqBig).Uint64()
+			sort.Slice(bestRoots, func(i, j int) bool { return bestRoots[i].remAbs.Cmp(bestRoots[j].remAbs) < 0 })
+		}
+	}
 
-			type rootCand struct {
-				a0     *big.Int
-				M      *big.Int
-				td1    *big.Int
-				remAbs *big.Int
-			}
-			var bestRoots []rootCand
-			var a0, a0d, a0d1, num, M, remCheck, td1, rem3, remAbs big.Int
+	invA1ModN := new(big.Int).ModInverse(a1Big, n)
+	if invA1ModN == nil {
+		var g big.Int
+		g.GCD(nil, nil, a1Big, n)
+		if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
+			return nil, &g
+		}
+		return nil, nil
+	}
 
-			for _, r := range rems {
-				var delta int64
-				if r >= tMod {
-					dPos := r - tMod
-					if dPos > a1Sq/2 {
-						delta = -int64(a1Sq - dPos)
-					} else {
-						delta = int64(dPos)
-					}
-				} else {
-					dNeg := tMod - r
-					if dNeg > a1Sq/2 {
-						delta = int64(a1Sq - dNeg)
-					} else {
-						delta = -int64(dNeg)
-					}
-				}
-				a0.Add(targetA0, big.NewInt(delta))
-				if a0.Sign() <= 0 {
-					continue
-				}
-				a0ModA1 := rTmp.Mod(&a0, bigP.SetUint64(a1)).Uint64()
-				if arith.Gcd64(a0ModA1, a1) != 1 {
-					continue
-				}
-
-				a0d1.Exp(&a0, big.NewInt(int64(d-1)), nil)
-				a0d.Mul(&a0d1, &a0)
-				num.Mul(cdBig, &a0d)
-				num.Sub(n, &num)
-				M.QuoRem(&num, a1SqBig, &remCheck)
-				if remCheck.Sign() != 0 {
-					continue
-				}
-
-				roundQuoRem(&td1, &rem3, &M, &a0d1)
-				remAbs.Abs(&rem3)
-
-				if len(bestRoots) < 3 {
-					bestRoots = append(bestRoots, rootCand{
-						a0:     new(big.Int).Set(&a0),
-						M:      new(big.Int).Set(&M),
-						td1:    new(big.Int).Set(&td1),
-						remAbs: new(big.Int).Set(&remAbs),
-					})
-					sort.Slice(bestRoots, func(i, j int) bool { return bestRoots[i].remAbs.Cmp(bestRoots[j].remAbs) < 0 })
-				} else if remAbs.Cmp(bestRoots[2].remAbs) < 0 {
-					bestRoots[2] = rootCand{
-						a0:     new(big.Int).Set(&a0),
-						M:      new(big.Int).Set(&M),
-						td1:    new(big.Int).Set(&td1),
-						remAbs: new(big.Int).Set(&remAbs),
-					}
-					sort.Slice(bestRoots, func(i, j int) bool { return bestRoots[i].remAbs.Cmp(bestRoots[j].remAbs) < 0 })
-				}
-			}
-
-			a1Big := new(big.Int).SetUint64(a1)
-			invA1ModN := new(big.Int).ModInverse(a1Big, n)
-			if invA1ModN == nil {
-				var g big.Int
-				g.GCD(nil, nil, a1Big, n)
-				if g.Cmp(bigOne) > 0 && g.Cmp(n) < 0 {
-					return nil, &g
-				}
-				continue
-			}
-
-			for _, rc := range bestRoots {
-				p := expandKleinjungRoot(n, d, cdBig, a1, a1Big, rc.a0, rc.M, rc.td1, invA1ModN, dBig)
-				if p == nil {
-					continue
-				}
-				normed, fac := normalizePoly(p, n)
-				if fac != nil {
-					return nil, fac
-				}
-				if normed != nil {
-					out = append(out, normed)
-				}
-			}
+	var out []*Poly
+	for _, rc := range bestRoots {
+		p := expandKleinjungRoot(n, d, cdBig, a1, a1Big, rc.a0, rc.M, rc.td1, invA1ModN, dBig)
+		if p == nil {
+			continue
+		}
+		normed, fac := normalizePoly(p, n)
+		if fac != nil {
+			return nil, fac
+		}
+		if normed != nil {
+			out = append(out, normed)
 		}
 	}
 	return out, nil
@@ -1886,7 +2182,7 @@ func rootSieveOptimize(base *Poly, n *big.Int, pr *Params, maxSkew float64, pks 
 		}
 		rot.Skew = optimizeSkewnessBounded(rot, maxSkew)
 		rot.Alpha = ComputeAlpha(rot, 200)
-		sc := dickmanYieldScore(rot, pr)
+		sc := murphyYieldScore(rot, pr)
 		if sc < bestScore {
 			bestScore = sc
 			best = rot

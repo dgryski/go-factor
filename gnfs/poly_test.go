@@ -208,11 +208,115 @@ func TestSelectPolyKleinjungAndRootSieve(t *testing.T) {
 		if bfac == nil && base != nil {
 			pr := defaultParams(n)
 			base.Skew = optimizeSkewnessBounded(base, maxSkewForParams(pr))
-			gotScore := dickmanYieldScore(p, pr)
-			baseScore := dickmanYieldScore(base, pr)
+			gotScore := murphyYieldScore(p, pr)
+			baseScore := murphyYieldScore(base, pr)
 			if gotScore >= baseScore {
-				t.Errorf("%d bits got Dickman score %.2f >= monic base-m %.2f", n.BitLen(), gotScore, baseScore)
+				t.Errorf("%d bits got Murphy score %.2f >= monic base-m %.2f", n.BitLen(), gotScore, baseScore)
 			}
 		}
+	}
+}
+
+func TestDickmanRhoAndKleinjungCollision(t *testing.T) {
+	ref := [][2]float64{
+		{1.0, 1.0},
+		{2.0, 0.3068528194},
+		{3.0, 0.0486083883},
+		{4.0, 0.0049109256},
+		{5.0, 0.0003547247},
+		{6.0, 1.9649696e-5},
+		{7.0, 8.7456699e-7},
+		{8.0, 3.2320693e-8},
+	}
+	for _, tc := range ref {
+		got := dickmanRho(tc[0])
+		relErr := math.Abs(got-tc[1]) / tc[1]
+		if relErr > 2e-5 {
+			t.Fatalf("dickmanRho(%.0f) = %.9g, want %.9g (relErr %.2g)", tc[0], got, tc[1], relErr)
+		}
+	}
+
+	// Verify fractional collision finds the exact global minimum |M - t_{d-1}*a_0^{d-1}|.
+	rnd := rand.New(rand.NewSource(53))
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 166), testutil.RandomPrime(rnd, 166))
+	const d = 4
+	const cd = 420
+	var prs []kjPrimeRoots
+	for _, p64 := range arith.PrimesUpTo(400) {
+		p := uint64(p64)
+		if p < 5 || cd%p == 0 || d%p64 == 0 {
+			continue
+		}
+		if rs := rootsNthModP2(cd, n, d, p); len(rs) == d {
+			prs = append(prs, kjPrimeRoots{p: p, p2: p * p, rs: rs})
+			if len(prs) == 4 {
+				break
+			}
+		}
+	}
+	if len(prs) < 4 {
+		t.Skip("fewer than 4 splitting primes")
+	}
+
+	cdBig := big.NewInt(cd)
+	m0 := arith.NthRoot(new(big.Int).Quo(n, cdBig), d)
+	a1Check := uint64(1)
+	for _, pr := range prs {
+		a1Check *= pr.p
+	}
+	bound := new(big.Int).Mul(new(big.Int).SetUint64(a1Check*a1Check), big.NewInt(cd<<12))
+	if bound.Cmp(m0) > 0 {
+		t.Skip("a_1 too large for linearized collision bound")
+	}
+	dBig := big.NewInt(d)
+	gotPolys, fac := searchKleinjungTuple(n, d, cd, cdBig, m0, dBig, prs)
+	if fac != nil {
+		t.Skip("lucky factor")
+	}
+	if len(gotPolys) == 0 {
+		t.Fatal("searchKleinjungTuple returned 0 polynomials")
+	}
+
+	// Check all 4^4 = 256 CRT roots directly against gotPolys[0].
+	_, a1Sq, allRems := buildHalfCRT(prs)
+	a1 := uint64(1)
+	for _, pr := range prs {
+		a1 *= pr.p
+	}
+	a1SqBig := new(big.Int).SetUint64(a1Sq)
+	m0Mod := new(big.Int).Mod(m0, a1SqBig)
+	var minRem *big.Int
+	for _, r := range allRems {
+		delta := new(big.Int).Sub(new(big.Int).SetUint64(r), m0Mod)
+		if delta.Cmp(new(big.Int).Rsh(a1SqBig, 1)) > 0 {
+			delta.Sub(delta, a1SqBig)
+		} else if delta.Cmp(new(big.Int).Neg(new(big.Int).Rsh(a1SqBig, 1))) <= 0 {
+			delta.Add(delta, a1SqBig)
+		}
+		a0 := new(big.Int).Add(m0, delta)
+		if arith.Gcd64(new(big.Int).Mod(a0, new(big.Int).SetUint64(a1)).Uint64(), a1) != 1 {
+			continue
+		}
+		a0d1 := new(big.Int).Exp(a0, big.NewInt(d-1), nil)
+		a0d := new(big.Int).Mul(a0d1, a0)
+		M := new(big.Int).Quo(new(big.Int).Sub(n, new(big.Int).Mul(cdBig, a0d)), a1SqBig)
+		var td1, rem3 big.Int
+		roundQuoRem(&td1, &rem3, M, a0d1)
+		rem3.Abs(&rem3)
+		if minRem == nil || rem3.Cmp(minRem) < 0 {
+			minRem = new(big.Int).Set(&rem3)
+		}
+	}
+
+	// Recompute |M - td1*a0^(d-1)| for gotPolys[0]'s (A1, A0).
+	p0 := gotPolys[0]
+	a0d1 := new(big.Int).Exp(p0.A0, big.NewInt(d-1), nil)
+	a0d := new(big.Int).Mul(a0d1, p0.A0)
+	M0 := new(big.Int).Quo(new(big.Int).Sub(n, new(big.Int).Mul(p0.Coeffs[d], a0d)), a1SqBig)
+	var td1, gotRem big.Int
+	roundQuoRem(&td1, &gotRem, M0, a0d1)
+	gotRem.Abs(&gotRem)
+	if gotRem.Cmp(minRem) != 0 {
+		t.Fatalf("collision got |rem3|=%v, brute-force min=%v", &gotRem, minRem)
 	}
 }

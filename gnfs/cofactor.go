@@ -807,15 +807,15 @@ func isMultipleRoot(poly *Poly, r, p uint64) bool {
 }
 
 type cofactorScratch struct {
-	val, temp       big.Int
-	t1, t2          big.Int
-	bigA, bigB      big.Int
-	term            big.Int
-	bigP, q, rem    big.Int
-	aPows           []big.Int
-	bPows           []big.Int
-	ratCols         []int32
-	algCols         []int32
+	val, temp    big.Int
+	t1, t2       big.Int
+	bigA, bigB   big.Int
+	term         big.Int
+	bigP, q, rem big.Int
+	aPows        []big.Int
+	bPows        []big.Int
+	ratCols      []int32
+	algCols      []int32
 }
 
 func newCofactorScratch(deg int) *cofactorScratch {
