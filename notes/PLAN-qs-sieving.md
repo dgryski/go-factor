@@ -819,14 +819,15 @@ With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20�
    - Sieve $Y_2(x) = ((2Ax + B)^2 - kN)/(4A)$ with odd $B$ (choosing the sign of $B_{s-1}$ so $B$ is odd) and $X = (2Ax + B)(N+1)/2 \bmod N$, halving target $A$ and dividing sieve values by 4.
 4. **Done (`a09a31e`, `prunePartials`). Tighter zero-allocation partial recount**
    - Shrink the recount interval near `want`, track 1-LP excess incrementally in $O(1)$ without scanning partials, and prune 2-LP singletons in reusable flat `int32` adjacency slices instead of rebuilding `map[uint64][]int32` per recount. Cut 80-digit runtime to ~9.3s (`M = 128K`) and 8.86s (`M = 256K`, `small = 100`).
-5. **Retune factor base table, Double Large Primes, sieve width, and small-prime skip**
-   - Replace `L(N)^0.46` above ~200 bits with a smaller table-driven $B$ paired with Double Large Primes (`dlpMinBits`, `dlpSlackFrac`, higher `largePrimeMult`), `largeSieveRange` (`256K`), and higher `minSievePrime` (small-prime variation), swept after Priorities 1–2.4 are in place.
+5. **Done. Retune factor base table, Double Large Primes, sieve width, and small-prime skip**
+   - Log-linearly interpolated `siqsFBTable` (`190b: 110k`, `200b: 150k`, `232b: 300k`, `266b: 950k`, `298b: 2.4M`, `315b: 3.8M`, capped at `335b: 5.5M`), `M = 64K / 128K / 256K` (`largeSieveRange = 256K`), `minSievePrime` `30 / 80 / 100 / 120`, `largePrimeMult = 128` from 220 bits, and Double Large Primes enabled from `dlpMinBits = 245` (`dlpSlackFrac = 0.52`, `dlpMaxCofactor = 2^58`).
+   - Measured 15-worker runtimes: 60b `259µs` (was `361µs`), 100b `1.43ms` (was `2.44ms`), 160b `23.1ms` (was `33.5ms`), 200b/60d `188ms` (was `320ms`), 232b/70d `1.23s` (was `~2.3s`), 266b/80d ref `8.77s` (was `16.45s`), 297b/90d `54.79s` (was `2m11s`), 314b/95d `3m42.2s` (was `9m06s`).
 
 ### Priority 3 (Pipeline, robustness, and vectorisation)
 
 6. **Done (`bf0508f`). Combine all 64 Lanczos dependencies by GCD** (`splitAll` / `refineDependencies`) so composites with 3+ factors split from one matrix without re-sieving composite cofactors.
 7. **Done (`bf0508f`). Sieve additional relations if all dependencies are trivial** (`maxSieveRetries = 3`, resuming `aRng`/`aSeen`) instead of returning `nil`.
-8. **Raise `qsMaxBits` to the QS/GNFS crossover (~95 digits)** and retune the parallel ECM pretest share in `factor/budget.go`.
+8. **Raise `qsMaxBits` to the QS/GNFS crossover** and retune the parallel ECM pretest share in `factor/budget.go`.
 9. **Done (`787e8ea`). Single `n mod p` setup pass** (`limbs32`, `modLimbs`, `prepareFactorBase`) combining trial division, Legendre symbol, and modular square root setup.
 10. **Profiled (`< 2%` CPU). Small P−1 / ECM cofactor split** ahead of `rho64`: profiling 80-digit DLP (`B = 500k, lpm = 128, frac = 0.48`) showed `Rho64` at 1.38% CPU and `IsPrime64` at 0.53% CPU, so `Rho64` is not a bottleneck at QS sizes.
-11. **SIMD / `avo` inner sieve and medium-prime kernel** after algorithmic and parameter changes settle.
+11. **Skipped. SIMD / `avo` inner sieve and medium-prime kernel.**
