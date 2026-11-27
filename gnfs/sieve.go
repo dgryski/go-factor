@@ -919,7 +919,7 @@ func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs 
 		i, j             int
 		a, b             int64
 		colStart, colEnd int
-		ratLPs           [2]uint64
+		ratLPs           [3]uint64
 	}
 
 	for w := 0; w < nw; w++ {

@@ -973,7 +973,38 @@ func buildSemiSmoothCurve(b1 int64, lpBound uint64, mfb, maxLP int) semiSmoothCu
 			}
 			p2 *= dv1
 		}
-		tot := p0 + p1 + p2
+		var p3 float64
+		if maxLP >= 3 && mfbMax > 3.0 {
+			const q3N = 8
+			for j := 0; j < q1N; j++ {
+				t1 := 1.0 + (float64(j)+0.5)*dv1
+				hi2 := min(vMax, (mfbMax-t1)*0.5)
+				if hi2 <= t1 {
+					break
+				}
+				dv2 := (hi2 - t1) / q3N
+				var midSum float64
+				for m := 0; m < q3N; m++ {
+					t2 := t1 + (float64(m)+0.5)*dv2
+					hi3 := min(vMax, mfbMax-t1-t2)
+					if hi3 <= t2 {
+						break
+					}
+					dv3 := (hi3 - t2) / q3N
+					var in3 float64
+					for l := 0; l < q3N; l++ {
+						t3 := t2 + (float64(l)+0.5)*dv3
+						if u >= t1+t2+t3 {
+							in3 += dickmanRho(u-t1-t2-t3) / t3
+						}
+					}
+					midSum += (in3 * dv3) / t2
+				}
+				p3 += (midSum * dv2) / t1
+			}
+			p3 *= dv1
+		}
+		tot := p0 + p1 + p2 + p3
 		if tot > 1.0 {
 			tot = 1.0
 		}

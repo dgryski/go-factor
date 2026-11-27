@@ -20,7 +20,7 @@ type Relation struct {
 	A, B    int64
 	RatCols []int32      // RFB indices (with multiplicity)
 	AlgCols []int32      // AFB indices (with multiplicity, including special-q if <= Ba)
-	RatLPs  [2]uint64    // rational large primes (0 if absent)
+	RatLPs  [3]uint64    // rational large primes (0 if absent)
 	AlgLPs  []LargeIdeal // algebraic large ideals (including special-q if > Ba)
 	IsFree  bool
 }
@@ -33,8 +33,8 @@ type Params struct {
 	LpBoundAlg     uint64 // algebraic large prime bound
 	MfbRat         int    // max cofactor bits on rational side
 	MfbAlg         int    // max cofactor bits on algebraic side
-	MaxLPRat       int    // 1 or 2 large primes on rational side
-	MaxLPAlg       int    // 1 or 2 large primes on algebraic side
+	MaxLPRat       int    // 1, 2, or 3 large primes on rational side
+	MaxLPAlg       int    // 1, 2, or 3 large primes on algebraic side
 	QMin, QMax     uint64 // special-q range (if lattice sieve is used)
 	IHalf          int    // lattice sieve i in [-IHalf, IHalf)
 	JMax           int    // lattice sieve j in [1, JMax)
@@ -47,26 +47,11 @@ type Params struct {
 	RelTargetRatio float64 // expected relations / LP ideals (0 uses defaultRelTargetRatio)
 }
 
-// splitCofactor splits c (already divided by all primes <= pMax) into 1 or 2
+// splitCofactor splits c (already divided by all primes <= pMax) into up to maxLP
 // primes each <= lpBound, returning them sorted ascending.
-func splitCofactor(c, pMax, lpBound uint64, maxLP int, mfb int) ([2]uint64, bool) {
-	if c == 1 {
-		return [2]uint64{}, true
-	}
-	if mfb > 0 && bits.Len64(c) > mfb {
-		return [2]uint64{}, false
-	}
-	if c <= lpBound && (c < pMax*pMax || arith.IsPrime64(c)) {
-		return [2]uint64{c, 0}, true
-	}
-	if maxLP < 2 {
-		return [2]uint64{}, false
-	}
-	lp1, lp2, ok := arith.SplitCofactor(c, pMax, lpBound)
-	if !ok {
-		return [2]uint64{}, false
-	}
-	return [2]uint64{lp1, lp2}, true
+func splitCofactor(c, pMax, lpBound uint64, maxLP int, mfb int) ([3]uint64, bool) {
+	ns := normState{hi: 0, lo: c, use128: true}
+	return splitNormCofactor(&ns, pMax, lpBound, maxLP, mfb)
 }
 
 // divRem128 divides (hi, lo) by d (d > 0) and returns quotient (qHi, qLo) and remainder r.
@@ -177,10 +162,10 @@ func cofactorRatLattice(
 	ratAll []int32,
 	ratHits []int32,
 	sc *cofactorScratch,
-) (ratCols []int32, ratLPs [2]uint64, ok bool) {
+) (ratCols []int32, ratLPs [3]uint64, ok bool) {
 	gVal := evalGInto(&sc.val, poly, a, b, sc)
 	if gVal.Sign() == 0 {
-		return nil, [2]uint64{}, false
+		return nil, [3]uint64{}, false
 	}
 	temp := sc.temp.Abs(gVal)
 	var ns normState
@@ -243,15 +228,9 @@ func cofactorRatLattice(
 		addMult(idx, uint64(fb.RFB[idx].P))
 	}
 
-	rem64, fits := ns.uint64Val()
-	if !fits {
-		return nil, [2]uint64{}, false
-	}
-	if rem64 != 1 {
-		ratLPs, ok = splitCofactor(rem64, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
-		if !ok {
-			return nil, [2]uint64{}, false
-		}
+	ratLPs, ok = splitNormCofactor(&ns, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
+	if !ok {
+		return nil, [3]uint64{}, false
 	}
 	return cols, ratLPs, true
 }
@@ -265,7 +244,7 @@ func cofactorAlgLattice(
 	i, j int,
 	a, b int64,
 	ratCols []int32,
-	ratLPs [2]uint64,
+	ratLPs [3]uint64,
 	algSmall []int32,
 	algLines []linePrime,
 	algVerts []vertPrime,
@@ -354,25 +333,19 @@ func cofactorAlgLattice(
 		addMult(idx, uint64(fb.AFB[idx].P))
 	}
 
-	rem64, fits := ns.uint64Val()
-	if !fits {
+	lps, ok := splitNormCofactor(&ns, uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
+	if !ok {
 		return Relation{}, false
 	}
-	if rem64 != 1 {
-		lps, ok := splitCofactor(rem64, uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
+	for _, lp := range lps {
+		if lp == 0 {
+			continue
+		}
+		ideal, ok := makeLargeIdeal(poly, a, b, lp)
 		if !ok {
 			return Relation{}, false
 		}
-		for _, lp := range lps {
-			if lp == 0 {
-				continue
-			}
-			ideal, ok := makeLargeIdeal(poly, a, b, lp)
-			if !ok {
-				return Relation{}, false
-			}
-			algLPs = append(algLPs, ideal)
-		}
+		algLPs = append(algLPs, ideal)
 	}
 
 	return Relation{
@@ -427,17 +400,9 @@ func cofactorCandidate(
 		divRat(idx, uint64(fb.RFB[idx].P))
 	}
 
-	remRat, fits := ns.uint64Val()
-	if !fits {
+	ratLPs, ok := splitNormCofactor(&ns, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
+	if !ok {
 		return Relation{}, false
-	}
-	var ratLPs [2]uint64
-	if remRat != 1 {
-		var ok bool
-		ratLPs, ok = splitCofactor(remRat, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
-		if !ok {
-			return Relation{}, false
-		}
 	}
 
 	fVal := evalFInto(&sc.val, poly, a, b, sc)
@@ -484,25 +449,19 @@ func cofactorCandidate(
 		divAlg(idx, uint64(fb.AFB[idx].P))
 	}
 
-	remAlg, fits := ns.uint64Val()
-	if !fits {
+	lps, ok := splitNormCofactor(&ns, uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
+	if !ok {
 		return Relation{}, false
 	}
-	if remAlg != 1 {
-		lps, ok := splitCofactor(remAlg, uint64(p.Ba), p.LpBoundAlg, p.MaxLPAlg, p.MfbAlg)
+	for _, lp := range lps {
+		if lp == 0 {
+			continue
+		}
+		ideal, ok := makeLargeIdeal(poly, a, b, lp)
 		if !ok {
 			return Relation{}, false
 		}
-		for _, lp := range lps {
-			if lp == 0 {
-				continue
-			}
-			ideal, ok := makeLargeIdeal(poly, a, b, lp)
-			if !ok {
-				return Relation{}, false
-			}
-			algLPs = append(algLPs, ideal)
-		}
+		algLPs = append(algLPs, ideal)
 	}
 
 	return Relation{
@@ -548,11 +507,11 @@ func cofactorPair(
 		}
 		up := uint64(a)
 		var ratCols []int32
-		var ratLPs [2]uint64
+		var ratLPs [3]uint64
 		if idx, ok := fb.RatLookup[uint32(up)]; ok && up <= uint64(p.Br) {
 			ratCols = []int32{idx}
 		} else if up <= p.LpBoundRat {
-			ratLPs = [2]uint64{up, 0}
+			ratLPs = [3]uint64{up, 0, 0}
 		} else {
 			return Relation{}, false
 		}
@@ -627,17 +586,9 @@ func cofactorPair(
 			}
 		}
 	}
-	remRat, fits := ns.uint64Val()
-	if !fits {
+	ratLPs, ok := splitNormCofactor(&ns, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
+	if !ok {
 		return Relation{}, false
-	}
-	var ratLPs [2]uint64
-	if remRat != 1 {
-		var ok bool
-		ratLPs, ok = splitCofactor(remRat, uint64(p.Br), p.LpBoundRat, p.MaxLPRat, p.MfbRat)
-		if !ok {
-			return Relation{}, false
-		}
 	}
 
 	fVal := evalFInto(&sc.val, poly, a, b, sc)
@@ -694,10 +645,13 @@ func factorSavedAlgCofactor(ns *normState, temp *big.Int, ba, lpBound, qcMin uin
 			return nil, true
 		}
 		if lps, ok := splitCofactor(u, ba, lpBound, maxLP, 0); ok {
-			if lps[1] != 0 {
-				return []uint64{lps[0], lps[1]}, true
+			var out []uint64
+			for _, lp := range lps {
+				if lp != 0 {
+					out = append(out, lp)
+				}
 			}
-			return []uint64{lps[0]}, true
+			return out, true
 		}
 		var facs []uint64
 		if !factorUint64Into(u, &facs) {
@@ -706,26 +660,32 @@ func factorSavedAlgCofactor(ns *normState, temp *big.Int, ba, lpBound, qcMin uin
 		return checkSavedAlgPrimes(facs, lpBound, qcMin, maxLP)
 	}
 
-	// Cofactor > 64 bits (only possible when special-q * lp1 * lp2 >= 2^64).
-	var cur big.Int
 	if ns.use128 {
-		cur.SetUint64(ns.hi)
-		cur.Lsh(&cur, 64)
-		cur.Or(&cur, new(big.Int).SetUint64(ns.lo))
-	} else {
-		cur.Set(temp)
+		var facs []uint64
+		if !factorU128Into(u128{hi: ns.hi, lo: ns.lo}, &facs) {
+			return nil, false
+		}
+		return checkSavedAlgPrimes(facs, lpBound, qcMin, maxLP)
 	}
-	if cur.BitLen() > 96 {
+
+	if temp.BitLen() > 160 {
 		return nil, false
 	}
+	var cur big.Int
+	cur.Set(temp)
 	var facs []uint64
 	for !cur.IsUint64() {
+		if hi, lo, ok := bigToU128(&cur); ok {
+			if !factorU128Into(u128{hi: hi, lo: lo}, &facs) {
+				return nil, false
+			}
+			return checkSavedAlgPrimes(facs, lpBound, qcMin, maxLP)
+		}
 		d := rhoBig(&cur)
 		if d == nil || !d.IsUint64() {
 			return nil, false
 		}
-		du := d.Uint64()
-		if !factorUint64Into(du, &facs) {
+		if !factorUint64Into(d.Uint64(), &facs) {
 			return nil, false
 		}
 		cur.Quo(&cur, d)

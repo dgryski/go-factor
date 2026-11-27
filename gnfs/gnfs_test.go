@@ -320,9 +320,9 @@ func TestFreeRelationsAndLPFilter(t *testing.T) {
 	// Verify incremental lpFilter recounts match pruneSingletons across steps.
 	synth := []Relation{
 		{A: 3, B: 1},
-		{A: 5, B: 1, RatLPs: [2]uint64{20011, 0}},
-		{A: 7, B: 1, RatLPs: [2]uint64{20011, 20021}},
-		{A: 9, B: 1, RatLPs: [2]uint64{20021, 0}, AlgLPs: []LargeIdeal{{P: 20029, R: 4}}},
+		{A: 5, B: 1, RatLPs: [3]uint64{20011}},
+		{A: 7, B: 1, RatLPs: [3]uint64{20011, 20021}},
+		{A: 9, B: 1, RatLPs: [3]uint64{20021}, AlgLPs: []LargeIdeal{{P: 20029, R: 4}}},
 		{A: 11, B: 1, AlgLPs: []LargeIdeal{{P: 20029, R: 4}}},
 		{A: 13, B: 1, AlgLPs: []LargeIdeal{{P: 20029, R: 5}}},
 	}

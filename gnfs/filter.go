@@ -58,7 +58,7 @@ func oddLPKeysInto(dst []lpKey, rel *Relation) []lpKey {
 // oddLPKeys returns the distinct large prime keys appearing an odd number of
 // times in rel.
 func oddLPKeys(rel *Relation) []lpKey {
-	var buf [8]lpKey
+	var buf [12]lpKey
 	keys := oddLPKeysInto(buf[:0], rel)
 	if len(keys) == 0 {
 		return nil
@@ -95,7 +95,7 @@ func newLPFilter(capHint int) *lpFilter {
 }
 
 func (f *lpFilter) add(rel *Relation) {
-	var buf [8]lpKey
+	var buf [12]lpKey
 	keys := oddLPKeysInto(buf[:0], rel)
 	for _, k := range keys {
 		id, ok := f.idMap[k]
@@ -236,7 +236,7 @@ func buildMatrix(poly *Poly, fb *FactorBases, rels []Relation) (surviving []Rela
 
 	var scratchVal = newCofactorScratch(poly.Degree)
 	var factors []int32
-	var lpBuf [8]lpKey
+	var lpBuf [12]lpKey
 	for i := range rels {
 		if !alive[i] {
 			continue
