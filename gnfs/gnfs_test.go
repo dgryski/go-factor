@@ -336,3 +336,63 @@ func TestFreeRelationsAndLPFilter(t *testing.T) {
 		}
 	}
 }
+
+func TestCavallarCliquePruningAndPointEvalMul(t *testing.T) {
+	// Build a relation set with excess > KeepSurplus + 16 and verify clique pruning
+	// drops multi relation weight 2 trees down to targetExcess cleanly.
+	fb := &FactorBases{NumFixed: 10}
+	var rels []Relation
+	for i := 0; i < 85; i++ {
+		rels = append(rels, Relation{A: int64(2*i + 3), B: 1})
+	}
+	for k := 0; k < 50; k++ {
+		lp := uint64(50000 + 2*k + 1)
+		rels = append(rels,
+			Relation{A: int64(1000 + 2*k + 1), B: 1, RatCols: make([]int32, k%5+1), RatLPs: [3]uint64{lp}},
+			Relation{A: int64(2000 + 2*k + 1), B: 1, RatCols: make([]int32, k%7+1), RatLPs: [3]uint64{lp}},
+		)
+	}
+	// Initial 185 relations minus 50 active LPs and 10 fixed columns gives 125 excess.
+	ex, alive, lpCols := pruneSingletons(rels, fb)
+	const wantEx = linalg.KeepSurplus + 16
+	if ex != wantEx {
+		t.Fatalf("clique pruned excess = %d, want %d", ex, wantEx)
+	}
+	aliveCount := 0
+	for _, a := range alive {
+		if a {
+			aliveCount++
+		}
+	}
+	if aliveCount-len(lpCols)-fb.NumFixed != wantEx {
+		t.Fatalf("inconsistent alive=%d lpCols=%d excess=%d", aliveCount, len(lpCols), ex)
+	}
+
+	// Verify point evaluation polynomial convolution matches schoolbook for d = 3, 4, 5.
+	rnd := rand.New(rand.NewSource(91))
+	for _, d := range []int{3, 4, 5} {
+		for _, bits := range []int{5000, 36000} {
+			lim := new(big.Int).Lsh(bigOne, uint(bits))
+			a := make([]*big.Int, d)
+			b := make([]*big.Int, d)
+			for i := 0; i < d; i++ {
+				a[i] = new(big.Int).Sub(new(big.Int).Rand(rnd, lim), new(big.Int).Rsh(lim, 1))
+				b[i] = new(big.Int).Sub(new(big.Int).Rand(rnd, lim), new(big.Int).Rsh(lim, 1))
+			}
+			got := polyConvolveBig(a, b, d, true)
+			want := polyConvolveSchoolbook(a, b, d)
+			for i := range want {
+				if got[i].Cmp(want[i]) != 0 {
+					t.Fatalf("d=%d bits=%d coeff %d mismatch", d, bits, i)
+				}
+			}
+			gotSq := polyConvolveBig(a, a, d, true)
+			wantSq := polyConvolveSchoolbook(a, a, d)
+			for i := range wantSq {
+				if gotSq[i].Cmp(wantSq[i]) != 0 {
+					t.Fatalf("d=%d bits=%d sqr coeff %d mismatch", d, bits, i)
+				}
+			}
+		}
+	}
+}

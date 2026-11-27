@@ -196,14 +196,18 @@ func (f *lpFilter) excess(numFixed int) int {
 	return (numRels - numDead) - activeLPs - numFixed
 }
 
-// pruneSingletons iteratively removes relations containing a large prime ideal
-// of weight 1 until a 2-core remains.
+// pruneSingletons iteratively removes singleton ideals and, when surplus exceeds
+// KeepSurplus + 16, prunes heavy weight 2 LP cliques (Cavallar, ANTS IV 2000, Section 3.2).
 func pruneSingletons(rels []Relation, fb *FactorBases) (excess int, alive []bool, lpCols map[lpKey]int32) {
 	f := newLPFilter(len(rels))
 	for i := range rels {
 		f.add(&rels[i])
 	}
 	excess = f.excess(fb.NumFixed)
+	const targetExcess = linalg.KeepSurplus + 16
+	if excess > targetExcess {
+		excess = f.pruneCliques(rels, fb.NumFixed, targetExcess)
+	}
 
 	alive = make([]bool, len(rels))
 	for i := range rels {
@@ -227,6 +231,205 @@ func pruneSingletons(rels []Relation, fb *FactorBases) (excess int, alive []bool
 		lpCols[k] = int32(fb.NumFixed + i)
 	}
 	return excess, alive, lpCols
+}
+
+func (f *lpFilter) isDead(r int32) bool {
+	return f.dead[r>>6]&(1<<(uint(r)&63)) != 0
+}
+
+func (f *lpFilter) pruneCliques(rels []Relation, numFixed, targetExcess int) int {
+	numRels := len(rels)
+	numLP := len(f.keys)
+	numDead := 0
+	for r := 0; r < numRels; r++ {
+		if f.isDead(int32(r)) {
+			numDead++
+		}
+	}
+	activeLPs := 0
+	for id := 0; id < numLP; id++ {
+		if f.deg[id] > 0 {
+			activeLPs++
+		}
+	}
+	curExcess := (numRels - numDead) - activeLPs - numFixed
+	if curExcess <= targetExcess {
+		return curExcess
+	}
+
+	// Build adjacency across live relations linked by weight 2 LP ideals.
+	relDeg2Count := make([]int32, numRels)
+	type edge2 struct{ u, v int32 }
+	var edges []edge2
+	for id := 0; id < numLP; id++ {
+		if f.deg[id] != 2 {
+			continue
+		}
+		var pair [2]int32
+		n := 0
+		for pos := f.head[id]; pos < f.head[id+1]; pos++ {
+			r := f.adj[pos]
+			if !f.isDead(r) {
+				if n < 2 {
+					pair[n] = r
+				}
+				n++
+			}
+		}
+		if n == 2 && pair[0] != pair[1] {
+			edges = append(edges, edge2{pair[0], pair[1]})
+			relDeg2Count[pair[0]]++
+			relDeg2Count[pair[1]]++
+		}
+	}
+	if len(edges) == 0 {
+		return curExcess
+	}
+
+	rHead := make([]int32, numRels+1)
+	rCur := make([]int32, numRels)
+	var totalAdj int32
+	for r := 0; r < numRels; r++ {
+		rHead[r] = totalAdj
+		rCur[r] = totalAdj
+		totalAdj += relDeg2Count[r]
+	}
+	rHead[numRels] = totalAdj
+	rAdj := make([]int32, totalAdj)
+	for _, e := range edges {
+		rAdj[rCur[e.u]] = e.v
+		rCur[e.u]++
+		rAdj[rCur[e.v]] = e.u
+		rCur[e.v]++
+	}
+
+	type cliqueCand struct {
+		rels   []int32
+		weight int32
+	}
+	visited := make([]bool, numRels)
+	var cliques []cliqueCand
+	var comp []int32
+	for r := 0; r < numRels; r++ {
+		if relDeg2Count[r] == 0 || visited[r] {
+			continue
+		}
+		comp = comp[:0]
+		visited[r] = true
+		comp = append(comp, int32(r))
+		var edgeTwice int
+		for head := 0; head < len(comp); head++ {
+			u := comp[head]
+			for pos := rHead[u]; pos < rHead[u+1]; pos++ {
+				v := rAdj[pos]
+				edgeTwice++
+				if !visited[v] {
+					visited[v] = true
+					comp = append(comp, v)
+				}
+			}
+		}
+		if len(comp) >= 2 && len(comp) == edgeTwice/2+1 {
+			var w int32
+			for _, u := range comp {
+				w += int32(len(rels[u].RatCols)+len(rels[u].AlgCols)) + (f.relOff[u+1] - f.relOff[u])
+			}
+			cliques = append(cliques, cliqueCand{
+				rels:   append([]int32(nil), comp...),
+				weight: w,
+			})
+		}
+	}
+	if len(cliques) == 0 {
+		return curExcess
+	}
+
+	sort.Slice(cliques, func(i, j int) bool {
+		if cliques[i].weight != cliques[j].weight {
+			return cliques[i].weight > cliques[j].weight
+		}
+		return cliques[i].rels[0] < cliques[j].rels[0]
+	})
+
+	lpTouch := make([]int32, numLP)
+	var touched []int32
+	for _, cl := range cliques {
+		if curExcess <= targetExcess {
+			break
+		}
+		allAlive := true
+		touched = touched[:0]
+		for _, r := range cl.rels {
+			if f.isDead(r) {
+				allAlive = false
+				break
+			}
+			for p := f.relOff[r]; p < f.relOff[r+1]; p++ {
+				q := f.relIDs[p]
+				if lpTouch[q] == 0 {
+					touched = append(touched, q)
+				}
+				lpTouch[q]++
+			}
+		}
+		safe := allAlive
+		if safe {
+			for _, q := range touched {
+				rem := f.deg[q] - lpTouch[q]
+				if rem == 1 || (rem == 0 && f.deg[q] != 2) {
+					safe = false
+					break
+				}
+			}
+		}
+		for _, q := range touched {
+			lpTouch[q] = 0
+		}
+		if !safe {
+			continue
+		}
+
+		// Delete cl.rels[0] and cascade singletons across the tree.
+		r0 := cl.rels[0]
+		f.dead[r0>>6] |= 1 << (uint(r0) & 63)
+		numDead++
+		f.queue = f.queue[:0]
+		for p := f.relOff[r0]; p < f.relOff[r0+1]; p++ {
+			q := f.relIDs[p]
+			f.deg[q]--
+			if f.deg[q] == 0 {
+				activeLPs--
+			} else if f.deg[q] == 1 {
+				f.queue = append(f.queue, q)
+			}
+		}
+		for len(f.queue) > 0 {
+			id := f.queue[len(f.queue)-1]
+			f.queue = f.queue[:len(f.queue)-1]
+			if f.deg[id] != 1 {
+				continue
+			}
+			for pos := f.head[id]; pos < f.head[id+1]; pos++ {
+				r := f.adj[pos]
+				if f.isDead(r) {
+					continue
+				}
+				f.dead[r>>6] |= 1 << (uint(r) & 63)
+				numDead++
+				for p := f.relOff[r]; p < f.relOff[r+1]; p++ {
+					q := f.relIDs[p]
+					f.deg[q]--
+					if f.deg[q] == 0 {
+						activeLPs--
+					} else if f.deg[q] == 1 {
+						f.queue = append(f.queue, q)
+					}
+				}
+			}
+		}
+		curExcess = (numRels - numDead) - activeLPs - numFixed
+	}
+	return curExcess
 }
 
 // buildMatrix prunes singletons and constructs the sparse GF(2) rows for SGE + Block Lanczos.

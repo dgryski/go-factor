@@ -171,7 +171,7 @@ func computeGamma(selected []Relation, cd *big.Int, fHat, fHatDeriv []*big.Int) 
 			return items[0]
 		}
 		if len(items) == 2 {
-			return polyAlgMulMod(items[0], items[1], fHat)
+			return polyAlgMulModPar(items[0], items[1], fHat, depth == 0)
 		}
 		mid := len(items) / 2
 		var left, right []*big.Int
@@ -188,7 +188,7 @@ func computeGamma(selected []Relation, cd *big.Int, fHat, fHatDeriv []*big.Int) 
 			left = treeMul(items[:mid], depth+1)
 			right = treeMul(items[mid:], depth+1)
 		}
-		return polyAlgMulMod(left, right, fHat)
+		return polyAlgMulModPar(left, right, fHat, depth == 0)
 	}
 
 	prod := treeMul(factors, 0)
@@ -201,11 +201,139 @@ func computeGamma(selected []Relation, cd *big.Int, fHat, fHatDeriv []*big.Int) 
 		}
 	}
 	fDerivSq := polyAlgMulMod(fDeriv, fDeriv, fHat)
-	return polyAlgMulMod(fDerivSq, prod, fHat)
+	return polyAlgMulModPar(fDerivSq, prod, fHat, true)
 }
 
 func polyAlgMulMod(a, b, fHat []*big.Int) []*big.Int {
+	return polyAlgMulModPar(a, b, fHat, false)
+}
+
+func polyAlgMulModPar(a, b, fHat []*big.Int, allowPar bool) []*big.Int {
 	d := len(fHat) - 1
+	prod := polyConvolveBig(a, b, d, allowPar)
+	var tmp big.Int
+	// Reduce mod monic fHat (fHat[d] == 1).
+	for k := len(prod) - 1; k >= d; k-- {
+		if prod[k].Sign() == 0 {
+			continue
+		}
+		ck := prod[k]
+		shift := k - d
+		for j := 0; j < d; j++ {
+			if fHat[j].Sign() != 0 {
+				tmp.Mul(ck, fHat[j])
+				prod[shift+j].Sub(prod[shift+j], &tmp)
+			}
+		}
+	}
+	return prod[:d]
+}
+
+// polyConvolveBig multiplies degree < d polynomials via 2d - 1 symmetric integer
+// point evaluations and Newton forward differences when coefficients >= 4096 bits.
+func polyConvolveBig(a, b []*big.Int, d int, allowPar bool) []*big.Int {
+	maxBits := 0
+	for i := 0; i < d; i++ {
+		if bl := a[i].BitLen(); bl > maxBits {
+			maxBits = bl
+		}
+		if bl := b[i].BitLen(); bl > maxBits {
+			maxBits = bl
+		}
+	}
+	if d < 3 || maxBits < 4096 {
+		return polyConvolveSchoolbook(a, b, d)
+	}
+
+	mDeg := 2*d - 2
+	nPts := mDeg + 1
+	same := len(a) > 0 && len(b) > 0 && a[0] == b[0]
+	if same {
+		for i := 1; i < d; i++ {
+			if a[i] != b[i] {
+				same = false
+				break
+			}
+		}
+	}
+
+	evalAt := func(poly []*big.Int, x int64) *big.Int {
+		if x == 0 {
+			return new(big.Int).Set(poly[0])
+		}
+		res := new(big.Int).Set(poly[d-1])
+		var xBig big.Int
+		xBig.SetInt64(x)
+		for i := d - 2; i >= 0; i-- {
+			res.Mul(res, &xBig)
+			res.Add(res, poly[i])
+		}
+		return res
+	}
+
+	y := make([]*big.Int, nPts)
+	nw := Workers
+	if nw <= 0 {
+		nw = runtime.GOMAXPROCS(0)
+	}
+	if allowPar && maxBits >= 32768 && nw > 1 {
+		var wg sync.WaitGroup
+		for k := 0; k < nPts; k++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				xk := int64(idx - (d - 1))
+				va := evalAt(a, xk)
+				if same {
+					y[idx] = va.Mul(va, va)
+				} else {
+					vb := evalAt(b, xk)
+					y[idx] = va.Mul(va, vb)
+				}
+			}(k)
+		}
+		wg.Wait()
+	} else {
+		for k := 0; k < nPts; k++ {
+			xk := int64(k - (d - 1))
+			va := evalAt(a, xk)
+			if same {
+				y[k] = va.Mul(va, va)
+			} else {
+				vb := evalAt(b, xk)
+				y[k] = va.Mul(va, vb)
+			}
+		}
+	}
+
+	var stepBig, rem big.Int
+	for step := 1; step <= mDeg; step++ {
+		stepBig.SetInt64(int64(step))
+		for k := mDeg; k >= step; k-- {
+			y[k].Sub(y[k], y[k-1])
+			y[k].QuoRem(y[k], &stepBig, &rem)
+		}
+	}
+
+	prod := make([]*big.Int, nPts)
+	for i := range prod {
+		prod[i] = new(big.Int)
+	}
+	prod[0].Set(y[mDeg])
+	var xjBig, term big.Int
+	for j := mDeg - 1; j >= 0; j-- {
+		xjBig.SetInt64(int64(j - (d - 1)))
+		for k := mDeg - j; k >= 1; k-- {
+			term.Mul(prod[k], &xjBig)
+			prod[k].Sub(prod[k-1], &term)
+		}
+		term.Mul(prod[0], &xjBig)
+		prod[0].Sub(y[j], &term)
+	}
+	return prod
+}
+
+func polyConvolveSchoolbook(a, b []*big.Int, d int) []*big.Int {
 	prod := make([]*big.Int, 2*d-1)
 	for i := range prod {
 		prod[i] = new(big.Int)
@@ -223,21 +351,7 @@ func polyAlgMulMod(a, b, fHat []*big.Int) []*big.Int {
 			prod[i+j].Add(prod[i+j], &tmp)
 		}
 	}
-	// Reduce mod monic fHat (fHat[d] == 1).
-	for k := len(prod) - 1; k >= d; k-- {
-		if prod[k].Sign() == 0 {
-			continue
-		}
-		ck := prod[k]
-		shift := k - d
-		for j := 0; j < d; j++ {
-			if fHat[j].Sign() != 0 {
-				tmp.Mul(ck, fHat[j])
-				prod[shift+j].Sub(prod[shift+j], &tmp)
-			}
-		}
-	}
-	return prod[:d]
+	return prod
 }
 
 // boundBetaBits computes an upper bound in bits for max_i |beta_i|.
@@ -591,12 +705,60 @@ func algebraicSqrt(gamma, fHat []*big.Int, cd *big.Int, boundBits int) ([]*big.I
 			}
 		}
 
-		// Newton lift: x <- x * (3 - gamma*x^2) / 2 mod (p^{e_i}, fHat).
-		for step, m := range moduli {
-			gm := gammaMods[step]
-			x2 := polyAlgMulModModBig(x, x, fHat, m)
-			gx2 := polyAlgMulModModBig(gm, x2, fHat, m)
-			// 3 - gx2 mod m
+		var beta []*big.Int
+		if len(moduli) >= 2 {
+			// Lift x = gamma^(-1/2) to half precision, then finish with Karp and Markstein's
+			// coupled step (ACM TOMS 23, 1997, Section 3) using only half precision multiplies.
+			lastHalf := len(moduli) - 2
+			for step := 0; step <= lastHalf; step++ {
+				m := moduli[step]
+				gm := gammaMods[step]
+				x2 := polyAlgMulModModBigPar(x, x, fHat, m, true)
+				gx2 := polyAlgMulModModBigPar(gm, x2, fHat, m, true)
+				threeMinus := make([]*big.Int, d)
+				threeMinus[0] = new(big.Int).Sub(big.NewInt(3), gx2[0])
+				threeMinus[0].Mod(threeMinus[0], m)
+				for i := 1; i < d; i++ {
+					threeMinus[i] = new(big.Int).Neg(gx2[i])
+					threeMinus[i].Mod(threeMinus[i], m)
+				}
+				prod := polyAlgMulModModBigPar(x, threeMinus, fHat, m, true)
+				inv2 := invTwos[step]
+				for i := 0; i < d; i++ {
+					prod[i].Mul(prod[i], inv2)
+					prod[i].Mod(prod[i], m)
+				}
+				x = prod
+			}
+			m0 := moduli[lastHalf]
+			eRem := exps[len(exps)-1] - exps[lastHalf]
+			m1 := new(big.Int).Exp(&bigP, big.NewInt(int64(eRem)), nil)
+			inv2M1 := new(big.Int).Add(m1, bigOne)
+			inv2M1.Rsh(inv2M1, 1)
+
+			b0 := polyAlgMulModModBigPar(gammaMods[lastHalf], x, fHat, m0, true)
+			b0Sq := polyAlgMulModModBigPar(b0, b0, fHat, pK, true)
+			qPoly := make([]*big.Int, d)
+			xLow := make([]*big.Int, d)
+			for i := 0; i < d; i++ {
+				diff := new(big.Int).Sub(gammaMods[len(moduli)-1][i], b0Sq[i])
+				diff.Mod(diff, pK)
+				qPoly[i] = new(big.Int).Quo(diff, m0)
+				xLow[i] = new(big.Int).Mod(x[i], m1)
+			}
+			hq := polyAlgMulModModBigPar(xLow, qPoly, fHat, m1, true)
+			beta = make([]*big.Int, d)
+			for i := 0; i < d; i++ {
+				hq[i].Mul(hq[i], inv2M1)
+				hq[i].Mod(hq[i], m1)
+				beta[i] = new(big.Int).Mul(m0, hq[i])
+				beta[i].Add(beta[i], b0[i])
+			}
+		} else {
+			m := moduli[0]
+			gm := gammaMods[0]
+			x2 := polyAlgMulModModBigPar(x, x, fHat, m, true)
+			gx2 := polyAlgMulModModBigPar(gm, x2, fHat, m, true)
 			threeMinus := make([]*big.Int, d)
 			threeMinus[0] = new(big.Int).Sub(big.NewInt(3), gx2[0])
 			threeMinus[0].Mod(threeMinus[0], m)
@@ -604,17 +766,15 @@ func algebraicSqrt(gamma, fHat []*big.Int, cd *big.Int, boundBits int) ([]*big.I
 				threeMinus[i] = new(big.Int).Neg(gx2[i])
 				threeMinus[i].Mod(threeMinus[i], m)
 			}
-			prod := polyAlgMulModModBig(x, threeMinus, fHat, m)
-			inv2 := invTwos[step]
+			prod := polyAlgMulModModBigPar(x, threeMinus, fHat, m, true)
+			inv2 := invTwos[0]
 			for i := 0; i < d; i++ {
 				prod[i].Mul(prod[i], inv2)
 				prod[i].Mod(prod[i], m)
 			}
-			x = prod
+			beta = polyAlgMulModModBigPar(gm, prod, fHat, pK, true)
 		}
 
-		// beta = gamma * x mod (p^K, fHat), converted to symmetric residues.
-		beta := polyAlgMulModModBig(gammaMods[len(moduli)-1], x, fHat, pK)
 		tooBig := false
 		for i := 0; i < d; i++ {
 			if beta[i].Cmp(halfPK) > 0 {
@@ -629,7 +789,7 @@ func algebraicSqrt(gamma, fHat []*big.Int, cd *big.Int, boundBits int) ([]*big.I
 		}
 
 		// Verify beta^2 == gamma in Z[y]/(fHat).
-		sq := polyAlgMulMod(beta, beta, fHat)
+		sq := polyAlgMulModPar(beta, beta, fHat, true)
 		equal := true
 		for i := 0; i < d; i++ {
 			if sq[i].Cmp(gamma[i]) != 0 {
@@ -645,24 +805,13 @@ func algebraicSqrt(gamma, fHat []*big.Int, cd *big.Int, boundBits int) ([]*big.I
 }
 
 func polyAlgMulModModBig(a, b, fHat []*big.Int, mod *big.Int) []*big.Int {
+	return polyAlgMulModModBigPar(a, b, fHat, mod, false)
+}
+
+func polyAlgMulModModBigPar(a, b, fHat []*big.Int, mod *big.Int, allowPar bool) []*big.Int {
 	d := len(fHat) - 1
-	prod := make([]*big.Int, 2*d-1)
-	for i := range prod {
-		prod[i] = new(big.Int)
-	}
+	prod := polyConvolveBig(a, b, d, allowPar)
 	var tmp big.Int
-	for i := 0; i < d; i++ {
-		if a[i].Sign() == 0 {
-			continue
-		}
-		for j := 0; j < d; j++ {
-			if b[j].Sign() == 0 {
-				continue
-			}
-			tmp.Mul(a[i], b[j])
-			prod[i+j].Add(prod[i+j], &tmp)
-		}
-	}
 	for k := len(prod) - 1; k >= d; k-- {
 		prod[k].Mod(prod[k], mod)
 		if prod[k].Sign() == 0 {

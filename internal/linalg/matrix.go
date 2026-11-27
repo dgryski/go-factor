@@ -280,25 +280,67 @@ func (r *Reducer) pruneSurplus() bool {
 }
 
 func (r *Reducer) pivot() {
+	type pivCand struct {
+		col  int32
+		cost int
+	}
+	var cands []pivCand
+	var others []int32
 	for {
 		r.drain()
-		progress := false
-		for c := range r.weight {
-			if w := r.weight[c]; w < 3 || w > r.maxWeight {
+		cands = cands[:0]
+		for c, w := range r.weight {
+			if w < 3 || w > r.maxWeight {
 				continue
 			}
 			rows := r.liveRows(int32(c))
+			if len(rows) < 3 {
+				continue
+			}
+			minLen := len(r.rows[rows[0]])
+			for _, rw := range rows[1:] {
+				if l := len(r.rows[rw]); l < minLen {
+					minLen = l
+				}
+			}
+			cost := (len(rows) - 1) * (minLen - 1)
+			if cost <= r.maxFill {
+				cands = append(cands, pivCand{col: int32(c), cost: cost})
+			}
+		}
+		if len(cands) == 0 {
+			return
+		}
+		// Pivot in ascending Markowitz fill order (Pomerance and Smith, Exper. Math. 1, 1992).
+		sort.Slice(cands, func(i, j int) bool {
+			if cands[i].cost != cands[j].cost {
+				return cands[i].cost < cands[j].cost
+			}
+			return cands[i].col < cands[j].col
+		})
+
+		progress := false
+		for _, cand := range cands {
+			w := r.weight[cand.col]
+			if w < 3 || w > r.maxWeight {
+				continue
+			}
+			rows := r.liveRows(cand.col)
+			if len(rows) < 3 {
+				continue
+			}
 			piv := 0
 			for i := range rows {
 				if len(r.rows[rows[i]]) < len(r.rows[rows[piv]]) {
 					piv = i
 				}
 			}
-			if (len(rows)-1)*(len(r.rows[rows[piv]])-1) > r.maxFill {
+			cost := (len(rows) - 1) * (len(r.rows[rows[piv]]) - 1)
+			if cost > r.maxFill || cost > cand.cost*2+16 {
 				continue
 			}
 			p := rows[piv]
-			others := append([]int32(nil), rows[:piv]...)
+			others = append(others[:0], rows[:piv]...)
 			others = append(others, rows[piv+1:]...)
 			for _, row := range others {
 				r.xorInto(row, p)
