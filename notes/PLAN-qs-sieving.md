@@ -824,9 +824,9 @@ With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20�
 
 ### Priority 3 (Pipeline, robustness, and vectorisation)
 
-6. **Done. Combine all 64 Lanczos dependencies by GCD** (`splitAll` / `refineDependencies`) so composites with 3+ factors split from one matrix without re-sieving composite cofactors.
-7. **Done. Sieve additional relations if all dependencies are trivial** (`maxSieveRetries = 3`, resuming `aRng`/`aSeen`) instead of returning `nil`.
+6. **Done (`bf0508f`). Combine all 64 Lanczos dependencies by GCD** (`splitAll` / `refineDependencies`) so composites with 3+ factors split from one matrix without re-sieving composite cofactors.
+7. **Done (`bf0508f`). Sieve additional relations if all dependencies are trivial** (`maxSieveRetries = 3`, resuming `aRng`/`aSeen`) instead of returning `nil`.
 8. **Raise `qsMaxBits` to the QS/GNFS crossover (~95 digits)** and retune the parallel ECM pretest share in `factor/budget.go`.
-9. **Single `n mod p` setup pass** combining trial division, Legendre symbol, and modular square root setup.
+9. **Done. Single `n mod p` setup pass** (`limbs32`, `modLimbs`, `prepareFactorBase`) combining trial division, Legendre symbol, and modular square root setup.
 10. **Small P−1 / ECM cofactor split** ahead of `rho64` if `SplitCofactor` becomes hot under DLP.
 11. **SIMD / `avo` inner sieve and medium-prime kernel** after algorithmic and parameter changes settle.
