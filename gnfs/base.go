@@ -120,38 +120,40 @@ func BuildFactorBases(poly *Poly, br, ba int64, qcMin uint64, numQCs int) *Facto
 		}
 	}
 
-	wantQCs := numQCs + fb.BadCount
-	if wantQCs < 64 {
-		wantQCs = 64
-	}
-	if wantQCs > 128 {
-		wantQCs = 128
-	}
+	if numQCs >= 0 {
+		wantQCs := numQCs + fb.BadCount
+		if wantQCs < 64 {
+			wantQCs = 64
+		}
+		if wantQCs > 128 {
+			wantQCs = 128
+		}
 
-	q := qcMin + 1
-	if q < 3 {
-		q = 3
-	}
-	if q&1 == 0 {
-		q++
-	}
-	for len(fb.QCB) < wantQCs {
-		if arith.IsPrime64(q) {
-			bigP.SetUint64(q)
-			if r.Mod(poly.Coeffs[poly.Degree], &bigP).Sign() != 0 {
-				fp := poly.CoeffsModP(q)
-				dfp := arith.PolyDerivModP(fp, q)
-				for _, s := range arith.PolyRootsModP(fp, q) {
-					if arith.PolyEvalModP(dfp, s, q) != 0 {
-						fb.QCB = append(fb.QCB, QChar{Q: q, S: s})
-						if len(fb.QCB) >= wantQCs {
-							break
+		q := qcMin + 1
+		if q < 3 {
+			q = 3
+		}
+		if q&1 == 0 {
+			q++
+		}
+		for len(fb.QCB) < wantQCs {
+			if arith.IsPrime64(q) {
+				bigP.SetUint64(q)
+				if r.Mod(poly.Coeffs[poly.Degree], &bigP).Sign() != 0 {
+					fp := poly.CoeffsModP(q)
+					dfp := arith.PolyDerivModP(fp, q)
+					for _, s := range arith.PolyRootsModP(fp, q) {
+						if arith.PolyEvalModP(dfp, s, q) != 0 {
+							fb.QCB = append(fb.QCB, QChar{Q: q, S: s})
+							if len(fb.QCB) >= wantQCs {
+								break
+							}
 						}
 					}
 				}
 			}
+			q += 2
 		}
-		q += 2
 	}
 
 	fb.ColRFB = NumSignCols

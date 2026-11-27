@@ -264,7 +264,7 @@ func TestDickmanRhoAndKleinjungCollision(t *testing.T) {
 	for _, pr := range prs {
 		a1Check *= pr.p
 	}
-	bound := new(big.Int).Mul(new(big.Int).SetUint64(a1Check*a1Check), big.NewInt(cd<<12))
+	bound := new(big.Int).Mul(new(big.Int).SetUint64(a1Check*a1Check), big.NewInt(cd<<8))
 	if bound.Cmp(m0) > 0 {
 		t.Skip("a_1 too large for linearized collision bound")
 	}
@@ -318,5 +318,45 @@ func TestDickmanRhoAndKleinjungCollision(t *testing.T) {
 	gotRem.Abs(&gotRem)
 	if gotRem.Cmp(minRem) != 0 {
 		t.Fatalf("collision got |rem3|=%v, brute-force min=%v", &gotRem, minRem)
+	}
+}
+
+func TestSemiSmoothCurveAndLatticeProbe(t *testing.T) {
+	curve := buildSemiSmoothCurve(250000, 1<<21, 42, 2)
+	if got := curve.eval(0.8); got != 1.0 {
+		t.Fatalf("curve.eval(0.8) = %v, want 1.0", got)
+	}
+	prev := curve.eval(1.0)
+	for step := 1; step <= 40; step++ {
+		u := 1.0 + 0.25*float64(step)
+		got := curve.eval(u)
+		if got > prev+1e-12 {
+			t.Fatalf("curve not monotone at u=%.2f: %g > %g", u, got, prev)
+		}
+		rho := dickmanRho(u)
+		if got+1e-12 < rho {
+			t.Fatalf("curve(%.2f) = %g < dickmanRho = %g", u, got, rho)
+		}
+		if u >= 2.0 && u <= 6.0 && got <= rho*1.2 {
+			t.Fatalf("curve(%.2f) = %g lacks 1LP/2LP contribution above rho = %g", u, got, rho)
+		}
+		prev = got
+	}
+
+	rnd := rand.New(rand.NewSource(71))
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 115), testutil.RandomPrime(rnd, 115))
+	pr := defaultParams(n)
+	poly, fac := BaseMPoly(n, pr.Degree, 60)
+	if fac != nil {
+		t.Skip("lucky factor")
+	}
+	poly.Skew = optimizeSkewnessBounded(poly, maxSkewForParams(pr))
+	y1 := probeLatticeYield(poly, pr)
+	y2 := probeLatticeYield(poly, pr)
+	if y1 <= 0 {
+		t.Fatalf("probeLatticeYield = %v, want > 0", y1)
+	}
+	if y1 != y2 {
+		t.Fatalf("probeLatticeYield non-deterministic: %v vs %v", y1, y2)
 	}
 }

@@ -221,7 +221,7 @@ func splitWithParams(n *big.Int, params *Params) (*big.Int, *big.Int) {
 	if poly == nil {
 		polyStart := time.Now()
 		var fac *big.Int
-		poly, fac = SelectPoly(n, params.Degree)
+		poly, fac = selectPolyWithParams(n, params)
 		if fac != nil {
 			logf("gnfs: found factor %v during polynomial selection", fac)
 			return fac, new(big.Int).Div(n, fac)

@@ -856,6 +856,8 @@ func maxSkewForParams(pr *Params) float64 {
 const (
 	rhoMaxU      = 20
 	rhoSteps     = 1024
+	semiMaxU     = 18
+	semiSteps    = 32
 	alphaLinearG = 0.5699609931
 )
 
@@ -904,9 +906,104 @@ func dickmanRho(u float64) float64 {
 	return math.Exp(logAnchor + asymp(u) - asymp(rhoMaxU))
 }
 
+// semiSmoothCurve tabulates 0LP + 1LP + 2LP smoothness probability as a function
+// of u = ln(X) / ln(B1), following Murphy (1999), Section 3.2.3.
+type semiSmoothCurve struct {
+	lnB1 float64
+	tab  [semiMaxU*semiSteps + 1]float64
+}
+
+func buildSemiSmoothCurve(b1 int64, lpBound uint64, mfb, maxLP int) semiSmoothCurve {
+	lnB1 := math.Log(float64(max(int64(100), b1)))
+	var c semiSmoothCurve
+	c.lnB1 = lnB1
+	lnLP := math.Log(float64(max(uint64(101), lpBound)))
+	if maxLP <= 0 || lnLP <= lnB1 {
+		for i := range c.tab {
+			c.tab[i] = dickmanRho(float64(i) / semiSteps)
+		}
+		return c
+	}
+	vMax := lnLP / lnB1
+	mfbMax := float64(mfb) * math.Ln2 / lnB1
+	if mfb <= 0 {
+		mfbMax = float64(maxLP) * vMax
+	}
+
+	const q1N = 24
+	const q2N = 16
+	dv1 := (vMax - 1.0) / q1N
+
+	for i := range c.tab {
+		u := float64(i) / semiSteps
+		if u <= 1.0 {
+			c.tab[i] = 1.0
+			continue
+		}
+		p0 := dickmanRho(u)
+		var p1 float64
+		for j := 0; j < q1N; j++ {
+			t1 := 1.0 + (float64(j)+0.5)*dv1
+			if t1 > mfbMax {
+				break
+			}
+			if u >= t1 {
+				p1 += dickmanRho(u-t1) / t1
+			}
+		}
+		p1 *= dv1
+
+		var p2 float64
+		if maxLP >= 2 && mfbMax > 2.0 {
+			for j := 0; j < q1N; j++ {
+				t1 := 1.0 + (float64(j)+0.5)*dv1
+				hi2 := min(vMax, mfbMax-t1)
+				if hi2 <= t1 {
+					break
+				}
+				dv2 := (hi2 - t1) / q2N
+				var inner float64
+				for m := 0; m < q2N; m++ {
+					t2 := t1 + (float64(m)+0.5)*dv2
+					if u >= t1+t2 {
+						inner += dickmanRho(u-t1-t2) / t2
+					}
+				}
+				p2 += (inner * dv2) / t1
+			}
+			p2 *= dv1
+		}
+		tot := p0 + p1 + p2
+		if tot > 1.0 {
+			tot = 1.0
+		}
+		c.tab[i] = tot
+	}
+	return c
+}
+
+func (c *semiSmoothCurve) eval(u float64) float64 {
+	if u <= 1.0 {
+		return 1.0
+	}
+	if u >= semiMaxU {
+		return dickmanRho(u)
+	}
+	pos := u * semiSteps
+	idx := int(pos)
+	frac := pos - float64(idx)
+	return c.tab[idx]*(1.0-frac) + c.tab[idx+1]*frac
+}
+
 // murphyE computes Murphy's directional yield score E(f, g) across 128 angles
-// in [0, pi] (Murphy 1999, Section 5.1.3, Eq. 5.7).
+// in [0, pi] using 2LP semismoothness (Murphy 1999, Sections 3.2.3 and 5.1.3).
 func murphyE(p *Poly, pr *Params) float64 {
+	algCurve := buildSemiSmoothCurve(pr.Ba, pr.LpBoundAlg, pr.MfbAlg, pr.MaxLPAlg)
+	ratCurve := buildSemiSmoothCurve(pr.Br, pr.LpBoundRat, pr.MfbRat, pr.MaxLPRat)
+	return murphyEWithCurves(p, pr, &algCurve, &ratCurve)
+}
+
+func murphyEWithCurves(p *Poly, pr *Params, algCurve, ratCurve *semiSmoothCurve) float64 {
 	const numAngles = 128
 	s := p.Skew
 	if s < 1.0 {
@@ -926,8 +1023,8 @@ func murphyE(p *Poly, pr *Params) float64 {
 		aTyp = math.Sqrt(float64(pr.LineA) * float64(max(1, pr.LineB/2)))
 	}
 
-	lnBa := math.Log(float64(max(int64(100), pr.Ba)))
-	lnBr := math.Log(float64(max(int64(100), pr.Br)))
+	lnBa := algCurve.lnB1
+	lnBr := ratCurve.lnB1
 
 	maxF := 0
 	for _, c := range p.Coeffs {
@@ -951,7 +1048,7 @@ func murphyE(p *Poly, pr *Params) float64 {
 	d := p.Degree
 	rA := aTyp * sqrtS
 	rB := aTyp / sqrtS
-	var sum float64
+	var lnFArr, lnGArr [numAngles]float64
 	for k := 0; k < numAngles; k++ {
 		theta := math.Pi * (float64(k) + 0.5) / numAngles
 		ak := rA * math.Cos(theta)
@@ -963,25 +1060,46 @@ func murphyE(p *Poly, pr *Params) float64 {
 			bPow *= bk
 			fVal = fVal*ak + cf[i]*bPow
 		}
-		var uF float64
 		if fVal != 0 {
-			lnF := math.Log(math.Abs(fVal)) + lnShiftF
-			uF = (lnF - logQ + p.Alpha) / lnBa
+			lnFArr[k] = math.Log(math.Abs(fVal)) + lnShiftF
 		}
 
 		gVal := a1f*ak - a0f*bk
-		var uG float64
 		if gVal != 0 {
-			lnG := math.Log(math.Abs(gVal)) + lnShiftG
-			uG = (lnG + alphaLinearG) / lnBr
+			lnGArr[k] = math.Log(math.Abs(gVal)) + lnShiftG
 		}
-		sum += dickmanRho(uF) * dickmanRho(uG)
+	}
+
+	var sum float64
+	for k := 0; k < numAngles; k++ {
+		prev := (k - 1 + numAngles) % numAngles
+		next := (k + 1) % numAngles
+		// Cap single ray root aliasing spikes relative to adjacent rays.
+		lnF := lnFArr[k]
+		if floorF := 0.5*(lnFArr[prev]+lnFArr[next]) - 2.5; lnF < floorF {
+			lnF = floorF
+		}
+		lnG := lnGArr[k]
+		if floorG := 0.5*(lnGArr[prev]+lnGArr[next]) - 2.5; lnG < floorG {
+			lnG = floorG
+		}
+		uF := (lnF - logQ + p.Alpha) / lnBa
+		uG := (lnG + alphaLinearG) / lnBr
+		sum += algCurve.eval(uF) * ratCurve.eval(uG)
 	}
 	return sum / numAngles
 }
 
 func murphyYieldScore(p *Poly, pr *Params) float64 {
 	e := murphyE(p, pr)
+	if e <= 1e-300 {
+		return dickmanYieldScore(p, pr) + 700
+	}
+	return -math.Log(e)
+}
+
+func murphyYieldScoreCurves(p *Poly, pr *Params, algCurve, ratCurve *semiSmoothCurve) float64 {
+	e := murphyEWithCurves(p, pr, algCurve, ratCurve)
 	if e <= 1e-300 {
 		return dickmanYieldScore(p, pr) + 700
 	}
@@ -1064,13 +1182,22 @@ func logNormScore(p *Poly) float64 {
 	return lf + lg
 }
 
-// SelectPoly searches skewed base-m and Kleinjung polynomial pairs, size-optimizes
+// SelectPoly searches skewed base m and Kleinjung polynomial pairs, size optimizes
 // them by translation and rotation, and runs a root sieve over (u, v) rotations.
 func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 	pr := defaultParams(n)
+	if degree > 0 && degree != pr.Degree {
+		cp := *pr
+		cp.Degree = degree
+		pr = &cp
+	}
+	return selectPolyWithParams(n, pr)
+}
+
+func selectPolyWithParams(n *big.Int, pr *Params) (*Poly, *big.Int) {
+	degree := pr.Degree
 	if degree <= 0 {
-		degree = pr.Degree
-	} else {
+		degree = defaultParams(n).Degree
 		cp := *pr
 		cp.Degree = degree
 		pr = &cp
@@ -1105,9 +1232,13 @@ func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 		return BaseMPoly(n, degree, 1)
 	}
 
+	algCurve := buildSemiSmoothCurve(pr.Ba, pr.LpBoundAlg, pr.MfbAlg, pr.MaxLPAlg)
+	ratCurve := buildSemiSmoothCurve(pr.Br, pr.LpBoundRat, pr.MfbRat, pr.MaxLPRat)
+
 	type sizedCand struct {
-		poly      *Poly
-		sizeScore float64
+		poly    *Poly
+		murphy  float64
+		dickman float64
 	}
 	sized := make([]sizedCand, 0, len(rawCands))
 	for _, p := range rawCands {
@@ -1119,18 +1250,32 @@ func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 			continue
 		}
 		opt.Alpha = projectiveAlphaBonus(opt.Coeffs[degree])
-		sized = append(sized, sizedCand{poly: opt, sizeScore: murphyYieldScore(opt, pr)})
+		sized = append(sized, sizedCand{
+			poly:    opt,
+			murphy:  murphyYieldScoreCurves(opt, pr, &algCurve, &ratCurve),
+			dickman: dickmanYieldScore(opt, pr),
+		})
 	}
 	if len(sized) == 0 {
 		return BaseMPoly(n, degree, 1)
 	}
 
-	sort.Slice(sized, func(i, j int) bool { return sized[i].sizeScore < sized[j].sizeScore })
-	topN := 32
-	if len(sized) < topN {
-		topN = len(sized)
+	// Keep the union of top directional Murphy candidates and top isotropic norm candidates.
+	var shortlist []*Poly
+	kept := make(map[*Poly]bool, 36)
+	sort.Slice(sized, func(i, j int) bool { return sized[i].murphy < sized[j].murphy })
+	for i := 0; i < len(sized) && len(shortlist) < 20; i++ {
+		kept[sized[i].poly] = true
+		shortlist = append(shortlist, sized[i].poly)
 	}
-	sized = sized[:topN]
+	sort.Slice(sized, func(i, j int) bool { return sized[i].dickman < sized[j].dickman })
+	for i := 0; i < len(sized) && len(shortlist) < 36; i++ {
+		if !kept[sized[i].poly] {
+			kept[sized[i].poly] = true
+			shortlist = append(shortlist, sized[i].poly)
+		}
+	}
+	topN := len(shortlist)
 
 	nw := Workers
 	if nw <= 0 {
@@ -1158,7 +1303,7 @@ func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 				if idx >= topN {
 					return
 				}
-				best, fac := rootSieveOptimize(sized[idx].poly, n, pr, maxSkew, pks)
+				best, fac := rootSieveOptimizeWithCurves(shortlist[idx], n, pr, maxSkew, pks, &algCurve, &ratCurve)
 				if fac != nil {
 					factors[idx] = fac
 					return
@@ -1175,22 +1320,62 @@ func SelectPoly(n *big.Int, degree int) (*Poly, *big.Int) {
 		}
 	}
 
-	var best *Poly
-	bestScore := math.Inf(1)
+	type rankedPoly struct {
+		poly  *Poly
+		score float64
+	}
+	var ranked []rankedPoly
+	seenPoly := make(map[string]bool, len(results))
 	for _, cand := range results {
 		if cand == nil {
 			continue
 		}
-		sc := murphyYieldScore(cand, pr)
-		if sc < bestScore {
-			bestScore = sc
-			best = cand
+		sig := cand.Coeffs[degree].String() + ":" + cand.A1.String() + ":" + cand.A0.String() + ":" + cand.Coeffs[0].String()
+		if seenPoly[sig] {
+			continue
 		}
+		seenPoly[sig] = true
+		ranked = append(ranked, rankedPoly{poly: cand, score: murphyYieldScoreCurves(cand, pr, &algCurve, &ratCurve)})
 	}
-	if best == nil {
+	if len(ranked) == 0 {
 		return BaseMPoly(n, degree, 1)
 	}
-	return best, nil
+	sort.Slice(ranked, func(i, j int) bool { return ranked[i].score < ranked[j].score })
+
+	if pr.UseLattice && bits >= 220 && len(ranked) > 1 {
+		probeN := min(6, len(ranked))
+		qcMin := computeQCMin(pr)
+		probeFBs := make([]*FactorBases, probeN)
+		fbWorkers := min(nw, probeN)
+		var nextFB atomic.Int64
+		var fbWG sync.WaitGroup
+		for w := 0; w < fbWorkers; w++ {
+			fbWG.Add(1)
+			go func() {
+				defer fbWG.Done()
+				for {
+					i := int(nextFB.Add(1) - 1)
+					if i >= probeN {
+						return
+					}
+					probeFBs[i] = BuildFactorBases(ranked[i].poly, pr.Br, pr.Ba, qcMin, -1)
+				}
+			}()
+		}
+		fbWG.Wait()
+
+		best := ranked[0].poly
+		bestYield := -1.0
+		for i := 0; i < probeN; i++ {
+			y := probeLatticeYieldWithFB(ranked[i].poly, probeFBs[i], pr)
+			if y > bestYield {
+				bestYield = y
+				best = ranked[i].poly
+			}
+		}
+		return best, nil
+	}
+	return ranked[0].poly, nil
 }
 
 func selectPolySmall(n *big.Int, degree int, pr *Params, maxSkew float64) (*Poly, *big.Int) {
@@ -1366,8 +1551,8 @@ func kleinjungCandidates(n *big.Int, d int) ([]*Poly, *big.Int) {
 			continue
 		}
 		m0 := arith.NthRoot(q, d)
-		// Keep c_d * a_1^2 <= m_0 / 4096 so second order terms in M / a_0^(d-1) mod 1 stay near 1e-3.
-		maxA1Sq := new(big.Int).Quo(m0, new(big.Int).SetUint64(cd<<12))
+		// Keep c_d * a_1^2 <= m_0 / 256 so second order terms in M / a_0^(d-1) mod 1 stay below 0.01.
+		maxA1Sq := new(big.Int).Quo(m0, new(big.Int).SetUint64(cd<<8))
 		if maxA1Sq.Cmp(big.NewInt(1<<20)) < 0 {
 			continue
 		}
@@ -1451,6 +1636,9 @@ func chooseKleinjungTuples(prs []kjPrimeRoots, maxA1 uint64) [][]kjPrimeRoots {
 		if tupleProductFits(alt, maxA1) {
 			out = append(out, alt)
 		}
+	}
+	if bestK >= 4 {
+		out = append(out, prs[:bestK-1])
 	}
 	return out
 }
@@ -1596,7 +1784,7 @@ func searchKleinjungTuple(n *big.Int, d int, cd uint64, cdBig, m0, dBig *big.Int
 		beta2 -= math.Floor(beta2)
 
 		idx := sort.Search(n1, func(i int) bool { return table1[i].frac >= beta2 })
-		checkCount := min(6, n1)
+		checkCount := min(8, n1)
 		startOff := -checkCount / 2
 		for off := 0; off < checkCount; off++ {
 			pos := (idx + startOff + off + n1) % n1
@@ -2031,6 +2219,12 @@ func buildRootSievePrimes(bound int64) []rootSievePK {
 // rootSieveOptimize sieves (u, v) in [-U, U] x [-V, V] around base for small-prime root density,
 // following Murphy (1999), Chapter 5.2.
 func rootSieveOptimize(base *Poly, n *big.Int, pr *Params, maxSkew float64, pks []rootSievePK) (*Poly, *big.Int) {
+	algCurve := buildSemiSmoothCurve(pr.Ba, pr.LpBoundAlg, pr.MfbAlg, pr.MaxLPAlg)
+	ratCurve := buildSemiSmoothCurve(pr.Br, pr.LpBoundRat, pr.MfbRat, pr.MaxLPRat)
+	return rootSieveOptimizeWithCurves(base, n, pr, maxSkew, pks, &algCurve, &ratCurve)
+}
+
+func rootSieveOptimizeWithCurves(base *Poly, n *big.Int, pr *Params, maxSkew float64, pks []rootSievePK, algCurve, ratCurve *semiSmoothCurve) (*Poly, *big.Int) {
 	rmsF, _ := logNormParts(base)
 	s := base.Skew
 	if s < 1 {
@@ -2182,7 +2376,7 @@ func rootSieveOptimize(base *Poly, n *big.Int, pr *Params, maxSkew float64, pks 
 		}
 		rot.Skew = optimizeSkewnessBounded(rot, maxSkew)
 		rot.Alpha = ComputeAlpha(rot, 200)
-		sc := murphyYieldScore(rot, pr)
+		sc := murphyYieldScoreCurves(rot, pr, algCurve, ratCurve)
 		if sc < bestScore {
 			bestScore = sc
 			best = rot

@@ -801,6 +801,55 @@ func estimateExpectedFKHitsPerBlock(rfb []RatIdeal, afb []AlgIdeal, fkIdxs []int
 // sieveLattice runs the special-q lattice sieve with flat Franke-Kleinjung bucket arenas.
 func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relation), shouldStop func() bool) int {
 	sqs := buildSpecialQs(poly, fb, params)
+	return sieveLatticeQs(poly, fb, params, sqs, onRel, shouldStop)
+}
+
+// probeLatticeYield runs a deterministic 30 lattice special q sample across three points
+// in [QMin, QMax] and returns unique relations yielded per special q ideal.
+func probeLatticeYield(poly *Poly, params *Params) float64 {
+	qcMin := computeQCMin(params)
+	fb := BuildFactorBases(poly, params.Br, params.Ba, qcMin, -1)
+	return probeLatticeYieldWithFB(poly, fb, params)
+}
+
+func probeLatticeYieldWithFB(poly *Poly, fb *FactorBases, params *Params) float64 {
+	qcMin := computeQCMin(params)
+	qMid := uint64(math.Sqrt(float64(params.QMin) * float64(params.QMax)))
+	qHi := params.QMin + (params.QMax-params.QMin)/2
+	anchors := [3]uint64{params.QMin + 1000, qMid, qHi}
+
+	var sample []LatticeQ
+	for _, a := range anchors {
+		if a < 3 || a >= qcMin {
+			continue
+		}
+		sub := *params
+		sub.QMin = a
+		sub.QMax = a + 1500
+		if sub.QMax >= qcMin {
+			sub.QMax = qcMin - 1
+		}
+		sqs := buildSpecialQs(poly, fb, &sub)
+		if len(sqs) > 10 {
+			sqs = sqs[:10]
+		}
+		sample = append(sample, sqs...)
+	}
+	if len(sample) == 0 {
+		return 0
+	}
+	seen := make(map[[2]int64]struct{}, len(sample)*24)
+	sieveLatticeQsWithWorkers(poly, fb, params, sample, 6, func(r Relation) {
+		seen[[2]int64{r.A, r.B}] = struct{}{}
+	}, func() bool { return false })
+	return float64(len(seen)) / float64(len(sample))
+}
+
+func sieveLatticeQs(poly *Poly, fb *FactorBases, params *Params, sqs []LatticeQ, onRel func(Relation), shouldStop func() bool) int {
+	return sieveLatticeQsWithWorkers(poly, fb, params, sqs, 0, onRel, shouldStop)
+}
+
+func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs []LatticeQ, maxWorkers int, onRel func(Relation), shouldStop func() bool) int {
 	if len(sqs) == 0 {
 		return 0
 	}
@@ -848,6 +897,9 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 	nw := Workers
 	if nw <= 0 {
 		nw = runtime.GOMAXPROCS(0)
+	}
+	if maxWorkers > 0 && nw > maxWorkers {
+		nw = maxWorkers
 	}
 	if nw > len(sqs) {
 		nw = len(sqs)
