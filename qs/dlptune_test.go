@@ -22,6 +22,7 @@ func TestDLPTune(t *testing.T) {
 	if !*tune {
 		t.Skip("slow; run with -tune")
 	}
+	defer func(dm int, df float64) { dlpMinBits, dlpSlackFrac = dm, df }(dlpMinBits, dlpSlackFrac)
 	for _, bits := range []int{110, 120} {
 		rnd := rand.New(rand.NewSource(7))
 		n := new(big.Int).Mul(testutil.RandomPrime(rnd, bits), testutil.RandomPrime(rnd, bits))
@@ -44,42 +45,83 @@ func TestDLPTune(t *testing.T) {
 	}
 }
 
-// TestSweep times split on QS_N for each QS_RANGE, QS_DLP slack fraction
-// (0 means off, others start at 250 bits) and QS_WORKERS count.
+// TestSweep times split on QS_N (or seed-7 semiprimes of QS_BITS bits) across
+// QS_B, QS_LPM, QS_SMALL, QS_RANGE, QS_DLP, and QS_WORKERS.
 func TestSweep(t *testing.T) {
-	if !*tune || os.Getenv("QS_N") == "" {
-		t.Skip("slow; run with -tune and QS_N, QS_RANGE, QS_DLP, QS_WORKERS")
+	if !*tune || (os.Getenv("QS_N") == "" && os.Getenv("QS_BITS") == "") {
+		t.Skip("slow; run with -tune and QS_N or QS_BITS")
 	}
-	n, _ := new(big.Int).SetString(os.Getenv("QS_N"), 10)
-	list := func(k string) []string { return strings.Split(os.Getenv(k), ",") }
-	for _, rs := range list("QS_RANGE") {
-		largeSieveRange, _ = strconv.ParseInt(rs, 10, 64)
-		for _, fs := range list("QS_DLP") {
-			frac, _ := strconv.ParseFloat(fs, 64)
-			if frac == 0 {
-				dlpMinBits = 1 << 30
-			} else {
-				dlpMinBits, dlpSlackFrac = 250, frac
-			}
-			for _, ws := range list("QS_WORKERS") {
-				Workers, _ = strconv.Atoi(ws)
-				var prog, mat string
-				var sieved time.Duration
-				st := time.Now()
-				Logf = func(f string, a ...interface{}) {
-					switch {
-					case strings.HasPrefix(f, "qs: %d/%"):
-						prog = fmt.Sprintf(f, a...)
-						sieved = time.Since(st)
-					case strings.HasPrefix(f, "qs: matrix"):
-						mat = fmt.Sprintf(f, a...)
+	list := func(k, def string) []string {
+		v := os.Getenv(k)
+		if v == "" {
+			v = def
+		}
+		return strings.Split(v, ",")
+	}
+	var inputs []*big.Int
+	if os.Getenv("QS_N") != "" {
+		n, _ := new(big.Int).SetString(os.Getenv("QS_N"), 10)
+		inputs = append(inputs, n)
+	} else {
+		for _, bStr := range list("QS_BITS", "") {
+			bits, _ := strconv.Atoi(bStr)
+			rnd := rand.New(rand.NewSource(7))
+			h1 := bits / 2
+			h2 := bits - h1
+			inputs = append(inputs, new(big.Int).Mul(testutil.RandomPrime(rnd, h1), testutil.RandomPrime(rnd, h2)))
+		}
+	}
+	defer func(b int64, l uint64, s uint32, r int64, dm int, df float64) {
+		fbBoundOverride, largePrimeMultOverride, minSievePrimeOverride, largeSieveRange = b, l, s, r
+		dlpMinBits, dlpSlackFrac = dm, df
+	}(fbBoundOverride, largePrimeMultOverride, minSievePrimeOverride, largeSieveRange, dlpMinBits, dlpSlackFrac)
+	defRange, defDM, defDF := largeSieveRange, dlpMinBits, dlpSlackFrac
+	for _, n := range inputs {
+		for _, bs := range list("QS_B", "0") {
+			fbBoundOverride, _ = strconv.ParseInt(bs, 10, 64)
+			for _, ls := range list("QS_LPM", "0") {
+				largePrimeMultOverride, _ = strconv.ParseUint(ls, 10, 64)
+				for _, ss := range list("QS_SMALL", "0") {
+					v, _ := strconv.ParseUint(ss, 10, 32)
+					minSievePrimeOverride = uint32(v)
+					for _, rs := range list("QS_RANGE", "0") {
+						largeSieveRange = defRange
+						if rv, _ := strconv.ParseInt(rs, 10, 64); rv > 0 {
+							largeSieveRange = rv
+						}
+						for _, fs := range list("QS_DLP", "default") {
+							dlpMinBits, dlpSlackFrac = defDM, defDF
+							if fs != "default" {
+								frac, _ := strconv.ParseFloat(fs, 64)
+								if frac == 0 {
+									dlpMinBits = 1 << 30
+								} else {
+									dlpMinBits, dlpSlackFrac = 0, frac
+								}
+							}
+							for _, ws := range list("QS_WORKERS", "0") {
+								Workers, _ = strconv.Atoi(ws)
+								var prog, mat string
+								var sieved time.Duration
+								st := time.Now()
+								Logf = func(f string, a ...interface{}) {
+									switch {
+									case strings.HasPrefix(f, "qs: %d/%"):
+										prog = fmt.Sprintf(f, a...)
+										sieved = time.Since(st)
+									case strings.HasPrefix(f, "qs: matrix"):
+										mat = fmt.Sprintf(f, a...)
+									}
+								}
+								p, _ := split(n)
+								Logf = nil
+								fmt.Printf("  [%db] B=%s lpm=%s small=%s M=%s frac=%s: ok=%v total %v sieve %v | %s | %s\n",
+									n.BitLen(), bs, ls, ss, rs, fs, p != nil,
+									time.Since(st).Round(time.Millisecond), sieved.Round(time.Millisecond), prog, mat)
+							}
+						}
 					}
 				}
-				p, _ := split(n)
-				Logf = nil
-				t.Logf("M=%dK frac=%v workers=%d: ok=%v total %v sieve %v | %s | %s",
-					largeSieveRange/1024, frac, Workers, p != nil,
-					time.Since(st).Round(time.Millisecond), sieved.Round(time.Millisecond), prog, mat)
 			}
 		}
 	}

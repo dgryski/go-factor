@@ -36,9 +36,8 @@ const (
 	blockSize     = 1 << blockShift
 	blockMask     = blockSize - 1
 	bucketCut     = 16384 // primes from here up are sieved through per-block buckets
-	resieveCut     = 2048 // primes from here to bucketCut are found again by resieving
-	minSievePrime  = 30   // smaller primes are not sieved, only allowed for in the threshold
-	largePrimeMult = 64
+	resieveCut   = 2048 // primes from here to bucketCut are found again by resieving
+	poolMinPrime = 30   // smallest prime allowed in A
 
 	// A candidate may score this many times log2(largest base prime) below
 	// log2|Y|.
@@ -48,6 +47,70 @@ const (
 	siqsMinBits = 60   // below this, a single polynomial is faster
 	siqsMinB    = 1000 // smaller bases leave too few primes to build enough different A values
 )
+
+var (
+	minSievePrimeOverride  uint32
+	largePrimeMultOverride uint64
+	fbBoundOverride        int64
+)
+
+var siqsFBTable = []struct {
+	bits  int
+	bound int64
+}{
+	{190, 110000},
+	{200, 150000},
+	{232, 300000},
+	{266, 950000},
+	{298, 2400000},
+	{315, 3800000},
+	{335, 5500000},
+}
+
+func siqsFactorBaseBound(bits int, l float64) int64 {
+	if bits < siqsFBTable[0].bits {
+		return int64(math.Pow(l, 0.46))
+	}
+	last := siqsFBTable[len(siqsFBTable)-1]
+	if bits >= last.bits {
+		return last.bound
+	}
+	i := 1
+	for i < len(siqsFBTable)-1 && bits > siqsFBTable[i].bits {
+		i++
+	}
+	lo, hi := siqsFBTable[i-1], siqsFBTable[i]
+	t := float64(bits-lo.bits) / float64(hi.bits-lo.bits)
+	lnLo := math.Log(float64(lo.bound))
+	lnHi := math.Log(float64(hi.bound))
+	return int64(math.Round(math.Exp(lnLo + t*(lnHi-lnLo))))
+}
+
+func minSievePrimeForBits(bits int) uint32 {
+	if minSievePrimeOverride > 0 {
+		return minSievePrimeOverride
+	}
+	switch {
+	case bits < 150:
+		return 30
+	case bits < 220:
+		return 80
+	case bits < 280:
+		return 100
+	default:
+		return 120
+	}
+}
+
+func largePrimeMultForBits(bits int) uint64 {
+	if largePrimeMultOverride > 0 {
+		return largePrimeMultOverride
+	}
+	if bits < 220 {
+		return 64
+	}
+	return 128
+}
 
 // QuadraticSieve factors n by finding congruences of squares X² ≡ Y² (mod n).
 func QuadraticSieve(n *big.Int) (primes, composites []*big.Int) {
@@ -281,15 +344,20 @@ func params(n *big.Int) (b int64, siqs bool, sieveRange int64) {
 		return b, false, mult * b
 	}
 
-	b = int64(math.Pow(l, 0.46))
+	b = siqsFactorBaseBound(n.BitLen(), l)
+	if fbBoundOverride > 0 {
+		b = fbBoundOverride
+	}
 	if b < siqsMinB {
 		b = siqsMinB
 	}
 	switch {
 	case b < 10000:
 		sieveRange = 32 * 1024
-	case b < 100000:
+	case b < 200000:
 		sieveRange = 64 * 1024
+	case b < 500000:
+		sieveRange = 128 * 1024
 	default:
 		sieveRange = largeSieveRange
 	}
@@ -606,8 +674,10 @@ func newSieveWithRoots(n, kn *big.Int, roots []root, siqs bool) *sieve {
 
 	// Skip the small primes, which hit often but add little, and lower the
 	// threshold by their expected contribution of about 2·log2(p)/p.
+	bits := n.BitLen()
+	minPrime := minSievePrimeForBits(bits)
 	smallSlack := 0.0
-	for s.sieveFrom < len(s.roots) && s.roots[s.sieveFrom].p < minSievePrime {
+	for s.sieveFrom < len(s.roots) && s.roots[s.sieveFrom].p < minPrime {
 		r := s.roots[s.sieveFrom]
 		if r.p == 2 && s.q2 {
 			smallSlack += 1.0
@@ -644,9 +714,9 @@ func newSieveWithRoots(n, kn *big.Int, roots []root, siqs bool) *sieve {
 	s.pMax = pMax
 	s.slack = singleSlack*math.Log2(float64(pMax)) + smallSlack
 	if siqs {
-		s.lpBound = largePrimeMult * pMax
+		s.lpBound = largePrimeMultForBits(bits) * pMax
 		s.slack = siqsSlack*math.Log2(float64(pMax)) + math.Log2(float64(s.lpBound))/2 + smallSlack
-		if n.BitLen() >= dlpMinBits {
+		if bits >= dlpMinBits {
 			s.dlpCap = s.lpBound * s.lpBound
 			if s.dlpCap > dlpMaxCofactor {
 				s.dlpCap = dlpMaxCofactor
@@ -701,7 +771,7 @@ func (s *sieve) siqs(sieveRange int64) *big.Int {
 
 	var pool []int
 	for i, r := range s.roots {
-		if r.p > minSievePrime && r.t != 0 {
+		if r.p > poolMinPrime && r.t != 0 {
 			pool = append(pool, i)
 		}
 	}
@@ -2097,14 +2167,11 @@ func tryDependency(n *big.Int, factorBase []int64, relations []relation, dep []u
 	return nil
 }
 
-// largeSieveRange is the SIQS sieve half-width for factor bases from 100,000
-// primes up. It's a var while it's being tuned.
-var largeSieveRange int64 = 128 * 1024
+// largeSieveRange is the SIQS sieve half-width for factor bases from 500,000 up.
+var largeSieveRange int64 = 256 * 1024
 
-// Double large primes are still being tuned, so they're off by default. Set
-// dlpMinBits to turn them on for inputs of at least that many bits.
 var (
-	dlpMinBits            = 1 << 30
-	dlpSlackFrac          = 0.5 // threshold allowance, as a fraction of log2(dlpCap)
-	dlpMaxCofactor uint64 = 1 << 50
+	dlpMinBits            = 245
+	dlpSlackFrac          = 0.52
+	dlpMaxCofactor uint64 = 1 << 58
 )
