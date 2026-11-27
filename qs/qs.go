@@ -96,24 +96,28 @@ func splitAll(n *big.Int) []*big.Int {
 	b, siqs, sieveRange := params(n)
 	setup := newSetupLog()
 
-	// Remove small factors first so the multiplier is coprime to n.
 	primes := arith.PrimesUpTo(b)
 	setup.step("found %d primes up to %d", len(primes), b)
-	var r, bigP big.Int
+	nWords := limbs32(n)
 	for _, p := range primes {
-		bigP.SetInt64(p)
-		if r.Mod(n, &bigP).Sign() == 0 {
-			return []*big.Int{new(big.Int).Set(&bigP), new(big.Int).Div(n, &bigP)}
+		if p >= 100 {
+			break
+		}
+		if modLimbs(nWords, uint32(p)) == 0 {
+			bp := big.NewInt(p)
+			return []*big.Int{bp, new(big.Int).Div(n, bp)}
 		}
 	}
-	setup.step("trial divided by them")
 
 	k := knuthSchroeppel(n)
 	kn := new(big.Int).Mul(n, big.NewInt(k))
-	factorBase := buildFactorBase(kn, primes)
-	setup.step("built a factor base of %d primes", len(factorBase))
-	s := newSieve(n, kn, factorBase, siqs)
-	setup.step("found the square roots of kN mod each prime")
+	div, factorBase, roots := prepareFactorBase(nWords, k, primes)
+	if div != 0 {
+		bp := big.NewInt(div)
+		return []*big.Int{bp, new(big.Int).Div(n, bp)}
+	}
+	setup.step("built a factor base of %d primes and roots", len(factorBase))
+	s := newSieveWithRoots(n, kn, roots, siqs)
 
 	method := "single polynomial"
 	if siqs {
@@ -347,15 +351,62 @@ func squareFree(k int64) bool {
 	return true
 }
 
-// buildFactorBase returns the primes in primes for which kn is a square
-// mod p: 2, the primes dividing the multiplier, and the odd primes with
-// Legendre symbol 1.
+// limbs32 returns the 32 bit limbs of |x|, least significant first.
+func limbs32(x *big.Int) []uint32 {
+	words := x.Bits()
+	out := make([]uint32, 0, 2*len(words))
+	for _, w := range words {
+		u := uint64(w)
+		out = append(out, uint32(u))
+		if bits.UintSize == 64 {
+			out = append(out, uint32(u>>32))
+		}
+	}
+	for len(out) > 0 && out[len(out)-1] == 0 {
+		out = out[:len(out)-1]
+	}
+	return out
+}
+
+// modLimbs returns x mod p for x given as 32 bit limbs.
+func modLimbs(x []uint32, p uint32) uint32 {
+	var r uint64
+	p64 := uint64(p)
+	for i := len(x) - 1; i >= 0; i-- {
+		r = (r<<32 | uint64(x[i])) % p64
+	}
+	return uint32(r)
+}
+
+// prepareFactorBase trial divides n, selects factor base primes, and computes
+// sqrt(kN) mod p in a single pass over primes.
+func prepareFactorBase(nWords []uint32, k int64, primes []int64) (div int64, base []int64, roots []root) {
+	uk := uint64(k)
+	for _, p := range primes {
+		p32 := uint32(p)
+		np := modLimbs(nWords, p32)
+		if np == 0 {
+			return p, nil, nil
+		}
+		p64 := uint64(p32)
+		knp := uk * uint64(np) % p64
+		if p == 2 || knp == 0 || arith.PowMod64(knp, (p64-1)/2, p64) == 1 {
+			base = append(base, p)
+			roots = append(roots, root{
+				p:    p32,
+				t:    arith.SqrtModPrime(uint32(knp), p32),
+				logP: byte(math.Round(math.Log2(float64(p)))),
+			})
+		}
+	}
+	return 0, base, roots
+}
+
 func buildFactorBase(kn *big.Int, primes []int64) []int64 {
 	var base []int64
-	var r, bigP big.Int
+	knWords := limbs32(kn)
 	for _, p := range primes {
-		bigP.SetInt64(p)
-		knp := r.Mod(kn, &bigP).Uint64()
+		knp := uint64(modLimbs(knWords, uint32(p)))
 		if p == 2 || knp == 0 || arith.PowMod64(knp, uint64(p-1)/2, uint64(p)) == 1 {
 			base = append(base, p)
 		}
@@ -513,30 +564,34 @@ func (s *sieve) workers() int {
 }
 
 func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
+	roots := make([]root, len(factorBase))
+	knWords := limbs32(kn)
+	for i, p := range factorBase {
+		p32 := uint32(p)
+		roots[i] = root{
+			p:    p32,
+			t:    arith.SqrtModPrime(modLimbs(knWords, p32), p32),
+			logP: byte(math.Round(math.Log2(float64(p)))),
+		}
+	}
+	return newSieveWithRoots(n, kn, roots, siqs)
+}
+
+func newSieveWithRoots(n, kn *big.Int, roots []root, siqs bool) *sieve {
 	s := &sieve{
 		n:       n,
 		kn:      kn,
 		log2KN:  arith.Log2Big(kn),
-		roots:   make([]root, len(factorBase)),
-		numCols: len(factorBase) + 1, // +1 for the sign of Y
+		roots:   roots,
+		numCols: len(roots) + 1, // +1 for the sign of Y
 		seenX:   make(map[string]bool),
 		start:   time.Now(),
 	}
 	s.want = s.numCols + extraRelations
-	if siqs && len(factorBase) >= 16 && n.Bit(0) == 1 && kn.Bit(0) == 1 && kn.Bit(1) == 0 && kn.Bit(2) == 0 {
+	if siqs && len(roots) >= 16 && n.Bit(0) == 1 && kn.Bit(0) == 1 && kn.Bit(1) == 0 && kn.Bit(2) == 0 {
 		s.q2 = true
 		s.inv2ModN = new(big.Int).Add(n, one)
 		s.inv2ModN.Rsh(s.inv2ModN, 1)
-	}
-
-	var r, bigP big.Int
-	for i, p := range factorBase {
-		bigP.SetInt64(p)
-		s.roots[i] = root{
-			p:    uint32(p),
-			t:    arith.SqrtModPrime(uint32(r.Mod(kn, &bigP).Uint64()), uint32(p)),
-			logP: byte(math.Round(math.Log2(float64(p)))),
-		}
 	}
 
 	// Skip the small primes, which hit often but add little, and lower the

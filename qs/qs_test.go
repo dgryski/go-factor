@@ -208,6 +208,32 @@ func TestQ2Relations(t *testing.T) {
 	}
 }
 
+func TestModLimbsAndPrepareBase(t *testing.T) {
+	rnd := rand.New(rand.NewSource(29))
+	for i := 0; i < 200; i++ {
+		x := new(big.Int).Rand(rnd, new(big.Int).Lsh(one, uint(1+rnd.Intn(400))))
+		p := uint32(2 + rnd.Intn(1<<31-2))
+		want := new(big.Int).Mod(x, big.NewInt(int64(p))).Uint64()
+		if got := modLimbs(limbs32(x), p); uint64(got) != want {
+			t.Fatalf("modLimbs(%v, %d) = %d, want %d", x, p, got, want)
+		}
+	}
+
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 60), testutil.RandomPrime(rnd, 60))
+	primes := arith.PrimesUpTo(5000)
+	k := knuthSchroeppel(n)
+	kn := new(big.Int).Mul(n, big.NewInt(k))
+	div, fb, roots := prepareFactorBase(limbs32(n), k, primes)
+	if div != 0 {
+		t.Fatalf("unexpected divisor %d", div)
+	}
+	wantFB := buildFactorBase(kn, primes)
+	wantSv := newSieve(n, kn, wantFB, true)
+	if fmt.Sprint(fb) != fmt.Sprint(wantFB) || fmt.Sprint(roots) != fmt.Sprint(wantSv.roots) {
+		t.Fatalf("prepareFactorBase mismatch")
+	}
+}
+
 // TestSplitAllThreeFactors checks that one matrix splits a product of three
 // primes completely.
 func TestSplitAllThreeFactors(t *testing.T) {
