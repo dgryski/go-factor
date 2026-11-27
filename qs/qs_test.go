@@ -208,6 +208,32 @@ func TestQ2Relations(t *testing.T) {
 	}
 }
 
+// TestSplitAllThreeFactors checks that one matrix splits a product of three
+// primes completely.
+func TestSplitAllThreeFactors(t *testing.T) {
+	rnd := rand.New(rand.NewSource(31))
+	for i := 0; i < 3; i++ {
+		n := big.NewInt(1)
+		for j := 0; j < 3; j++ {
+			n.Mul(n, testutil.RandomPrime(rnd, 30))
+		}
+		parts := splitAll(n)
+		if len(parts) != 3 {
+			t.Fatalf("splitAll(%v) = %v, want 3 parts", n, parts)
+		}
+		prod := big.NewInt(1)
+		for _, f := range parts {
+			if !f.ProbablyPrime(20) {
+				t.Fatalf("splitAll(%v) part %v is not prime", n, f)
+			}
+			prod.Mul(prod, f)
+		}
+		if prod.Cmp(n) != 0 {
+			t.Fatalf("splitAll(%v) parts multiply to %v", n, prod)
+		}
+	}
+}
+
 func BenchmarkQuadraticSieve(b *testing.B) {
 	for _, bits := range []int{30, 40, 50, 60, 70, 80} {
 		rnd := rand.New(rand.NewSource(1))

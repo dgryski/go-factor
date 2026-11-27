@@ -36,19 +36,14 @@ const (
 	blockSize     = 1 << blockShift
 	blockMask     = blockSize - 1
 	bucketCut     = 16384 // primes from here up are sieved through per-block buckets
-	resieveCut    = 2048  // primes from here to bucketCut are found again by resieving
-	minSievePrime = 30    // smaller primes are not sieved, only allowed for in the threshold
+	resieveCut     = 2048 // primes from here to bucketCut are found again by resieving
+	minSievePrime  = 30   // smaller primes are not sieved, only allowed for in the threshold
+	largePrimeMult = 64
 
 	// A candidate may score this many times log2(largest base prime) below
 	// log2|Y|.
 	singleSlack = 1.75
 	siqsSlack   = 1.25
-
-	// SIQS also keeps partial relations with one prime up to this many times
-	// the largest base prime, and lowers the threshold by half of that
-	// prime's size. Lowering it by all of it adds too many candidates that
-	// fail trial division. With a single polynomial, partials don't pay.
-	largePrimeMult = 64
 
 	siqsMinBits = 60   // below this, a single polynomial is faster
 	siqsMinB    = 1000 // smaller bases leave too few primes to build enough different A values
@@ -60,43 +55,55 @@ func QuadraticSieve(n *big.Int) (primes, composites []*big.Int) {
 		return []*big.Int{n}, nil
 	}
 
-	p, q := split(n)
-	if p == nil {
+	parts := splitAll(n)
+	if len(parts) < 2 {
 		return nil, []*big.Int{n}
 	}
-
-	pr, co := QuadraticSieve(p)
-	primes, composites = append(primes, pr...), append(composites, co...)
-	pr, co = QuadraticSieve(q)
-	primes, composites = append(primes, pr...), append(composites, co...)
+	for _, f := range parts {
+		pr, co := QuadraticSieve(f)
+		primes, composites = append(primes, pr...), append(composites, co...)
+	}
 	return primes, composites
 }
 
 // split attempts to split n into two non-trivial factors. It returns
 // nil, nil if n is prime, too small, or no factor was found.
 func split(n *big.Int) (*big.Int, *big.Int) {
-	if n.Cmp(big.NewInt(4)) < 0 || n.ProbablyPrime(20) {
+	parts := splitAll(n)
+	if len(parts) < 2 {
 		return nil, nil
+	}
+	return parts[0], new(big.Int).Div(n, parts[0])
+}
+
+// maxSieveRetries is how many times splitAll sieves more relations when
+// every dependency is trivial.
+const maxSieveRetries = 3
+
+// splitAll returns non-trivial factors of n whose product is n, refined
+// across every dependency, or nil if none was found.
+func splitAll(n *big.Int) []*big.Int {
+	if n.Cmp(big.NewInt(4)) < 0 || n.ProbablyPrime(20) {
+		return nil
 	}
 
 	// Perfect squares would make some Y zero.
 	sqrtN := new(big.Int).Sqrt(n)
 	if new(big.Int).Mul(sqrtN, sqrtN).Cmp(n) == 0 {
-		return sqrtN, new(big.Int).Set(sqrtN)
+		return []*big.Int{sqrtN, new(big.Int).Set(sqrtN)}
 	}
 
 	b, siqs, sieveRange := params(n)
 	setup := newSetupLog()
 
-	// Remove small factors first: primes that divide n would otherwise be
-	// silently dropped from the base, and the multiplier must be coprime to n.
+	// Remove small factors first so the multiplier is coprime to n.
 	primes := arith.PrimesUpTo(b)
 	setup.step("found %d primes up to %d", len(primes), b)
 	var r, bigP big.Int
 	for _, p := range primes {
 		bigP.SetInt64(p)
 		if r.Mod(n, &bigP).Sign() == 0 {
-			return new(big.Int).Set(&bigP), new(big.Int).Div(n, &bigP)
+			return []*big.Int{new(big.Int).Set(&bigP), new(big.Int).Div(n, &bigP)}
 		}
 	}
 	setup.step("trial divided by them")
@@ -115,39 +122,91 @@ func split(n *big.Int) (*big.Int, *big.Int) {
 	logf("qs: %d bits, %s, k=%d, B=%d (%d primes), M=%d, want %d relations",
 		n.BitLen(), method, k, b, len(factorBase), sieveRange, s.want)
 
-	var f *big.Int
-	if siqs {
-		f = s.siqs(sieveRange)
-	} else {
-		f = s.singlePoly(sieveRange)
-	}
-	s.logProgress()
-	if f != nil {
-		logf("qs: found factor %v while sieving", f)
-		return f, new(big.Int).Div(n, f)
-	}
+	for try := 0; ; try++ {
+		var f *big.Int
+		if siqs {
+			f = s.siqs(sieveRange)
+		} else {
+			f = s.singlePoly(sieveRange)
+		}
+		s.logProgress()
+		if f != nil {
+			logf("qs: found factor %v while sieving", f)
+			return []*big.Int{f, new(big.Int).Div(n, f)}
+		}
 
-	primes = s.finish(factorBase)
-	numCols := len(primes) + 1
-	if len(s.relations) <= numCols {
-		logf("qs: not enough relations, giving up")
-		return nil, nil // not enough relations to guarantee a dependency
+		full, partials := len(s.relations), s.partials
+		cols := s.finish(factorBase)
+		numCols := len(cols) + 1
+		if len(s.relations) <= numCols {
+			logf("qs: not enough relations, giving up")
+			return nil // not enough relations to guarantee a dependency
+		}
+		if SaveDir != "" {
+			saveRelations(n, cols, s.relations)
+		}
+		start := time.Now()
+		deps := findDependencies(s.relations, numCols)
+		logf("qs: matrix %d×%d, %d dependencies in %v",
+			len(s.relations), numCols, len(deps), time.Since(start).Round(time.Millisecond))
+		if parts := refineDependencies(n, cols, s.relations, deps); parts != nil {
+			return parts
+		}
+		if !siqs || try >= maxSieveRetries {
+			logf("qs: all dependencies were trivial")
+			return nil
+		}
+
+		// Restore the relations and partials from before finish and sieve more.
+		s.relations, s.partials = s.relations[:full], partials
+		extra := s.want / 50
+		if extra < 100 {
+			extra = 100
+		}
+		s.want += extra
+		s.nextCount = len(s.partials)
+		logf("qs: all dependencies were trivial, sieving %d more relations", extra)
 	}
-	if SaveDir != "" {
-		saveRelations(n, primes, s.relations)
-	}
-	start := time.Now()
-	deps := findDependencies(s.relations, numCols)
-	logf("qs: matrix %d×%d, %d dependencies in %v",
-		len(s.relations), numCols, len(deps), time.Since(start).Round(time.Millisecond))
+}
+
+// refineDependencies splits n across all dependencies until every part is prime.
+func refineDependencies(n *big.Int, cols []int64, relations []relation, deps [][]uint64) []*big.Int {
+	parts := []*big.Int{n}
 	for i, dep := range deps {
-		if f := tryDependency(n, primes, s.relations, dep); f != nil {
-			logf("qs: dependency %d gave factor %v", i+1, f)
-			return f, new(big.Int).Div(n, f)
+		g := tryDependency(n, cols, relations, dep)
+		if g == nil {
+			continue
+		}
+		refined := false
+		var d big.Int
+		for j := 0; j < len(parts); j++ {
+			f := parts[j]
+			d.GCD(nil, nil, f, g)
+			if d.Cmp(one) > 0 && d.Cmp(f) < 0 {
+				parts[j] = new(big.Int).Set(&d)
+				parts = append(parts, new(big.Int).Div(f, &d))
+				refined = true
+			}
+		}
+		if !refined {
+			continue
+		}
+		logf("qs: dependency %d gave factor %v", i+1, g)
+		allPrime := true
+		for _, f := range parts {
+			if !f.ProbablyPrime(20) {
+				allPrime = false
+				break
+			}
+		}
+		if allPrime {
+			break
 		}
 	}
-	logf("qs: all dependencies were trivial")
-	return nil, nil
+	if len(parts) < 2 {
+		return nil
+	}
+	return parts
 }
 
 // Logf, if set, receives progress messages while the sieve runs.
@@ -363,6 +422,10 @@ type sieve struct {
 	start   time.Time
 	lastLog time.Time
 	rate    progress.Rate // relations per second
+
+	// A value generator state, kept so sieving can resume.
+	aRng  *rand.Rand
+	aSeen map[string]bool
 }
 
 type bkRoot struct {
@@ -593,10 +656,13 @@ func (s *sieve) siqs(sieveRange int64) *big.Int {
 	quit := make(chan struct{})
 	var stop atomic.Bool
 
+	if s.aRng == nil {
+		s.aRng = rand.New(rand.NewSource(1))
+		s.aSeen = make(map[string]bool)
+	}
 	go func() {
 		defer close(jobs)
-		rng := rand.New(rand.NewSource(1))
-		seen := make(map[string]bool)
+		rng, seen := s.aRng, s.aSeen
 		for seq := 0; ; seq++ {
 			a, aIdx := chooseA(rng, s.roots, pool, log2Target, seen)
 			if a == nil {
