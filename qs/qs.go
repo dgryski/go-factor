@@ -326,7 +326,9 @@ type root struct {
 
 type sieve struct {
 	n, kn     *big.Int
+	inv2ModN  *big.Int
 	log2KN    float64
+	q2        bool   // sieve ((2Ax + B)² − kN) / (4A) with odd B when kN ≡ 1 (mod 8)
 	roots     []root // the roots before any polynomial, copied by each worker
 	numCols   int
 	want      int
@@ -378,10 +380,12 @@ type worker struct {
 	stop  *atomic.Bool
 	poly  int // index of the polynomial being sieved within its A
 
-	deltas [][]uint32
-	buf    [blockSize]byte
-	arena  *qsArena
-	log2A  float64
+	deltas    [][]uint32
+	buf       [blockSize]byte
+	arena     *qsArena
+	log2Denom float64
+	twoA      big.Int
+	fourA     big.Int
 
 	// The current block's candidates, and the primes from resieveFrom up
 	// hitting each.
@@ -456,6 +460,11 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 		start:   time.Now(),
 	}
 	s.want = s.numCols + extraRelations
+	if siqs && len(factorBase) >= 16 && n.Bit(0) == 1 && kn.Bit(0) == 1 && kn.Bit(1) == 0 && kn.Bit(2) == 0 {
+		s.q2 = true
+		s.inv2ModN = new(big.Int).Add(n, one)
+		s.inv2ModN.Rsh(s.inv2ModN, 1)
+	}
 
 	var r, bigP big.Int
 	for i, p := range factorBase {
@@ -472,6 +481,11 @@ func newSieve(n, kn *big.Int, factorBase []int64, siqs bool) *sieve {
 	smallSlack := 0.0
 	for s.sieveFrom < len(s.roots) && s.roots[s.sieveFrom].p < minSievePrime {
 		r := s.roots[s.sieveFrom]
+		if r.p == 2 && s.q2 {
+			smallSlack += 1.0
+			s.sieveFrom++
+			continue
+		}
 		hits := 2.0
 		if r.p == 2 || r.t == 0 {
 			hits = 1
@@ -534,7 +548,7 @@ func (s *sieve) singlePoly(sieveRange int64) *big.Int {
 	if m.IsInt64() && 1-m.Int64() > lo {
 		lo = 1 - m.Int64()
 	}
-	w.log2A = 0
+	w.log2Denom = 0
 	w.setRoots(one, m, lo)
 	s.polys = 1
 	w.sievePoly(one, m, nil, lo, sieveRange)
@@ -551,8 +565,11 @@ func (s *sieve) singlePoly(sieveRange int64) *big.Int {
 // workers. Workers only do extra work past the point where sieving stops.
 func (s *sieve) siqs(sieveRange int64) *big.Int {
 	// With A ≈ √(2kN) / M, the largest |Y| at x = 0 and at x = ±M are
-	// about the same.
+	// about the same, and Q2 polynomials halve the target A.
 	log2Target := (s.log2KN+1)/2 - math.Log2(float64(sieveRange))
+	if s.q2 {
+		log2Target -= 1
+	}
 
 	var pool []int
 	for i, r := range s.roots {
@@ -676,6 +693,7 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 	qSlice := make([]uint64, sLen)
 	gammaSlice := make([]uint64, sLen)
 	b := new(big.Int)
+	q2 := w.s.q2
 	for j, idx := range aIdx {
 		q := uint64(w.roots[idx].p)
 		qSlice[j] = q
@@ -683,6 +701,9 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 		aq.Quo(a, &bigP)
 		gamma := uint64(w.roots[idx].t) * uint64(invMod32(uint32(r.Mod(&aq, &bigP).Uint64()), uint32(q))) % q
 		if gamma > q/2 {
+			gamma = q - gamma
+		}
+		if q2 && j == sLen-1 && (b.Bit(0)^uint(gamma&1)) == 0 {
 			gamma = q - gamma
 		}
 		gammaSlice[j] = gamma
@@ -705,7 +726,12 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 	}
 
 	// Batch invert q_j mod p via prefix products since B_j*A^-1 ≡ gamma_j*q_j^-1 (mod p).
-	w.log2A = arith.Log2Big(a)
+	w.log2Denom = arith.Log2Big(a)
+	if q2 {
+		w.log2Denom += 2
+		w.twoA.Lsh(a, 1)
+		w.fourA.Lsh(a, 2)
+	}
 	bkFrom := w.s.bucketFrom
 	for _, idx := range aIdx {
 		for v := 0; v < sLen-1; v++ {
@@ -720,6 +746,13 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 	for i := range w.roots {
 		rt := &w.roots[i]
 		if rt.inA {
+			continue
+		}
+		if q2 && rt.p == 2 {
+			rt.r1, rt.r2 = 0, 1
+			for v := 0; v < sLen-1; v++ {
+				w.deltas[v][i] = 0
+			}
 			continue
 		}
 		p := uint64(rt.p)
@@ -753,9 +786,12 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 			beta := g * qInv % p
 			sumBeta += beta
 			if j < sLen-1 {
-				d := beta << 1
-				if d >= p {
-					d -= p
+				d := beta
+				if !q2 {
+					d <<= 1
+					if d >= p {
+						d -= p
+					}
 				}
 				w.deltas[j][i] = uint32(d)
 			}
@@ -764,6 +800,11 @@ func (w *worker) sieveA(a *big.Int, aIdx []int, sieveRange int64) int {
 		shift := uRange
 		if shift >= p {
 			shift %= p
+		}
+		if q2 {
+			halfP := (p + 1) >> 1
+			aInv = aInv * halfP % p
+			sumBeta = sumBeta * halfP % p
 		}
 		tA := uint64(rt.t) * aInv % p
 		r1 := uint32((tA + p - sumBeta + shift) % p)
@@ -1200,6 +1241,10 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 	}
 	w.fillBuckets(lo, hi, aIdx)
 
+	stepA, denomA := a, a
+	if s.q2 && aIdx != nil {
+		stepA, denomA = &w.twoA, &w.fourA
+	}
 	x, y := &w.sx, &w.sy
 	for blockStart, bi := lo, 0; blockStart < hi && !w.stop.Load(); blockStart, bi = blockStart+blockSize, bi+1 {
 		blockLen := int64(blockSize)
@@ -1224,7 +1269,7 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 			w.arena.drainBlock(bi, block, s.bucketGroups)
 		}
 
-		thresh := int(math.Ceil(w.maxLog2Y(a, b, blockStart, blockStart+blockLen) - s.slack))
+		thresh := int(math.Ceil(w.maxLog2Y(stepA, b, blockStart, blockStart+blockLen) - s.slack))
 		if thresh < 0 {
 			thresh = 0
 		}
@@ -1237,11 +1282,11 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 		for k, i := range w.cands {
 			off := blockStart + int64(i)
 			x.SetInt64(off)
-			x.Mul(x, a)
+			x.Mul(x, stepA)
 			x.Add(x, b)
 			y.Mul(x, x)
 			y.Sub(y, s.kn)
-			y.Quo(y, a)
+			y.Quo(y, denomA)
 			if y.Sign() == 0 {
 				continue
 			}
@@ -1249,7 +1294,14 @@ func (w *worker) sievePoly(a, b *big.Int, aIdx []int, lo, hi int64) {
 			if !ok {
 				continue
 			}
-			w.emit(found{new(big.Int).Mod(x, s.n), factors, lp1, lp2, w.poly})
+			xMod := new(big.Int)
+			if s.q2 && aIdx != nil {
+				xMod.Mul(x, s.inv2ModN)
+				xMod.Mod(xMod, s.n)
+			} else {
+				xMod.Mod(x, s.n)
+			}
+			w.emit(found{xMod, factors, lp1, lp2, w.poly})
 			if w.stop.Load() {
 				break
 			}
@@ -1400,14 +1452,14 @@ func (w *worker) fillBuckets(lo, hi int64, aIdx []int) {
 }
 
 // maxLog2Y returns log2 of the largest |Y(x)| for x in [from, to). |Y| is
-// largest either at one end, or where ax + b = 0 if that lies in between.
-func (w *worker) maxLog2Y(a, b *big.Int, from, to int64) float64 {
+// largest either at one end, or where stepA*x + b = 0 if that lies in between.
+func (w *worker) maxLog2Y(stepA, b *big.Int, from, to int64) float64 {
 	s := w.s
 	x, y := &w.mx, &w.my
 	best, signs := 0.0, 0
 	for _, off := range [2]int64{from, to - 1} {
 		x.SetInt64(off)
-		x.Mul(x, a)
+		x.Mul(x, stepA)
 		x.Add(x, b)
 		signs += x.Sign()
 		y.Mul(x, x)
@@ -1419,7 +1471,7 @@ func (w *worker) maxLog2Y(a, b *big.Int, from, to int64) float64 {
 	if signs == 0 {
 		best = math.Max(best, s.log2KN)
 	}
-	return best - w.log2A
+	return best - w.log2Denom
 }
 
 // tryFactorize attempts to factor y = Y(x) over the factor base, where z = x - lo.
@@ -1662,7 +1714,25 @@ func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.I
 	s.partials = append(s.partials, partial{relation{X: x, Factors: factors}, lp1, lp2})
 	if len(s.partials) >= s.nextCount {
 		s.partialExcess, _, _ = s.countPartials()
-		s.nextCount = len(s.partials) + len(s.partials)/20 + 1000
+		have := len(s.relations) + s.partialExcess
+		need := s.want - have
+		switch {
+		case need <= 0:
+			s.nextCount = len(s.partials) + 1
+		case need <= 2000:
+			step := need * 2
+			if step < 100 {
+				step = 100
+			}
+			if step > 1000 {
+				step = 1000
+			}
+			s.nextCount = len(s.partials) + step
+		case have >= s.want/2:
+			s.nextCount = len(s.partials) + len(s.partials)/50 + 300
+		default:
+			s.nextCount = len(s.partials) + len(s.partials)/15 + 1000
+		}
 	}
 	return nil
 }

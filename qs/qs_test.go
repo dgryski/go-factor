@@ -169,6 +169,45 @@ func TestAppendGe(t *testing.T) {
 	}
 }
 
+func TestQ2Relations(t *testing.T) {
+	rnd := rand.New(rand.NewSource(23))
+	foundQ2 := false
+	for trial := 0; trial < 20; trial++ {
+		n := new(big.Int).Mul(testutil.RandomPrime(rnd, 55), testutil.RandomPrime(rnd, 55))
+		b, siqs, sieveRange := params(n)
+		kn := new(big.Int).Mul(n, big.NewInt(knuthSchroeppel(n)))
+		factorBase := buildFactorBase(kn, arith.PrimesUpTo(b))
+		sv := newSieve(n, kn, factorBase, siqs)
+		if !sv.q2 {
+			continue
+		}
+		foundQ2 = true
+		sv.siqs(sieveRange)
+		if !sv.done() {
+			t.Fatalf("%v: Q2 sieve did not reach target", n)
+		}
+		primes := sv.finish(factorBase)
+		for _, rel := range sv.relations {
+			y := big.NewInt(1)
+			for _, c := range rel.Factors {
+				if c == 0 {
+					y.Neg(y)
+				} else {
+					y.Mul(y, big.NewInt(primes[c-1]))
+				}
+			}
+			lhs := new(big.Int).Mul(rel.X, rel.X)
+			if lhs.Sub(lhs, y).Mod(lhs, n).Sign() != 0 {
+				t.Fatalf("Q2 relation X=%v does not square to Y=%v mod N", rel.X, y)
+			}
+		}
+		break
+	}
+	if !foundQ2 {
+		t.Fatal("no kN ≡ 1 (mod 8) input encountered")
+	}
+}
+
 func BenchmarkQuadraticSieve(b *testing.B) {
 	for _, bits := range []int{30, 40, 50, 60, 70, 80} {
 		rnd := rand.New(rand.NewSource(1))
