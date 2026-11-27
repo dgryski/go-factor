@@ -600,6 +600,7 @@ func sieveLine(poly *Poly, fb *FactorBases, params *Params, prevA, prevB int64, 
 
 	smallSlackRat := expectedSmallLogSumRat(fb, minSievePrime)
 	smallSlackAlg := expectedSmallLogSumAlg(fb, minSievePrime)
+	fastPoly := newFastNormPoly(poly)
 
 	nw := Workers
 	if nw <= 0 {
@@ -647,81 +648,10 @@ func sieveLine(poly *Poly, fb *FactorBases, params *Params, prevA, prevB int64, 
 						}
 						rb := ratBuf[:bLen]
 						ab := algBuf[:bLen]
-						clear(rb)
-						clear(ab)
+						rThresh := lineBlockNormsRat(rb, &fastPoly, bStart, bLen, b, params.SlackRat+smallSlackRat)
+						aThresh := lineBlockNormsAlg(ab, &fastPoly, bStart, bLen, b, params.SlackAlg+smallSlackAlg)
 
-						for _, idx := range ratSieve {
-							id := fb.RFB[idx]
-							p := int(id.P)
-							if id.R == id.P {
-								if b%int64(p) == 0 {
-									if evenB {
-										j := int(bStart&1) ^ 1
-										for ; j < bLen; j += 2 {
-											rb[j] += id.LogP
-										}
-									} else {
-										for j := 0; j < bLen; j++ {
-											rb[j] += id.LogP
-										}
-									}
-								}
-								continue
-							}
-							target := (b % int64(p)) * int64(id.R) % int64(p)
-							j := int(nextOffsetInt64(bStart, target, int64(p)))
-							if evenB {
-								if (bStart+int64(j))&1 == 0 {
-									j += p
-								}
-								step := p << 1
-								for ; j < bLen; j += step {
-									rb[j] += id.LogP
-								}
-							} else {
-								for ; j < bLen; j += p {
-									rb[j] += id.LogP
-								}
-							}
-						}
-
-						for _, idx := range algSieve {
-							id := fb.AFB[idx]
-							p := int(id.P)
-							if id.R == id.P {
-								if b%int64(p) == 0 {
-									if evenB {
-										j := int(bStart&1) ^ 1
-										for ; j < bLen; j += 2 {
-											ab[j] += id.LogP
-										}
-									} else {
-										for j := 0; j < bLen; j++ {
-											ab[j] += id.LogP
-										}
-									}
-								}
-								continue
-							}
-							target := (b % int64(p)) * int64(id.R) % int64(p)
-							j := int(nextOffsetInt64(bStart, target, int64(p)))
-							if evenB {
-								if (bStart+int64(j))&1 == 0 {
-									j += p
-								}
-								step := p << 1
-								for ; j < bLen; j += step {
-									ab[j] += id.LogP
-								}
-							} else {
-								for ; j < bLen; j += p {
-									ab[j] += id.LogP
-								}
-							}
-						}
-
-						rThresh := blockThresholdRat(poly, bStart, bStart+int64(bLen)-1, b, b, params.SlackRat+smallSlackRat, scratch)
-						aThresh := blockThresholdAlg(poly, bStart, bStart+int64(bLen)-1, b, b, 0, params.SlackAlg+smallSlackAlg, scratch)
+						sieveLineBlock(rb, ab, fb, ratSieve, algSieve, bStart, bLen, b, evenB)
 
 						cands = appendBothGe(cands[:0], ab, rb, aThresh, rThresh)
 						if len(cands) == 0 {
@@ -880,6 +810,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 
 	smallSlackRat := expectedSmallLogSumRat(fb, minSievePrime)
 	smallSlackAlg := expectedSmallLogSumAlg(fb, minSievePrime)
+	fastPoly := newFastNormPoly(poly)
 
 	nw := Workers
 	if nw <= 0 {
@@ -1023,18 +954,18 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 					bLen := bEnd - bStart
 
 					ab := algBuf[:bLen]
-					sieveBlockLines(ab, bStart, bEnd, I, W, algLines, algVerts, algAllLog)
+					aThresh := initLatticeNormsAlg(ab, &fastPoly, lq, bStart, bEnd, I, W, logQ, params.SlackAlg+smallSlackAlg, algAllLog)
+					sieveBlockLinesAdd(ab, bStart, bEnd, I, W, algLines, algVerts)
 					algArena.drainBlock(bi, ab, algGroups)
 
-					aThresh := latticeBlockThresholdAlg(poly, lq, bStart, bEnd, I, W, logQ, params.SlackAlg+smallSlackAlg, scratch)
 					if !hasByteGe(ab, aThresh) {
 						continue
 					}
 
 					rb := ratBuf[:bLen]
-					sieveBlockLines(rb, bStart, bEnd, I, W, ratLines, ratVerts, ratAllLog)
+					rThresh := initLatticeNormsRat(rb, &fastPoly, lq, bStart, bEnd, I, W, params.SlackRat+smallSlackRat, ratAllLog)
+					sieveBlockLinesAdd(rb, bStart, bEnd, I, W, ratLines, ratVerts)
 					ratArena.drainBlock(bi, rb, ratGroups)
-					rThresh := latticeBlockThresholdRat(poly, lq, bStart, bEnd, I, W, params.SlackRat+smallSlackRat, scratch)
 
 					rawOffs = appendBothGe(rawOffs[:0], ab, rb, aThresh, rThresh)
 					if len(rawOffs) == 0 {
@@ -1183,8 +1114,7 @@ func addSieveStride(seg []byte, x, step, limit int, logP byte) {
 	}
 }
 
-// sieveBlockLines sieves all line-sieve primes (< W) across [bStart, bEnd),
-// looping prime-outer over the L1-resident block and skipping both-even (i, j) on even j.
+// sieveBlockLines initializes buf to allLog and sieves all line primes (< W) across [bStart, bEnd).
 func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, verts []vertPrime, allLog byte) {
 	if allLog > 0 {
 		for i := range buf {
@@ -1193,7 +1123,11 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 	} else {
 		clear(buf)
 	}
+	sieveBlockLinesAdd(buf, bStart, bEnd, I, W, lines, verts)
+}
 
+// sieveBlockLinesAdd adds line and vertical prime logP hits onto an initialized block.
+func sieveBlockLinesAdd(buf []byte, bStart, bEnd, I, W int, lines []linePrime, verts []vertPrime) {
 	if bStart%W == 0 && bEnd%W == 0 {
 		j0 := 1 + bStart/W
 		nLines := (bEnd - bStart) / W
@@ -1342,100 +1276,337 @@ func expectedSmallLogSumAlg(fb *FactorBases, cut uint32) float64 {
 	return sum
 }
 
-func blockThresholdRat(poly *Poly, a0, a1, b0, b1 int64, slack float64, sc *cofactorScratch) int {
-	best := 0.0
-	for _, a := range [2]int64{a0, a1} {
-		for _, b := range [2]int64{b0, b1} {
-			evalGInto(&sc.val, poly, a, b, sc)
-			sc.val.Abs(&sc.val)
-			if sc.val.Sign() > 0 {
-				if l := arith.Log2Big(&sc.val); l > best {
-					best = l
+func sieveLineBlock(rb, ab []byte, fb *FactorBases, ratSieve, algSieve []int32, bStart int64, bLen int, b int64, evenB bool) {
+	for _, idx := range ratSieve {
+		id := fb.RFB[idx]
+		p := int(id.P)
+		if id.R == id.P {
+			if b%int64(p) == 0 {
+				if evenB {
+					j := int(bStart&1) ^ 1
+					for ; j < bLen; j += 2 {
+						rb[j] += id.LogP
+					}
+				} else {
+					for j := 0; j < bLen; j++ {
+						rb[j] += id.LogP
+					}
 				}
+			}
+			continue
+		}
+		target := (b % int64(p)) * int64(id.R) % int64(p)
+		j := int(nextOffsetInt64(bStart, target, int64(p)))
+		if evenB {
+			if (bStart+int64(j))&1 == 0 {
+				j += p
+			}
+			step := p << 1
+			for ; j < bLen; j += step {
+				rb[j] += id.LogP
+			}
+		} else {
+			for ; j < bLen; j += p {
+				rb[j] += id.LogP
 			}
 		}
 	}
-	t := int(math.Floor(best - slack))
-	if t < 0 {
-		t = 0
+
+	for _, idx := range algSieve {
+		id := fb.AFB[idx]
+		p := int(id.P)
+		if id.R == id.P {
+			if b%int64(p) == 0 {
+				if evenB {
+					j := int(bStart&1) ^ 1
+					for ; j < bLen; j += 2 {
+						ab[j] += id.LogP
+					}
+				} else {
+					for j := 0; j < bLen; j++ {
+						ab[j] += id.LogP
+					}
+				}
+			}
+			continue
+		}
+		target := (b % int64(p)) * int64(id.R) % int64(p)
+		j := int(nextOffsetInt64(bStart, target, int64(p)))
+		if evenB {
+			if (bStart+int64(j))&1 == 0 {
+				j += p
+			}
+			step := p << 1
+			for ; j < bLen; j += step {
+				ab[j] += id.LogP
+			}
+		} else {
+			for ; j < bLen; j += p {
+				ab[j] += id.LogP
+			}
+		}
 	}
-	return t
 }
 
-func blockThresholdAlg(poly *Poly, a0, a1, b0, b1 int64, logQ, slack float64, sc *cofactorScratch) int {
-	best := 0.0
-	for _, a := range [2]int64{a0, a1} {
-		for _, b := range [2]int64{b0, b1} {
-			evalFInto(&sc.val, poly, a, b, sc)
-			sc.val.Abs(&sc.val)
-			if sc.val.Sign() > 0 {
-				if l := arith.Log2Big(&sc.val); l > best {
-					best = l
-				}
-			}
-		}
-	}
-	t := int(math.Floor(best - logQ - slack))
-	if t < 0 {
-		t = 0
-	}
-	return t
+// fastNormPoly stores scaled float64 coefficients of F and G for segment log2 norm evaluation.
+type fastNormPoly struct {
+	deg    int
+	cf     []float64
+	shiftF float64
+	a1, a0 float64
+	shiftG float64
 }
 
-func latticeBlockThresholdRat(poly *Poly, lq *LatticeQ, bStart, bEnd, I, W int, slack float64, sc *cofactorScratch) int {
-	j0 := int64(1 + bStart/W)
-	j1 := int64(1 + (bEnd-1)/W)
-	i0 := int64((bStart % W) - I)
-	i1 := int64(((bEnd - 1) % W) - I)
-	if j1 > j0 {
-		i0, i1 = int64(-I), int64(I-1)
-	}
-	best := 0.0
-	for _, ii := range [2]int64{i0, i1} {
-		for _, jj := range [2]int64{j0, j1} {
-			a := ii*lq.U1 + jj*lq.V1
-			b := ii*lq.U2 + jj*lq.V2
-			evalGInto(&sc.val, poly, a, b, sc)
-			sc.val.Abs(&sc.val)
-			if sc.val.Sign() > 0 {
-				if l := arith.Log2Big(&sc.val); l > best {
-					best = l
-				}
-			}
+func newFastNormPoly(poly *Poly) fastNormPoly {
+	maxF := 0
+	for _, c := range poly.Coeffs {
+		if b := c.BitLen(); b > maxF {
+			maxF = b
 		}
 	}
-	t := int(math.Floor(best - slack))
-	if t < 0 {
-		t = 0
+	shF := maxF - 200
+	if shF < 0 {
+		shF = 0
 	}
-	return t
+	cf := make([]float64, poly.Degree+1)
+	for i, c := range poly.Coeffs {
+		cf[i] = scaledFloat(c, shF)
+	}
+
+	maxG := max(poly.A1.BitLen(), poly.A0.BitLen())
+	shG := maxG - 200
+	if shG < 0 {
+		shG = 0
+	}
+	return fastNormPoly{
+		deg:    poly.Degree,
+		cf:     cf,
+		shiftF: float64(shF),
+		a1:     scaledFloat(poly.A1, shG),
+		a0:     scaledFloat(poly.A0, shG),
+		shiftG: float64(shG),
+	}
 }
 
-func latticeBlockThresholdAlg(poly *Poly, lq *LatticeQ, bStart, bEnd, I, W int, logQ, slack float64, sc *cofactorScratch) int {
-	j0 := int64(1 + bStart/W)
-	j1 := int64(1 + (bEnd-1)/W)
-	i0 := int64((bStart % W) - I)
-	i1 := int64(((bEnd - 1) % W) - I)
-	if j1 > j0 {
-		i0, i1 = int64(-I), int64(I-1)
+func (fp *fastNormPoly) evalLog2F(a, b float64) (val, log2Abs float64) {
+	d := fp.deg
+	val = fp.cf[d]
+	bPow := 1.0
+	for k := d - 1; k >= 0; k-- {
+		bPow *= b
+		val = val*a + fp.cf[k]*bPow
 	}
-	best := 0.0
-	for _, ii := range [2]int64{i0, i1} {
-		for _, jj := range [2]int64{j0, j1} {
-			a := ii*lq.U1 + jj*lq.V1
-			b := ii*lq.U2 + jj*lq.V2
-			evalFInto(&sc.val, poly, a, b, sc)
-			sc.val.Abs(&sc.val)
-			if sc.val.Sign() > 0 {
-				if l := arith.Log2Big(&sc.val); l > best {
-					best = l
-				}
-			}
+	if val == 0 {
+		return 0, 0
+	}
+	return val, math.Log2(math.Abs(val)) + fp.shiftF
+}
+
+func (fp *fastNormPoly) evalLog2G(a, b float64) (val, log2Abs float64) {
+	val = fp.a1*a - fp.a0*b
+	if val == 0 {
+		return 0, 0
+	}
+	return val, math.Log2(math.Abs(val)) + fp.shiftG
+}
+
+func segPairThreshold(l0, l1, deduct float64) uint8 {
+	lLo, lHi := l0, l1
+	if lLo > lHi {
+		lLo, lHi = lHi, lLo
+	}
+	if lLo < lHi-5.0 {
+		lLo = lHi - 5.0
+	}
+	t := int(math.Floor(lLo - deduct))
+	if t <= 0 {
+		return 0
+	}
+	if t > 240 {
+		return 240
+	}
+	return uint8(t)
+}
+
+func initLatticeNormsAlg(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bEnd, I, W int, logQ, slack float64, allLog byte) int {
+	return initLatticeNormsSide(buf, fp, lq, bStart, bEnd, I, W, logQ+slack, slack, allLog, true)
+}
+
+func initLatticeNormsRat(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bEnd, I, W int, slack float64, allLog byte) int {
+	return initLatticeNormsSide(buf, fp, lq, bStart, bEnd, I, W, slack, slack, allLog, false)
+}
+
+func initLatticeNormsSide(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bEnd, I, W int, deduct, slack float64, allLog byte, isAlg bool) int {
+	const coarseStep = 64
+	const fineStep = 16
+	var segEnd [1088]uint16
+	var segT [1088]uint8
+	nSeg := 0
+	var tMax uint8
+
+	u1, u2 := float64(lq.U1), float64(lq.U2)
+	v1, v2 := float64(lq.V1), float64(lq.V2)
+	eval := fp.evalLog2G
+	if isAlg {
+		eval = fp.evalLog2F
+	}
+
+	appendSeg := func(endOff int, t uint8) {
+		if t > tMax {
+			tMax = t
 		}
+		if nSeg > 0 && segT[nSeg-1] == t {
+			segEnd[nSeg-1] = uint16(endOff)
+			return
+		}
+		segEnd[nSeg] = uint16(endOff)
+		segT[nSeg] = t
+		nSeg++
 	}
-	t := int(math.Floor(best - logQ - slack))
-	if t < 0 {
-		t = 0
+
+	for pos := bStart; pos < bEnd; {
+		j := float64(1 + pos/W)
+		xFrom := pos % W
+		segLen := W - xFrom
+		if bEnd-pos < segLen {
+			segLen = bEnd - pos
+		}
+		xEnd := xFrom + segLen
+		baseOff := pos - bStart
+		aLine := j*v1 - float64(I)*u1
+		bLine := j*v2 - float64(I)*u2
+
+		v0, l0 := eval(aLine+float64(xFrom)*u1, bLine+float64(xFrom)*u2)
+		for x0 := xFrom; x0 < xEnd; {
+			x1 := x0 + coarseStep
+			if x1 > xEnd {
+				x1 = xEnd
+			}
+			xEval := x1
+			if x1 == xEnd && xEnd > x0+1 {
+				xEval = xEnd - 1
+			}
+			v1, l1 := eval(aLine+float64(xEval)*u1, bLine+float64(xEval)*u2)
+			if (v0*v1 <= 0 || math.Abs(l1-l0) > 4.0) && x1-x0 > fineStep {
+				va, la := v0, l0
+				for xs := x0; xs < x1; {
+					xe := xs + fineStep
+					if xe >= x1 {
+						appendSeg(baseOff+(x1-xFrom), segPairThreshold(la, l1, deduct))
+						break
+					}
+					vb, lb := eval(aLine+float64(xe)*u1, bLine+float64(xe)*u2)
+					appendSeg(baseOff+(xe-xFrom), segPairThreshold(la, lb, deduct))
+					va, la = vb, lb
+					_ = va
+					xs = xe
+				}
+			} else {
+				appendSeg(baseOff+(x1-xFrom), segPairThreshold(l0, l1, deduct))
+			}
+			v0, l0 = v1, l1
+			x0 = x1
+		}
+		pos += segLen
 	}
-	return t
+
+	return fillNormSegments(buf, segEnd[:nSeg], segT[:nSeg], int(tMax), slack, allLog)
+}
+
+func lineBlockNormsAlg(buf []byte, fp *fastNormPoly, bStart int64, bLen int, b int64, slack float64) int {
+	return lineBlockNormsSide(buf, fp, bStart, bLen, b, slack, true)
+}
+
+func lineBlockNormsRat(buf []byte, fp *fastNormPoly, bStart int64, bLen int, b int64, slack float64) int {
+	return lineBlockNormsSide(buf, fp, bStart, bLen, b, slack, false)
+}
+
+func lineBlockNormsSide(buf []byte, fp *fastNormPoly, bStart int64, bLen int, b int64, slack float64, isAlg bool) int {
+	const coarseStep = 64
+	const fineStep = 16
+	var segEnd [1088]uint16
+	var segT [1088]uint8
+	nSeg := 0
+	var tMax uint8
+
+	bf := float64(b)
+	a0f := float64(bStart)
+	eval := fp.evalLog2G
+	if isAlg {
+		eval = fp.evalLog2F
+	}
+
+	appendSeg := func(endOff int, t uint8) {
+		if t > tMax {
+			tMax = t
+		}
+		if nSeg > 0 && segT[nSeg-1] == t {
+			segEnd[nSeg-1] = uint16(endOff)
+			return
+		}
+		segEnd[nSeg] = uint16(endOff)
+		segT[nSeg] = t
+		nSeg++
+	}
+
+	v0, l0 := eval(a0f, bf)
+	for x0 := 0; x0 < bLen; {
+		x1 := x0 + coarseStep
+		if x1 > bLen {
+			x1 = bLen
+		}
+		xEval := x1
+		if x1 == bLen && bLen > x0+1 {
+			xEval = bLen - 1
+		}
+		v1, l1 := eval(a0f+float64(xEval), bf)
+		if (v0*v1 <= 0 || math.Abs(l1-l0) > 4.0) && x1-x0 > fineStep {
+			la := l0
+			for xs := x0; xs < x1; {
+				xe := xs + fineStep
+				if xe >= x1 {
+					appendSeg(x1, segPairThreshold(la, l1, slack))
+					break
+				}
+				_, lb := eval(a0f+float64(xe), bf)
+				appendSeg(xe, segPairThreshold(la, lb, slack))
+				la = lb
+				xs = xe
+			}
+		} else {
+			appendSeg(x1, segPairThreshold(l0, l1, slack))
+		}
+		v0, l0 = v1, l1
+		x0 = x1
+	}
+
+	return fillNormSegments(buf, segEnd[:nSeg], segT[:nSeg], int(tMax), slack, 0)
+}
+
+func fillNormSegments(buf []byte, segEnd []uint16, segT []uint8, tMax int, slack float64, allLog byte) int {
+	maxT := 245 - int(math.Ceil(slack))
+	if maxT < int(allLog) {
+		maxT = int(allLog)
+	}
+	effTMax := tMax
+	if effTMax > maxT {
+		effTMax = maxT
+	}
+	prev := 0
+	for s, end16 := range segEnd {
+		end := int(end16)
+		initVal := int(allLog) + effTMax - int(segT[s])
+		if initVal < int(allLog) {
+			initVal = int(allLog)
+		} else if initVal > 255 {
+			initVal = 255
+		}
+		bVal := byte(initVal)
+		seg := buf[prev:end]
+		for i := range seg {
+			seg[i] = bVal
+		}
+		prev = end
+	}
+	return effTMax
 }

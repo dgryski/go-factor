@@ -322,3 +322,48 @@ func TestLatticeRoundTripAndRelations(t *testing.T) {
 		verifyRel(r)
 	}
 }
+
+func TestSubSegmentNormInit(t *testing.T) {
+	rnd := rand.New(rand.NewSource(41))
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 130), testutil.RandomPrime(rnd, 130))
+	poly, fac := SelectPoly(n, 4)
+	if fac != nil || poly == nil {
+		t.Skip("lucky factor or nil poly")
+	}
+	fp := newFastNormPoly(poly)
+
+	for trial := 0; trial < 40; trial++ {
+		a := int64(rnd.Intn(200000) - 100000)
+		b := int64(1 + rnd.Intn(50000))
+		fExact := new(big.Int).Abs(poly.EvalF(a, b))
+		if fExact.Sign() > 0 {
+			_, gotF := fp.evalLog2F(float64(a), float64(b))
+			wantF := arith.Log2Big(fExact)
+			if diff := gotF - wantF; diff < -0.02 || diff > 0.02 {
+				t.Fatalf("evalLog2F(%d,%d) = %.4f, want %.4f", a, b, gotF, wantF)
+			}
+		}
+		gExact := new(big.Int).Abs(poly.EvalG(a, b))
+		if gExact.Sign() > 0 {
+			_, gotG := fp.evalLog2G(float64(a), float64(b))
+			wantG := arith.Log2Big(gExact)
+			if diff := gotG - wantG; diff < -0.02 || diff > 0.02 {
+				t.Fatalf("evalLog2G(%d,%d) = %.4f, want %.4f", a, b, gotG, wantG)
+			}
+		}
+	}
+
+	// Verify interior offsets receive positive baseline credit relative to block corners.
+	lq := ReduceLattice(100003, 12345, poly.Skew, 2048, 1024, -1)
+	var ab [blockSize]byte
+	const W = 4096
+	aThresh := initLatticeNormsAlg(ab[:], &fp, &lq, 0, blockSize, 2048, W, 16.6, 48.0, 2)
+	if aThresh <= 0 {
+		t.Fatalf("unexpected non-positive block threshold %d", aThresh)
+	}
+	center := ab[2048]
+	corner := ab[W-1]
+	if center <= corner {
+		t.Fatalf("expected center baseline (%d) > corner baseline (%d) on j=1", center, corner)
+	}
+}
