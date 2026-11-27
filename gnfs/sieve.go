@@ -13,12 +13,13 @@ import (
 )
 
 const (
-	blockShift    = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
-	blockSize     = 1 << blockShift
-	blockMask     = blockSize - 1
-	minSievePrime = 29
-	minSievePower = 32
-	maxSievePower = 256
+	blockShift     = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
+	blockSize      = 1 << blockShift
+	blockMask      = blockSize - 1
+	maxStripBlocks = 256
+	minSievePrime  = 29
+	minSievePower  = 32
+	maxSievePower  = 256
 )
 
 // oddModInv32 returns p^-1 mod 2^32 and floor((2^32-1)/p) for exact uint32
@@ -499,6 +500,225 @@ func emitVertArena(p, I, J, W int, idx int32, logP byte, a *fkArena) {
 	}
 }
 
+// fkWalker holds per ideal Franke Kleinjung walk state resumed across L2 cache strips.
+type fkWalker struct {
+	pos     int
+	step0   int
+	step1   int
+	idx     int32
+	x       int32
+	thresh0 int32
+	thresh1 int32
+	dx0     int32
+	dx1     int32
+	vertP   int32
+}
+
+func makeFKWalker(p, lam uint32, I, W int, idx int32, vert bool) fkWalker {
+	if vert {
+		return fkWalker{idx: idx, vertP: int32(p)}
+	}
+	if lam == 0 {
+		return fkWalker{idx: idx, pos: I, step0: 2 * W}
+	}
+	a0, b0, a1, b1 := fkReduce(int64(p), int64(lam), int64(W))
+	t0 := int32(-a0)
+	t1 := int32(W - int(a1))
+	dx0 := int32(a0)
+	dx1 := int32(a1)
+	s0 := int(b0)*W + int(a0)
+	s1 := int(b1)*W + int(a1)
+	pos := I
+	x := int32(I)
+	if x >= t0 {
+		pos += s0
+		x += dx0
+	} else if x < t1 {
+		pos += s1
+		x += dx1
+	} else {
+		pos += s0 + s1
+		x += dx0 + dx1
+	}
+	return fkWalker{
+		pos:     pos,
+		step0:   s0,
+		step1:   s1,
+		idx:     idx,
+		x:       x,
+		thresh0: t0,
+		thresh1: t1,
+		dx0:     dx0,
+		dx1:     dx1,
+		vertP:   -1,
+	}
+}
+
+func emitVertStripArena(p, I, J, W int, idx int32, logP byte, stripBlock0, stripStartPos, stripEndPos int, a *fkArena) {
+	if p >= J || stripStartPos >= stripEndPos {
+		return
+	}
+	tag := uint32(idx) << blockShift
+	counts := a.counts
+	data := a.data
+	stride := a.stride
+	if idx >= 1<<(32-blockShift) {
+		stride = 0
+	}
+	shift := a.shift
+	jMin := stripStartPos/W + 1
+	jFirst := ((jMin + p - 1) / p) * p
+	if jFirst < p {
+		jFirst = p
+	}
+	wantOddX := (I & 1) ^ 1
+	for j := jFirst; j < J; j += p {
+		base := (j - 1) * W
+		if base >= stripEndPos {
+			break
+		}
+		xLo := 0
+		if stripStartPos > base {
+			xLo = stripStartPos - base
+		}
+		xHi := W
+		if stripEndPos-base < W {
+			xHi = stripEndPos - base
+		}
+		if j&1 == 0 {
+			if (xLo & 1) != wantOddX {
+				xLo++
+			}
+			for x := xLo; x < xHi; x += 2 {
+				pos := base + x
+				bi := (pos >> blockShift) - stripBlock0
+				off := uint32(pos & blockMask)
+				if n := counts[bi]; n < stride {
+					data[bi<<shift|int(n)] = tag | off
+					counts[bi] = n + 1
+				} else {
+					a.addOverflow(bi, idx, uint16(off), logP)
+				}
+			}
+		} else {
+			for x := xLo; x < xHi; x++ {
+				pos := base + x
+				bi := (pos >> blockShift) - stripBlock0
+				off := uint32(pos & blockMask)
+				if n := counts[bi]; n < stride {
+					data[bi<<shift|int(n)] = tag | off
+					counts[bi] = n + 1
+				} else {
+					a.addOverflow(bi, idx, uint16(off), logP)
+				}
+			}
+		}
+	}
+}
+
+func advanceFKWalkers(walkers []fkWalker, I, J, W int, logP byte, stripBlock0, stripStartPos, stripEndPos int, a *fkArena) {
+	counts := a.counts
+	data := a.data
+	baseStride := a.stride
+	shift := a.shift
+	stripLimit := stripEndPos + W
+	pow2W := W&(W-1) == 0 && I&1 == 0
+	evenMask := W | 1
+
+	for wi := range walkers {
+		w := &walkers[wi]
+		if w.vertP > 0 {
+			emitVertStripArena(int(w.vertP), I, J, W, w.idx, logP, stripBlock0, stripStartPos, stripEndPos, a)
+			continue
+		}
+		tag := uint32(w.idx) << blockShift
+		stride := baseStride
+		if w.idx >= 1<<(32-blockShift) {
+			stride = 0
+		}
+		if w.vertP == 0 {
+			pos := w.pos
+			step := w.step0
+			for pos < stripEndPos {
+				bi := (pos >> blockShift) - stripBlock0
+				off := uint32(pos & blockMask)
+				if n := counts[bi]; n < stride {
+					data[bi<<shift|int(n)] = tag | off
+					counts[bi] = n + 1
+				} else {
+					a.addOverflow(bi, w.idx, uint16(off), logP)
+				}
+				pos += step
+			}
+			w.pos = pos
+			continue
+		}
+
+		pos := w.pos
+		if pos >= stripLimit {
+			continue
+		}
+		x := w.x
+		t0, t1 := w.thresh0, w.thresh1
+		dx0, dx1 := w.dx0, w.dx1
+		dx01 := dx0 + dx1
+		s0, s1 := w.step0, w.step1
+		s01 := s0 + s1
+
+		if pow2W {
+			for pos < stripLimit {
+				if pos&evenMask != 0 {
+					adjPos := pos - W
+					bi := (adjPos >> blockShift) - stripBlock0
+					off := uint32(adjPos & blockMask)
+					if n := counts[bi]; n < stride {
+						data[bi<<shift|int(n)] = tag | off
+						counts[bi] = n + 1
+					} else {
+						a.addOverflow(bi, w.idx, uint16(off), logP)
+					}
+				}
+				if x >= t0 {
+					pos += s0
+					x += dx0
+				} else if x < t1 {
+					pos += s1
+					x += dx1
+				} else {
+					pos += s01
+					x += dx01
+				}
+			}
+		} else {
+			for pos < stripLimit {
+				if ((int(x)-I)|(pos/W))&1 != 0 {
+					adjPos := pos - W
+					bi := (adjPos >> blockShift) - stripBlock0
+					off := uint32(adjPos & blockMask)
+					if n := counts[bi]; n < stride {
+						data[bi<<shift|int(n)] = tag | off
+						counts[bi] = n + 1
+					} else {
+						a.addOverflow(bi, w.idx, uint16(off), logP)
+					}
+				}
+				if x >= t0 {
+					pos += s0
+					x += dx0
+				} else if x < t1 {
+					pos += s1
+					x += dx1
+				} else {
+					pos += s01
+					x += dx01
+				}
+			}
+		}
+		w.pos = pos
+		w.x = x
+	}
+}
+
 // hasByteGe reports whether any byte in buf is >= thresh, scanning 8 bytes per word.
 func hasByteGe(buf []byte, thresh int) bool {
 	if thresh <= 0 {
@@ -850,6 +1070,10 @@ func sieveLatticeQs(poly *Poly, fb *FactorBases, params *Params, sqs []LatticeQ,
 }
 
 func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs []LatticeQ, maxWorkers int, onRel func(Relation), shouldStop func() bool) int {
+	return sieveLatticeQsStrip(poly, fb, params, sqs, maxWorkers, maxStripBlocks, onRel, shouldStop)
+}
+
+func sieveLatticeQsStrip(poly *Poly, fb *FactorBases, params *Params, sqs []LatticeQ, maxWorkers, maxBlocksPerStrip int, onRel func(Relation), shouldStop func() bool) int {
 	if len(sqs) == 0 {
 		return 0
 	}
@@ -859,6 +1083,11 @@ func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs 
 	W := 2 * I
 	total := (J - 1) * W
 	numBlocks := (total + blockSize - 1) >> blockShift
+	arenaBlocks := numBlocks
+	if maxBlocksPerStrip > 0 && arenaBlocks > maxBlocksPerStrip {
+		arenaBlocks = maxBlocksPerStrip
+	}
+	multiStrip := numBlocks > arenaBlocks
 
 	var ratSmall, ratLineIdx, ratFK []int32
 	for i, id := range fb.RFB {
@@ -927,8 +1156,8 @@ func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs 
 		go func() {
 			defer wg.Done()
 			var ratBuf, algBuf [blockSize]byte
-			ratArena := newFKArena(numBlocks, len(ratGroups), ratExpHits)
-			algArena := newFKArena(numBlocks, len(algGroups), algExpHits)
+			ratArena := newFKArena(arenaBlocks, len(ratGroups), ratExpHits)
+			algArena := newFKArena(arenaBlocks, len(algGroups), algExpHits)
 			scratch := newCofactorScratch(poly.Degree)
 
 			ratLines := make([]linePrime, 0, len(ratLineIdx))
@@ -939,6 +1168,15 @@ func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs 
 			var algVerts []vertPrime
 			var algAll []int32
 			algPowers := make([]sievePower, 0, len(algPowIdeals))
+
+			var ratWalkers, algWalkers []fkWalker
+			var ratWalkerEnds, algWalkerEnds []int
+			if multiStrip {
+				ratWalkers = make([]fkWalker, 0, len(ratFK))
+				algWalkers = make([]fkWalker, 0, len(algFK))
+				ratWalkerEnds = make([]int, len(ratGroups))
+				algWalkerEnds = make([]int, len(algGroups))
+			}
 
 			var rawOffs []int
 			var candPos []int
@@ -1012,211 +1250,272 @@ func sieveLatticeQsWithWorkers(poly *Poly, fb *FactorBases, params *Params, sqs 
 				}
 				algPowers = transformPowerIdeals(algPowers[:0], algPowIdeals, lq)
 
-				for g, grp := range ratGroups {
-					for _, idx := range ratFK[grp.start:grp.end] {
-						id := fb.RFB[idx]
-						lam, vert, all := transformRoot(id.P, id.R, lq)
-						if all {
-							ratAll = append(ratAll, idx)
-							ratAllLog += id.LogP
-						} else if vert {
-							emitVertArena(int(id.P), I, J, W, idx, grp.logP, ratArena)
-						} else {
-							addFKHitsArena(id.P, lam, I, J, idx, grp.logP, ratArena)
-						}
-					}
-					ratArena.endGroup(g)
-				}
-
-				for g, grp := range algGroups {
-					for _, idx := range algFK[grp.start:grp.end] {
-						id := fb.AFB[idx]
-						if id.P == lq.Q {
-							continue
-						}
-						lam, vert, all := transformRoot(id.P, id.R, lq)
-						if all {
-							algAll = append(algAll, idx)
-							algAllLog += id.LogP
-						} else if vert {
-							emitVertArena(int(id.P), I, J, W, idx, grp.logP, algArena)
-						} else {
-							addFKHitsArena(id.P, lam, I, J, idx, grp.logP, algArena)
-						}
-					}
-					algArena.endGroup(g)
-				}
-
-				for bi := 0; bi < numBlocks && !stop.Load(); bi++ {
-					bStart := bi * blockSize
-					bEnd := bStart + blockSize
-					if bEnd > total {
-						bEnd = total
-					}
-					bLen := bEnd - bStart
-
-					ab := algBuf[:bLen]
-					aThresh := initLatticeNormsAlg(ab, &fastPoly, lq, bStart, bEnd, I, W, logQ, params.SlackAlg+smallSlackAlg, algAllLog)
-					sieveBlockLinesAdd(ab, bStart, bEnd, I, W, algLines, algVerts)
-					sieveBlockPowersAdd(ab, bStart, bEnd, I, W, algPowers)
-					algArena.drainBlock(bi, ab, algGroups)
-
-					if !hasByteGe(ab, aThresh) {
-						continue
-					}
-
-					rb := ratBuf[:bLen]
-					rThresh := initLatticeNormsRat(rb, &fastPoly, lq, bStart, bEnd, I, W, params.SlackRat+smallSlackRat, ratAllLog)
-					sieveBlockLinesAdd(rb, bStart, bEnd, I, W, ratLines, ratVerts)
-					sieveBlockPowersAdd(rb, bStart, bEnd, I, W, ratPowers)
-					ratArena.drainBlock(bi, rb, ratGroups)
-
-					rawOffs = appendBothGe(rawOffs[:0], ab, rb, aThresh, rThresh)
-					if len(rawOffs) == 0 {
-						continue
-					}
-
-					candPos = candPos[:0]
-					candI = candI[:0]
-					candJ = candJ[:0]
-					candA = candA[:0]
-					candB = candB[:0]
-					for _, off := range rawOffs {
-						gPos := bStart + off
-						j := 1 + gPos/W
-						i := (gPos % W) - I
-						if (i|j)&1 == 0 {
-							continue
-						}
-						ui := uint64(i)
-						if i < 0 {
-							ui = uint64(-i)
-						}
-						if arith.Gcd64(ui, uint64(j)) != 1 {
-							continue
-						}
-						a := int64(i)*lq.U1 + int64(j)*lq.V1
-						b := int64(i)*lq.U2 + int64(j)*lq.V2
-						if b == 0 {
-							continue
-						}
-						if b < 0 {
-							a, b = -a, -b
-						}
-						ua := uint64(a)
-						if a < 0 {
-							ua = uint64(-a)
-						}
-						if arith.Gcd64(ua, uint64(b)) != 1 {
-							continue
-						}
-						candPos = append(candPos, off)
-						candI = append(candI, i)
-						candJ = append(candJ, j)
-						candA = append(candA, a)
-						candB = append(candB, b)
-					}
-					if len(candPos) == 0 {
-						continue
-					}
-
-					// Stage 1 filters G(a, b) before scanning algebraic buckets.
-					for len(ratCandHits) < len(candPos) {
-						ratCandHits = append(ratCandHits, nil)
-					}
-					for k, off := range candPos {
-						candBits[off/64] |= 1 << (uint(off) % 64)
-						candSlot[off] = uint16(k)
-						ratCandHits[k] = ratCandHits[k][:0]
-					}
-					ratArena.gatherHits(bi, &candBits, &candSlot, ratCandHits)
-					batchRatLines := len(candPos) >= 10
-					if batchRatLines {
-						gatherBlockLineHits(bStart, bEnd, I, W, ratLines, ratVerts, &candBits, &candSlot, ratCandHits)
-					}
-					for _, off := range candPos {
-						candBits[off/64] = 0
-					}
-
-					var ratLinesForCof []linePrime
-					var ratVertsForCof []vertPrime
-					if !batchRatLines {
-						ratLinesForCof = ratLines
-						ratVertsForCof = ratVerts
-					}
-
-					survivors = survivors[:0]
-					survColsBuf = survColsBuf[:0]
-					for k := range candPos {
-						ratCols, ratLPs, ok := cofactorRatLattice(
-							poly, fb, params,
-							candI[k], candJ[k], candA[k], candB[k],
-							ratSmall, ratLinesForCof, ratVertsForCof, ratAll, ratCandHits[k],
-							scratch,
-						)
-						if ok {
-							cStart := len(survColsBuf)
-							survColsBuf = append(survColsBuf, ratCols...)
-							survivors = append(survivors, ratSurv{
-								off:      candPos[k],
-								i:        candI[k],
-								j:        candJ[k],
-								a:        candA[k],
-								b:        candB[k],
-								colStart: cStart,
-								colEnd:   len(survColsBuf),
-								ratLPs:   ratLPs,
-							})
-						}
-					}
-					if len(survivors) == 0 {
-						continue
-					}
-
-					// Stage 2 scans algArena only for Stage 1 survivors.
-					for len(algCandHits) < len(survivors) {
-						algCandHits = append(algCandHits, nil)
-					}
-					for k, sv := range survivors {
-						off := sv.off
-						candBits[off/64] |= 1 << (uint(off) % 64)
-						candSlot[off] = uint16(k)
-						algCandHits[k] = algCandHits[k][:0]
-					}
-					algArena.gatherHits(bi, &candBits, &candSlot, algCandHits)
-					batchAlgLines := len(survivors) >= 10
-					if batchAlgLines {
-						gatherBlockLineHits(bStart, bEnd, I, W, algLines, algVerts, &candBits, &candSlot, algCandHits)
-					}
-					for _, sv := range survivors {
-						candBits[sv.off/64] = 0
-					}
-
-					var algLinesForCof []linePrime
-					var algVertsForCof []vertPrime
-					if !batchAlgLines {
-						algLinesForCof = algLines
-						algVertsForCof = algVerts
-					}
-
-					for k := range survivors {
-						sv := &survivors[k]
-						rel, ok := cofactorAlgLattice(
-							poly, fb, params,
-							sv.i, sv.j, sv.a, sv.b,
-							survColsBuf[sv.colStart:sv.colEnd], sv.ratLPs,
-							algSmall, algLinesForCof, algVertsForCof, algAll, algCandHits[k],
-							lq, scratch,
-						)
-						if ok {
-							mu.Lock()
-							onRel(rel)
-							if shouldStop() {
-								stop.Store(true)
+				if multiStrip {
+					ratWalkers = ratWalkers[:0]
+					for g, grp := range ratGroups {
+						for _, idx := range ratFK[grp.start:grp.end] {
+							id := fb.RFB[idx]
+							lam, vert, all := transformRoot(id.P, id.R, lq)
+							if all {
+								ratAll = append(ratAll, idx)
+								ratAllLog += id.LogP
+							} else {
+								ratWalkers = append(ratWalkers, makeFKWalker(id.P, lam, I, W, idx, vert))
 							}
-							mu.Unlock()
-							if stop.Load() {
-								return
+						}
+						ratWalkerEnds[g] = len(ratWalkers)
+					}
+					algWalkers = algWalkers[:0]
+					for g, grp := range algGroups {
+						for _, idx := range algFK[grp.start:grp.end] {
+							id := fb.AFB[idx]
+							if id.P == lq.Q {
+								continue
+							}
+							lam, vert, all := transformRoot(id.P, id.R, lq)
+							if all {
+								algAll = append(algAll, idx)
+								algAllLog += id.LogP
+							} else {
+								algWalkers = append(algWalkers, makeFKWalker(id.P, lam, I, W, idx, vert))
+							}
+						}
+						algWalkerEnds[g] = len(algWalkers)
+					}
+				} else {
+					for g, grp := range ratGroups {
+						for _, idx := range ratFK[grp.start:grp.end] {
+							id := fb.RFB[idx]
+							lam, vert, all := transformRoot(id.P, id.R, lq)
+							if all {
+								ratAll = append(ratAll, idx)
+								ratAllLog += id.LogP
+							} else if vert {
+								emitVertArena(int(id.P), I, J, W, idx, grp.logP, ratArena)
+							} else {
+								addFKHitsArena(id.P, lam, I, J, idx, grp.logP, ratArena)
+							}
+						}
+						ratArena.endGroup(g)
+					}
+
+					for g, grp := range algGroups {
+						for _, idx := range algFK[grp.start:grp.end] {
+							id := fb.AFB[idx]
+							if id.P == lq.Q {
+								continue
+							}
+							lam, vert, all := transformRoot(id.P, id.R, lq)
+							if all {
+								algAll = append(algAll, idx)
+								algAllLog += id.LogP
+							} else if vert {
+								emitVertArena(int(id.P), I, J, W, idx, grp.logP, algArena)
+							} else {
+								addFKHitsArena(id.P, lam, I, J, idx, grp.logP, algArena)
+							}
+						}
+						algArena.endGroup(g)
+					}
+				}
+
+				for stripBlock0 := 0; stripBlock0 < numBlocks && !stop.Load(); stripBlock0 += arenaBlocks {
+					stripBlocks := min(arenaBlocks, numBlocks-stripBlock0)
+					if multiStrip {
+						stripStartPos := stripBlock0 * blockSize
+						stripEndPos := min(total, (stripBlock0+stripBlocks)*blockSize)
+						ratArena.reset()
+						for g, grp := range ratGroups {
+							wStart := 0
+							if g > 0 {
+								wStart = ratWalkerEnds[g-1]
+							}
+							advanceFKWalkers(ratWalkers[wStart:ratWalkerEnds[g]], I, J, W, grp.logP, stripBlock0, stripStartPos, stripEndPos, ratArena)
+							ratArena.endGroup(g)
+						}
+						algArena.reset()
+						for g, grp := range algGroups {
+							wStart := 0
+							if g > 0 {
+								wStart = algWalkerEnds[g-1]
+							}
+							advanceFKWalkers(algWalkers[wStart:algWalkerEnds[g]], I, J, W, grp.logP, stripBlock0, stripStartPos, stripEndPos, algArena)
+							algArena.endGroup(g)
+						}
+					}
+
+					for localBI := 0; localBI < stripBlocks && !stop.Load(); localBI++ {
+						bi := stripBlock0 + localBI
+						bStart := bi * blockSize
+						bEnd := bStart + blockSize
+						if bEnd > total {
+							bEnd = total
+						}
+						bLen := bEnd - bStart
+
+						ab := algBuf[:bLen]
+						aThresh := initLatticeNormsAlg(ab, &fastPoly, lq, bStart, bEnd, I, W, logQ, params.SlackAlg+smallSlackAlg, algAllLog)
+						sieveBlockLinesAdd(ab, bStart, bEnd, I, W, algLines, algVerts)
+						sieveBlockPowersAdd(ab, bStart, bEnd, I, W, algPowers)
+						algArena.drainBlock(localBI, ab, algGroups)
+
+						if !hasByteGe(ab, aThresh) {
+							continue
+						}
+
+						rb := ratBuf[:bLen]
+						rThresh := initLatticeNormsRat(rb, &fastPoly, lq, bStart, bEnd, I, W, params.SlackRat+smallSlackRat, ratAllLog)
+						sieveBlockLinesAdd(rb, bStart, bEnd, I, W, ratLines, ratVerts)
+						sieveBlockPowersAdd(rb, bStart, bEnd, I, W, ratPowers)
+						ratArena.drainBlock(localBI, rb, ratGroups)
+
+						rawOffs = appendBothGe(rawOffs[:0], ab, rb, aThresh, rThresh)
+						if len(rawOffs) == 0 {
+							continue
+						}
+
+						candPos = candPos[:0]
+						candI = candI[:0]
+						candJ = candJ[:0]
+						candA = candA[:0]
+						candB = candB[:0]
+						for _, off := range rawOffs {
+							gPos := bStart + off
+							j := 1 + gPos/W
+							i := (gPos % W) - I
+							if (i|j)&1 == 0 {
+								continue
+							}
+							ui := uint64(i)
+							if i < 0 {
+								ui = uint64(-i)
+							}
+							if arith.Gcd64(ui, uint64(j)) != 1 {
+								continue
+							}
+							a := int64(i)*lq.U1 + int64(j)*lq.V1
+							b := int64(i)*lq.U2 + int64(j)*lq.V2
+							if b == 0 {
+								continue
+							}
+							if b < 0 {
+								a, b = -a, -b
+							}
+							ua := uint64(a)
+							if a < 0 {
+								ua = uint64(-a)
+							}
+							if arith.Gcd64(ua, uint64(b)) != 1 {
+								continue
+							}
+							candPos = append(candPos, off)
+							candI = append(candI, i)
+							candJ = append(candJ, j)
+							candA = append(candA, a)
+							candB = append(candB, b)
+						}
+						if len(candPos) == 0 {
+							continue
+						}
+
+						// Stage 1 filters G(a, b) before scanning algebraic buckets.
+						for len(ratCandHits) < len(candPos) {
+							ratCandHits = append(ratCandHits, nil)
+						}
+						for k, off := range candPos {
+							candBits[off/64] |= 1 << (uint(off) % 64)
+							candSlot[off] = uint16(k)
+							ratCandHits[k] = ratCandHits[k][:0]
+						}
+						ratArena.gatherHits(localBI, &candBits, &candSlot, ratCandHits)
+						batchRatLines := len(candPos) >= 10
+						if batchRatLines {
+							gatherBlockLineHits(bStart, bEnd, I, W, ratLines, ratVerts, &candBits, &candSlot, ratCandHits)
+						}
+						for _, off := range candPos {
+							candBits[off/64] = 0
+						}
+
+						var ratLinesForCof []linePrime
+						var ratVertsForCof []vertPrime
+						if !batchRatLines {
+							ratLinesForCof = ratLines
+							ratVertsForCof = ratVerts
+						}
+
+						survivors = survivors[:0]
+						survColsBuf = survColsBuf[:0]
+						for k := range candPos {
+							ratCols, ratLPs, ok := cofactorRatLattice(
+								poly, fb, params,
+								candI[k], candJ[k], candA[k], candB[k],
+								ratSmall, ratLinesForCof, ratVertsForCof, ratAll, ratCandHits[k],
+								scratch,
+							)
+							if ok {
+								cStart := len(survColsBuf)
+								survColsBuf = append(survColsBuf, ratCols...)
+								survivors = append(survivors, ratSurv{
+									off:      candPos[k],
+									i:        candI[k],
+									j:        candJ[k],
+									a:        candA[k],
+									b:        candB[k],
+									colStart: cStart,
+									colEnd:   len(survColsBuf),
+									ratLPs:   ratLPs,
+								})
+							}
+						}
+						if len(survivors) == 0 {
+							continue
+						}
+
+						// Stage 2 scans algArena only for Stage 1 survivors.
+						for len(algCandHits) < len(survivors) {
+							algCandHits = append(algCandHits, nil)
+						}
+						for k, sv := range survivors {
+							off := sv.off
+							candBits[off/64] |= 1 << (uint(off) % 64)
+							candSlot[off] = uint16(k)
+							algCandHits[k] = algCandHits[k][:0]
+						}
+						algArena.gatherHits(localBI, &candBits, &candSlot, algCandHits)
+						batchAlgLines := len(survivors) >= 10
+						if batchAlgLines {
+							gatherBlockLineHits(bStart, bEnd, I, W, algLines, algVerts, &candBits, &candSlot, algCandHits)
+						}
+						for _, sv := range survivors {
+							candBits[sv.off/64] = 0
+						}
+
+						var algLinesForCof []linePrime
+						var algVertsForCof []vertPrime
+						if !batchAlgLines {
+							algLinesForCof = algLines
+							algVertsForCof = algVerts
+						}
+
+						for k := range survivors {
+							sv := &survivors[k]
+							rel, ok := cofactorAlgLattice(
+								poly, fb, params,
+								sv.i, sv.j, sv.a, sv.b,
+								survColsBuf[sv.colStart:sv.colEnd], sv.ratLPs,
+								algSmall, algLinesForCof, algVertsForCof, algAll, algCandHits[k],
+								lq, scratch,
+							)
+							if ok {
+								mu.Lock()
+								onRel(rel)
+								if shouldStop() {
+									stop.Store(true)
+								}
+								mu.Unlock()
+								if stop.Load() {
+									return
+								}
 							}
 						}
 					}

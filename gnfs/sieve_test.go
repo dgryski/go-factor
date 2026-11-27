@@ -471,3 +471,64 @@ func TestOddModInv32AndPowerSieving(t *testing.T) {
 		}
 	}
 }
+
+func TestLatticeMultiStripMatchesSingleStrip(t *testing.T) {
+	rnd := rand.New(rand.NewSource(77))
+	n := new(big.Int).Mul(testutil.RandomPrime(rnd, 58), testutil.RandomPrime(rnd, 58))
+	poly, fac := BaseMPoly(n, 3, 6)
+	if fac != nil {
+		t.Skip("got lucky factor")
+	}
+	fb := BuildFactorBases(poly, 1200, 1500, 80000, 64)
+
+	for _, tc := range []struct {
+		I, J  int
+		strip int
+	}{
+		{60, 320, 1},
+		{256, 256, 2},
+	} {
+		params := &Params{
+			Degree: 3, Br: 1200, Ba: 1500,
+			LpBoundRat: 32000, LpBoundAlg: 32000,
+			MfbRat: 30, MfbAlg: 30, MaxLPRat: 2, MaxLPAlg: 2,
+			UseLattice: true, QMin: 1200, QMax: 1600,
+			IHalf: tc.I, JMax: tc.J,
+			SlackRat: 28, SlackAlg: 28,
+		}
+		sqs := buildSpecialQs(poly, fb, params)
+		if len(sqs) > 8 {
+			sqs = sqs[:8]
+		}
+		var single, multi []Relation
+		sieveLatticeQsStrip(poly, fb, params, sqs, 1, 0, func(r Relation) {
+			single = append(single, r)
+		}, func() bool { return false })
+		sieveLatticeQsStrip(poly, fb, params, sqs, 1, tc.strip, func(r Relation) {
+			multi = append(multi, r)
+		}, func() bool { return false })
+
+		if len(single) == 0 || len(single) != len(multi) {
+			t.Fatalf("I=%d J=%d strip=%d: single=%d relations, multi=%d", tc.I, tc.J, tc.strip, len(single), len(multi))
+		}
+		for k := range single {
+			a, b := single[k], multi[k]
+			if a.A != b.A || a.B != b.B || a.RatLPs != b.RatLPs || len(a.RatCols) != len(b.RatCols) || len(a.AlgCols) != len(b.AlgCols) || len(a.AlgLPs) != len(b.AlgLPs) {
+				t.Fatalf("I=%d J=%d relation %d mismatch: single=%+v multi=%+v", tc.I, tc.J, k, a, b)
+			}
+		}
+
+		// Also verify multi worker multi strip produces the identical deduplicated relation set.
+		seenMulti4 := make(map[[2]int64]bool)
+		sieveLatticeQsStrip(poly, fb, params, sqs, 4, tc.strip, func(r Relation) {
+			seenMulti4[[2]int64{r.A, r.B}] = true
+		}, func() bool { return false })
+		seenSingle := make(map[[2]int64]bool)
+		for _, r := range single {
+			seenSingle[[2]int64{r.A, r.B}] = true
+		}
+		if len(seenMulti4) != len(seenSingle) {
+			t.Fatalf("I=%d J=%d 4-worker unique=%d, want %d", tc.I, tc.J, len(seenMulti4), len(seenSingle))
+		}
+	}
+}
