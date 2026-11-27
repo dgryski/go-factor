@@ -805,27 +805,27 @@ With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20�
 
 ### Priority 1 (CPU hotspots and sieve data structures)
 
-1. **Remove `big.Int` division and `nextOffset` divisions (`sieveA`, `fillBuckets`, `tryFactorize`)**
+1. **Done (`58530b6`). Remove `big.Int` division and `nextOffset` divisions (`sieveA`, `fillBuckets`, `tryFactorize`)**
    - Compute `aInv`, `deltas`, and initial roots in one pass per `A` using `uint64` prefix-product batch inversion of $q_j \bmod p$ and 32-bit `invMod32` ($B_j A^{-1} \equiv \gamma_j q_j^{-1} \pmod p$).
    - Store `r1, r2` directly as non-negative offsets from `lo`, removing `nextOffset` divisions from `sievePoly` and `fillBuckets`, and use a branch-only single-hit check when $p \ge 2M$.
-   - Factor $|Y(x)|$ using 32/64-bit hardware `UDIV` limb division instead of `big.Int.QuoRem`, testing small primes directly against `w.roots[:resieveFrom]`.
-2. **Flat `uint32` bucket arena and 8-byte SWAR scan (`sievePoly`, `fillBuckets`, `bucketHits`)**
-   - Replace `buckets [][]uint64` (8 bytes/hit + slice headers) with a pre-allocated flat `uint32` slab (`idx << blockShift | off`, 4 bytes/hit) grouped by `logP` with 4x unrolled draining.
-   - Replace the byte-by-byte threshold loop with 8-byte SWAR scanning, `clear(block)`, and 4x unrolled prime stride updates.
+   - Factor $|Y(x)|$ using 32/64-bit hardware `UDIV` limb division instead of `big.Int.QuoRem`, testing small primes directly against `w.roots[:resieveFrom]`. Cut the 80-digit run from 16.45s (14.96s sieve) to 13.00s (11.52s sieve).
+2. **Done (`1c11a7c`). Flat `uint32` bucket arena and 8-byte SWAR scan (`sievePoly`, `fillBuckets`, `bucketHits`)**
+   - Replace `buckets [][]uint64` (8 bytes/hit + slice headers) with a pre-allocated flat `uint32` slab (`idx << blockShift | off`, 4 bytes/hit) grouped by `logP` with 4x unrolled draining, 12-byte `bkRoot` entries, and branchless `moveRoots`.
+   - Replace the byte-by-byte threshold loop with 8-byte SWAR scanning, `clear(block)`, and 4x unrolled prime stride updates. Cut the 80-digit run from 13.00s to 11.06s (9.58s sieve).
 
 ### Priority 2 (Algorithmic and parameter wins at 70–95 digits)
 
-3. **$Q_2(x)$ polynomials when $kN \equiv 1 \pmod 8$**
+3. **Done (`a09a31e`). $Q_2(x)$ polynomials when $kN \equiv 1 \pmod 8$**
    - Sieve $Y_2(x) = ((2Ax + B)^2 - kN)/(4A)$ with odd $B$ (choosing the sign of $B_{s-1}$ so $B$ is odd) and $X = (2Ax + B)(N+1)/2 \bmod N$, halving target $A$ and dividing sieve values by 4.
-4. **Tighter partial recount schedule near completion**
-   - Shrink the `countPartials` interval as `len(relations) + partialExcess` approaches `want` so runs stop near `want` instead of overshooting by ~5–6%.
+4. **Done (`a09a31e`). Tighter partial recount schedule near completion**
+   - Shrink the `countPartials` interval as `len(relations) + partialExcess` approaches `want`. Together with $Q_2(x)$, cut 80-digit polynomials from 225,643 to 194,913, overshoot from +1,972 to 0 (`59,391/59,391`), and runtime to 10.41s (9.03s sieve).
 5. **Retune factor base table, Double Large Primes, sieve width, and small-prime skip**
    - Replace `L(N)^0.46` above ~200 bits with a smaller table-driven $B$ paired with Double Large Primes (`dlpMinBits`, `dlpSlackFrac`, higher `largePrimeMult`), `largeSieveRange` (`256K`), and higher `minSievePrime` (small-prime variation), swept after Priorities 1–2.4 are in place.
 
 ### Priority 3 (Pipeline, robustness, and vectorisation)
 
-6. **Combine all 64 Lanczos dependencies by GCD** so composites with 3+ factors split from one matrix.
-7. **Sieve additional relations if all dependencies are trivial** instead of returning `nil`.
+6. **Done. Combine all 64 Lanczos dependencies by GCD** (`splitAll` / `refineDependencies`) so composites with 3+ factors split from one matrix without re-sieving composite cofactors.
+7. **Done. Sieve additional relations if all dependencies are trivial** (`maxSieveRetries = 3`, resuming `aRng`/`aSeen`) instead of returning `nil`.
 8. **Raise `qsMaxBits` to the QS/GNFS crossover (~95 digits)** and retune the parallel ECM pretest share in `factor/budget.go`.
 9. **Single `n mod p` setup pass** combining trial division, Legendre symbol, and modular square root setup.
 10. **Small P−1 / ECM cofactor split** ahead of `rho64` if `SplitCofactor` becomes hot under DLP.
