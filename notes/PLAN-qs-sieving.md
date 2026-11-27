@@ -827,7 +827,67 @@ With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20�
 
 6. **Done (`bf0508f`). Combine all 64 Lanczos dependencies by GCD** (`splitAll` / `refineDependencies`) so composites with 3+ factors split from one matrix without re-sieving composite cofactors.
 7. **Done (`bf0508f`). Sieve additional relations if all dependencies are trivial** (`maxSieveRetries = 3`, resuming `aRng`/`aSeen`) instead of returning `nil`.
-8. **Done (`d2b3b12`). Raise `qsMaxBits` to the QS/GNFS crossover** (`qsMaxBits = 332` / 100 digits in `factor/main.go`) and update `pretestFraction = 0.25`, `qs15Cores`, and `gnfs15Cores` in `factor/budget.go` for parallel ECM and the faster sieves.
+8. **Done (`d2b3b12`, `317512c`). Raise `qsMaxBits` to the QS/GNFS crossover** (`qsMaxBits = 342` / 103 digits in `factor/main.go`) and update `pretestFraction = 0.25`, `qs15Cores`, and `gnfs15Cores` in `factor/budget.go` for parallel ECM and the faster sieves.
 9. **Done (`787e8ea`). Single `n mod p` setup pass** (`limbs32`, `modLimbs`, `prepareFactorBase`) combining trial division, Legendre symbol, and modular square root setup.
 10. **Profiled (`< 2%` CPU). Small P−1 / ECM cofactor split** ahead of `rho64`: profiling 80-digit DLP (`B = 500k, lpm = 128, frac = 0.48`) showed `Rho64` at 1.38% CPU and `IsPrime64` at 0.53% CPU, so `Rho64` is not a bottleneck at QS sizes.
-11. **Skipped. SIMD / `avo` inner sieve and medium-prime kernel.**
+11. **Planned (optional). Dual-arch SIMD / `avo` sieving kernels (`amd64` AVX2 + `arm64` NEON)** — detailed below.
+
+---
+
+## SIMD / `avo` Assembly Plan (`amd64` + `arm64`)
+
+### Why SIQS is a high-return assembly target
+
+Profiling the tuned 80-digit DLP run (`qs80_dlp2.prof`, 9.02s wall, 94.2s CPU samples; 15.5s of raw samples in macOS `runtime.madvise` from per-run `qsArena` allocation, 78.7s active user CPU) shows:
+
+- **Sieving is 92–96% of wall time** (`3m34s` of `3m42s` at 95 digits), while cofactoring (`tryFactorize` 2.6% cum, `SplitCofactor` 1.8% cum) and linear algebra are minor.
+- **Every hot loop is 1D** over `[0, 2M)` or `[0, 32768)` with no 2D line transitions, parity skipping, or 3-way Franke–Kleinjung lattice branches.
+- **Single-source dual-arch generation:** `mmcloughlin/avo` PR #486 (`https://github.com/mmcloughlin/avo/pull/486`) allows one Go generator (`qs/internal/asm/gen.go`) to emit both `qs_amd64.s` (AVX2) and `qs_arm64.s` (NEON), paired with a pure-Go `qs_generic.go` fallback (`!amd64 && !arm64 || purego`) so `factor.tiny` (TinyGo) and other architectures keep working unchanged.
+
+### Data layout prerequisite (AoS to SoA)
+
+`worker.roots []root` (24 B/entry) and `worker.bk []bkRoot` (12 B/entry) currently interleave `p, r1, r2, off1, off2, logP, inA`. Splitting active sieve and bucket primes into 32-byte-aligned Structure-of-Arrays slices (`p, r1, r2, off1, off2 []uint32`, `logP []byte`) lets AVX2 (`VMOVDQU`, 8×`uint32`) and NEON (`VLD1`, 4×`uint32`) step contiguous lanes without gathers or shuffles. Primes dividing `A` set `delta[i] = 0` and `off = 0xffffffff` (or `r >= total`) so inner loops have no `if rt.inA` branch.
+
+### Kernel breakdown (ordered by profile share)
+
+1. **`fillBucketsSIMD` (~35% of active CPU at 80d, growing toward ~45% at 95d)**
+   - Group primes in `[bucketFrom, len(roots))` by hit-count regime (`p < M` multi-hit, `M <= p < 2M` 1–2 hits, `p >= 2M` 0–1 hit; the last two cover most primes above `bucketCut = 16384`).
+   - Advance 4 primes (NEON `uint32x4`) or 8 primes (AVX2 `uint32x8`) in lockstep (`off < total`, `bi = off >> 15`, `entry = tag | (off & 0x7fff)`, `off += p`), compacting valid lanes and scattering to `qsArena.data[bi<<shift + counts[bi]]`.
+2. **`sieveSmallPrimesAsm` (~22% of active CPU in `addSieveStride`)**
+   - Replace per-prime Go calls to `addSieveStride` with one per-block assembly entry over `[sieveFrom, bucketFrom)` split into three sub-regimes (following `yafu`'s `med_sieve_32k`):
+     - *Tiny periodic masks ($p < 32$, optional):* add precomputed 16B/32B tiled `logP` vectors (`VPADDB` / `VADD V.16B`) across the 32 KB block, tightening `smallSlack` and cutting false-positive candidates.
+     - *Small primes ($32 \le p < 4096$):* 8× unrolled dual-root (`off1`, `off2`) byte stride updates in one loop so both roots share loop control and pointer increments, writing updated `off1, off2` back once at block end.
+     - *Medium primes ($4096 \le p < 16384$, 2–8 hits per 32 KB block):* unrolled 2–8 hit dispatch avoiding inner loop branch mispredictions.
+3. **`drainBlockAsm` (~8.5% of active CPU in `qsArena.drainBlock`)**
+   - 8× unrolled scatter-add over `a.data[base+cur : base+end]` per `logGroup`, masking `entry & 0x7fff` and adding `lg` without bounds checks.
+4. **`appendGeSIMD` (~6% of active CPU in `appendGe`)**
+   - Scan `w.buf` 32 B/iter on AVX2 (`VPSUBUSB` or `VPMAXUB` against broadcast `thresh` + `VPMOVMSKB`) and 16–32 B/iter on NEON (`VCGE V.16B` + narrowing shift `SHRN` to a `uint64` mask), fast-skipping all-zero vectors and extracting hit offsets with `TZCNT`/`RBIT`+`CLZ`.
+5. **`moveRootsSIMD` (~3.5% of active CPU in `moveRoots`)**
+   - Vectorize Gray-code root updates across SoA `r1, r2, delta, p` (`0 <= r, d < p < 2^31`) using unsigned minimum without masks:
+     - Add (`(r + d) mod p`): `s = r + d`, `r' = min_u32(s, s - p)` (`VPADDD` + `VPSUBD` + `VPMINUD` on AVX2; `ADD` + `SUB` + `UMIN` on NEON), since `s - p` wraps above `2^31` iff `s < p`.
+     - Subtract (`(r - d) mod p`): `s = r - d`, `r' = min_u32(s, s + p)`, since `s` wraps above `2^31` iff `r < d`.
+6. **Low priority (`< 3%` CPU): SIMD small-prime trial division (`tryFactorize`)**
+   - `yafu` vectorizes `roots[:resieveFrom]` divisibility with 16-bit/32-bit Barrett/Lemire reciprocals (`tdiv_medprimes_32k`), but `tryFactorize` is only 2.6% cumulative CPU at 80 digits because `bucketHits` and integer thresholds keep candidate counts low. Only revisit if `dlpSlackFrac` is raised aggressively.
+
+### Estimated line counts and end-to-end speedup
+
+| Kernel | Active CPU Share | Est. Stage Speedup | `.s` Lines (1 arch) | `.s` Lines (`amd64`+`arm64`) | `avo` Generator `.go` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `sieveSmallPrimesAsm` | ~22% | 1.5–1.7× (+ tighter slack) | 90–120 | 180–240 | 160–210 |
+| `appendGeSIMD` | ~6% | 2.5–3.0× | 50–70 | 100–140 | 85–115 |
+| `drainBlockAsm` | ~8.5% | ~1.3× | 45–65 | 90–130 | 75–105 |
+| **Subtotal (block byte loops)** | **~36.5%** | — | **185–255** | **370–510** | **320–430** |
+| `fillBucketsSIMD` | ~36% (→45% at 95d) | 1.8–2.4× | 85–115 | 170–230 | 150–200 |
+| `moveRootsSIMD` | ~3.5% | 4.0–5.0× | 40–55 | 80–110 | 70–95 |
+| **Total (full SIQS scope)** | **~76%** | — | **310–425** | **620–850** | **540–725** |
+
+*(Remaining ~24% of active CPU is `bucketHits`/`gatherHits` ~12%, cofactoring + LA ~8%, and Go runtime ~4%.)*
+
+- **Projected wall-clock speedup:**
+  - *Block byte-loop scope (`sieveSmallPrimesAsm` + `appendGeSIMD` + `drainBlockAsm`):* **~20–28% faster (`1.25–1.38×`)**, e.g. 95 digits `3m42s` → `~2m45s`.
+  - *Full SIQS scope (+ `fillBucketsSIMD` + `moveRootsSIMD`):* **~35–48% faster (`1.55–1.90×`)**, e.g. 80 digits `8.8s` → `~5.0–5.8s`, 90 digits `54.8s` → `~30–35s`, 95 digits `3m42s` → `~2m00s–2m20s` (pushing the `qs`/`gnfs` crossover up ~2–3 digits to ~105–106 digits / `350` bits).
+
+### Verification plan when implementing
+
+- Keep `qs_generic.go` buildable under `-tags purego` and test every kernel directly against it on randomized inputs (`TestAsmMatchesGeneric`: byte-for-byte identical `w.buf`, identical sorted `qsArena` hits per block, identical `appendGe` offsets across `thresh` in `0..255`, and identical `moveRoots` outputs including edge cases `r = 0`, `r = p - 1`, `d = 0`, `d = p - 1`).
+- Verify `TestWorkers` and the seed-7 200/219/240-bit semiprime runs produce identical relation sets with and without `-tags purego`, then re-measure `qsMaxBits` and `qs15Cores` in `factor/budget.go`.
