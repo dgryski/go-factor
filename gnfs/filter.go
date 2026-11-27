@@ -440,6 +440,8 @@ func buildMatrix(poly *Poly, fb *FactorBases, rels []Relation) (surviving []Rela
 	var scratchVal = newCofactorScratch(poly.Degree)
 	var factors []int32
 	var lpBuf [12]lpKey
+	badEpoch := make([]int, len(fb.BadDecomps))
+	hasAFBCol := len(fb.AFBCol) == len(fb.AFB)
 	for i := range rels {
 		if !alive[i] {
 			continue
@@ -456,12 +458,30 @@ func buildMatrix(poly *Poly, fb *FactorBases, rels []Relation) (surviving []Rela
 			if evalFInto(&scratchVal.val, poly, rel.A, rel.B, scratchVal).Sign() < 0 {
 				factors = append(factors, ColAlgSign)
 			}
+			for bi := range fb.BadDecomps {
+				if fb.BadDecomps[bi].DividesCD {
+					badEpoch[bi] = i + 1
+					factors = fb.BadDecomps[bi].appendOddCols(rel.A, rel.B, factors)
+				}
+			}
 		}
 		for _, idx := range rel.RatCols {
 			factors = append(factors, int32(fb.ColRFB)+idx)
 		}
 		for _, idx := range rel.AlgCols {
-			factors = append(factors, int32(fb.ColAFB)+idx)
+			if !hasAFBCol {
+				factors = append(factors, int32(fb.ColAFB)+idx)
+				continue
+			}
+			if col := fb.AFBCol[idx]; col >= 0 {
+				factors = append(factors, col)
+			} else if !rel.IsFree {
+				bi := fb.BadByP[fb.AFB[idx].P]
+				if badEpoch[bi] != i+1 {
+					badEpoch[bi] = i + 1
+					factors = fb.BadDecomps[bi].appendOddCols(rel.A, rel.B, factors)
+				}
+			}
 		}
 		factors = fb.QCBits(rel.A, rel.B, factors)
 		for _, k := range oddLPKeysInto(lpBuf[:0], &rel) {

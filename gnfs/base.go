@@ -41,17 +41,20 @@ type QChar struct {
 // FactorBases holds the rational factor base, algebraic factor base,
 // and quadratic character base for a polynomial pair.
 type FactorBases struct {
-	RFB       []RatIdeal
-	AFB       []AlgIdeal
-	QCB       []QChar
-	BadCount  int
-	ColRFB    int
-	ColAFB    int
-	ColQCB    int
-	NumFixed  int
-	LogScale  float64
-	RatLookup map[uint32]int32 // P -> RFB index
-	AlgLookup map[uint64]int32 // (uint64(P)<<32)|uint64(R) -> AFB index
+	RFB        []RatIdeal
+	AFB        []AlgIdeal
+	AFBCol     []int32
+	BadDecomps []BadPrimeDecomp
+	BadByP     map[uint32]int
+	QCB        []QChar
+	BadCount   int
+	ColRFB     int
+	ColAFB     int
+	ColQCB     int
+	NumFixed   int
+	LogScale   float64
+	RatLookup  map[uint32]int32 // P -> RFB index
+	AlgLookup  map[uint64]int32 // (uint64(P)<<32)|uint64(R) -> AFB index
 }
 
 func algKey(p, r uint32) uint64 {
@@ -63,6 +66,7 @@ func algKey(p, r uint32) uint64 {
 func BuildFactorBases(poly *Poly, br, ba int64, qcMin uint64, numQCs int) *FactorBases {
 	fb := &FactorBases{
 		LogScale:  1.0,
+		BadByP:    make(map[uint32]int),
 		RatLookup: make(map[uint32]int32),
 		AlgLookup: make(map[uint64]int32),
 	}
@@ -72,8 +76,21 @@ func BuildFactorBases(poly *Poly, br, ba int64, qcMin uint64, numQCs int) *Facto
 		maxB = ba
 	}
 	primes := arith.PrimesUpTo(maxB)
+	var fHat []*big.Int
+	if numQCs >= 0 {
+		fHat, _ = poly.Monic()
+	}
 
 	var bigP, r, a0Mod, a1Mod big.Int
+	type pendingAlgPrime struct {
+		p32       uint32
+		logP      byte
+		cdDivides bool
+		isBad     bool
+		roots     []uint64
+	}
+	var algPrimes []pendingAlgPrime
+
 	for _, prime := range primes {
 		up := uint64(prime)
 		p32 := uint32(prime)
@@ -100,28 +117,68 @@ func BuildFactorBases(poly *Poly, br, ba int64, qcMin uint64, numQCs int) *Facto
 			fp := poly.CoeffsModP(up)
 			roots := arith.PolyRootsModP(fp, up)
 			cdDivides := r.Mod(poly.Coeffs[poly.Degree], &bigP).Sign() == 0
-			var dfp []uint64
-			if !cdDivides {
-				dfp = arith.PolyDerivModP(fp, up)
-			}
-			if cdDivides {
-				fb.AlgLookup[algKey(p32, p32)] = int32(len(fb.AFB))
-				fb.AFB = append(fb.AFB, AlgIdeal{P: p32, R: p32, LogP: logP})
-				fb.BadCount++
-			}
-			for _, rt := range roots {
-				r32 := uint32(rt)
-				fb.AlgLookup[algKey(p32, r32)] = int32(len(fb.AFB))
-				fb.AFB = append(fb.AFB, AlgIdeal{P: p32, R: r32, LogP: logP})
-				if cdDivides || arith.PolyEvalModP(dfp, rt, up) == 0 {
-					fb.BadCount++
+			isBad := cdDivides
+			if !isBad && len(roots) > 0 {
+				dfp := arith.PolyDerivModP(fp, up)
+				for _, rt := range roots {
+					if arith.PolyEvalModP(dfp, rt, up) == 0 {
+						isBad = true
+						break
+					}
 				}
 			}
+			algPrimes = append(algPrimes, pendingAlgPrime{
+				p32:       p32,
+				logP:      logP,
+				cdDivides: cdDivides,
+				isBad:     isBad,
+				roots:     roots,
+			})
 		}
 	}
 
+	fb.ColRFB = NumSignCols
+	fb.ColAFB = fb.ColRFB + len(fb.RFB)
+	nextCol := int32(fb.ColAFB)
+
+	for _, ap := range algPrimes {
+		p32 := ap.p32
+		if !ap.isBad || numQCs < 0 {
+			if ap.cdDivides {
+				fb.AlgLookup[algKey(p32, p32)] = int32(len(fb.AFB))
+				fb.AFB = append(fb.AFB, AlgIdeal{P: p32, R: p32, LogP: ap.logP})
+				fb.AFBCol = append(fb.AFBCol, nextCol)
+				nextCol++
+			}
+			for _, rt := range ap.roots {
+				r32 := uint32(rt)
+				fb.AlgLookup[algKey(p32, r32)] = int32(len(fb.AFB))
+				fb.AFB = append(fb.AFB, AlgIdeal{P: p32, R: r32, LogP: ap.logP})
+				fb.AFBCol = append(fb.AFBCol, nextCol)
+				nextCol++
+			}
+			continue
+		}
+
+		if ap.cdDivides {
+			fb.AlgLookup[algKey(p32, p32)] = int32(len(fb.AFB))
+			fb.AFB = append(fb.AFB, AlgIdeal{P: p32, R: p32, LogP: ap.logP})
+			fb.AFBCol = append(fb.AFBCol, -1)
+		}
+		for _, rt := range ap.roots {
+			r32 := uint32(rt)
+			fb.AlgLookup[algKey(p32, r32)] = int32(len(fb.AFB))
+			fb.AFB = append(fb.AFB, AlgIdeal{P: p32, R: r32, LogP: ap.logP})
+			fb.AFBCol = append(fb.AFBCol, -1)
+		}
+		bd := decomposeBadPrime(poly, fHat, p32, ap.cdDivides, &nextCol)
+		fb.BadByP[p32] = len(fb.BadDecomps)
+		fb.BadDecomps = append(fb.BadDecomps, bd)
+		fb.BadCount += len(bd.Ideals)
+	}
+
 	if numQCs >= 0 {
-		wantQCs := numQCs + fb.BadCount
+		wantQCs := numQCs
 		if wantQCs < 64 {
 			wantQCs = 64
 		}
@@ -156,9 +213,7 @@ func BuildFactorBases(poly *Poly, br, ba int64, qcMin uint64, numQCs int) *Facto
 		}
 	}
 
-	fb.ColRFB = NumSignCols
-	fb.ColAFB = fb.ColRFB + len(fb.RFB)
-	fb.ColQCB = fb.ColAFB + len(fb.AFB)
+	fb.ColQCB = int(nextCol)
 	fb.NumFixed = fb.ColQCB + len(fb.QCB)
 	return fb
 }
