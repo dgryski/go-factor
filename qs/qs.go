@@ -465,8 +465,17 @@ type sieve struct {
 	// Large primes that occur in more than one partial become matrix columns
 	// in finish.
 	partials      []partial
+	lpID          map[uint64]int32
+	lpPrimes      []uint64
+	has2LP        bool
 	partialExcess int // surviving partials minus large primes at the last count
 	nextCount     int // len(partials) at which to count again
+	cpDeg         []int32
+	cpHead        []int32
+	cpTo          []int32
+	cpNext        []int32
+	cpAlive       []bool
+	cpQueue       []int32
 
 	// For progress logging.
 	polys   int // polynomials sieved
@@ -585,6 +594,7 @@ func newSieveWithRoots(n, kn *big.Int, roots []root, siqs bool) *sieve {
 		roots:   roots,
 		numCols: len(roots) + 1, // +1 for the sign of Y
 		seenX:   make(map[string]bool),
+		lpID:    make(map[uint64]int32),
 		start:   time.Now(),
 	}
 	s.want = s.numCols + extraRelations
@@ -1832,9 +1842,30 @@ func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.I
 		s.relations = append(s.relations, relation{X: x, Factors: factors})
 		return nil
 	}
-	s.partials = append(s.partials, partial{relation{X: x, Factors: factors}, lp1, lp2})
+	id1, ok1 := s.internLP(lp1)
+	id2 := int32(-1)
+	if lp2 != 0 {
+		id2, _ = s.internLP(lp2)
+		if !s.has2LP {
+			s.has2LP = true
+			s.nextCount = len(s.partials) + 500
+		}
+	}
+	s.partials = append(s.partials, partial{
+		relation: relation{X: x, Factors: factors},
+		lp1:      lp1,
+		lp2:      lp2,
+		id1:      id1,
+		id2:      id2,
+	})
+	if !s.has2LP {
+		if ok1 {
+			s.partialExcess++
+		}
+		return nil
+	}
 	if len(s.partials) >= s.nextCount {
-		s.partialExcess, _, _ = s.countPartials()
+		s.partialExcess = s.prunePartials()
 		have := len(s.relations) + s.partialExcess
 		need := s.want - have
 		switch {
@@ -1858,6 +1889,16 @@ func (s *sieve) addRelation(x *big.Int, factors []int32, lp1, lp2 uint64) *big.I
 	return nil
 }
 
+func (s *sieve) internLP(lp uint64) (int32, bool) {
+	if id, ok := s.lpID[lp]; ok {
+		return id, true
+	}
+	id := int32(len(s.lpPrimes))
+	s.lpID[lp] = id
+	s.lpPrimes = append(s.lpPrimes, lp)
+	return id, false
+}
+
 // done reports whether the relations found so far, counting the partials
 // that survive pruning, give a matrix with at least s.want surplus rows.
 func (s *sieve) done() bool {
@@ -1868,95 +1909,145 @@ func (s *sieve) done() bool {
 type partial struct {
 	relation
 	lp1, lp2 uint64
+	id1, id2 int32
 }
 
-// countPartials repeatedly drops the partials containing a large prime that
-// no other surviving partial has, since they can't be in any dependency. It
-// returns the surviving partials minus the large primes they use, which
-// partials survive, and the column of each surviving large prime counted
-// from 0.
-func (s *sieve) countPartials() (excess int, alive []bool, cols map[uint64]int32) {
-	degree := make(map[uint64]int, len(s.partials))
-	byPrime := make(map[uint64][]int32, len(s.partials))
-	for i, p := range s.partials {
-		for _, lp := range [2]uint64{p.lp1, p.lp2} {
-			if lp != 0 {
-				degree[lp]++
-				byPrime[lp] = append(byPrime[lp], int32(i))
-			}
-		}
+// prunePartials drops partials with singleton large primes in reusable flat
+// slices and returns surviving partials minus active large primes.
+func (s *sieve) prunePartials() int {
+	nLP := len(s.lpPrimes)
+	nP := len(s.partials)
+	if nP == 0 || nLP == 0 {
+		return 0
 	}
-	alive = make([]bool, len(s.partials))
+	if cap(s.cpDeg) < nLP {
+		s.cpDeg = make([]int32, nLP*2)
+		s.cpHead = make([]int32, nLP*2)
+	}
+	deg := s.cpDeg[:nLP]
+	head := s.cpHead[:nLP]
+	clear(deg)
+	for i := range head {
+		head[i] = -1
+	}
+
+	maxEdges := 2 * nP
+	if cap(s.cpTo) < maxEdges {
+		s.cpTo = make([]int32, maxEdges*2)
+		s.cpNext = make([]int32, maxEdges*2)
+	}
+	to := s.cpTo[:maxEdges]
+	next := s.cpNext[:maxEdges]
+
+	if cap(s.cpAlive) < nP {
+		s.cpAlive = make([]bool, nP*2)
+	}
+	alive := s.cpAlive[:nP]
 	for i := range alive {
 		alive[i] = true
 	}
-	var queue []uint64
-	for lp, d := range degree {
-		if d == 1 {
-			queue = append(queue, lp)
+
+	var edge int32
+	for i := range s.partials {
+		p := &s.partials[i]
+		u := p.id1
+		deg[u]++
+		to[edge] = int32(i)
+		next[edge] = head[u]
+		head[u] = edge
+		edge++
+		if v := p.id2; v >= 0 {
+			deg[v]++
+			to[edge] = int32(i)
+			next[edge] = head[v]
+			head[v] = edge
+			edge++
 		}
 	}
-	for len(queue) > 0 {
-		lp := queue[len(queue)-1]
-		queue = queue[:len(queue)-1]
-		if degree[lp] != 1 {
+
+	q := s.cpQueue[:0]
+	for id := int32(0); id < int32(nLP); id++ {
+		if deg[id] == 1 {
+			q = append(q, id)
+		}
+	}
+	for len(q) > 0 {
+		u := q[len(q)-1]
+		q = q[:len(q)-1]
+		if deg[u] != 1 {
 			continue
 		}
-		for _, i := range byPrime[lp] {
-			if !alive[i] {
+		for e := head[u]; e >= 0; e = next[e] {
+			pi := to[e]
+			if !alive[pi] {
 				continue
 			}
-			alive[i] = false
-			for _, q := range [2]uint64{s.partials[i].lp1, s.partials[i].lp2} {
-				if q != 0 {
-					if degree[q]--; degree[q] == 1 {
-						queue = append(queue, q)
-					}
+			alive[pi] = false
+			p := &s.partials[pi]
+			if deg[p.id1]--; deg[p.id1] == 1 {
+				q = append(q, p.id1)
+			}
+			if p.id2 >= 0 {
+				if deg[p.id2]--; deg[p.id2] == 1 {
+					q = append(q, p.id2)
 				}
 			}
 		}
 	}
-	cols = make(map[uint64]int32)
-	for _, lp := range sortedKeys(degree) {
-		if degree[lp] > 0 {
-			cols[lp] = int32(len(cols))
-		}
-	}
+	s.cpQueue = q[:0]
+
+	surv := 0
 	for _, a := range alive {
 		if a {
-			excess++
+			surv++
 		}
 	}
-	return excess - len(cols), alive, cols
-}
-
-func sortedKeys(m map[uint64]int) []uint64 {
-	keys := make([]uint64, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	cols := 0
+	for _, d := range deg {
+		if d > 0 {
+			cols++
+		}
 	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	return keys
+	return surv - cols
 }
 
 // finish adds the surviving partials to s.relations, with a column for each
-// large prime they use, and returns the prime of each column after the sign:
-// the factor base, then the large primes.
+// large prime they use, and returns the prime of each column after the sign.
 func (s *sieve) finish(factorBase []int64) []int64 {
-	_, alive, cols := s.countPartials()
-	primes := make([]int64, len(factorBase)+len(cols))
+	if len(s.partials) == 0 {
+		return factorBase
+	}
+	s.prunePartials()
+	nLP := len(s.lpPrimes)
+	nP := len(s.partials)
+	deg := s.cpDeg[:nLP]
+	alive := s.cpAlive[:nP]
+
+	var activeIDs []int32
+	for id := int32(0); id < int32(nLP); id++ {
+		if deg[id] > 0 {
+			activeIDs = append(activeIDs, id)
+		}
+	}
+	sort.Slice(activeIDs, func(i, j int) bool {
+		return s.lpPrimes[activeIDs[i]] < s.lpPrimes[activeIDs[j]]
+	})
+	colOfID := make([]int32, nLP)
+	primes := make([]int64, len(factorBase)+len(activeIDs))
 	copy(primes, factorBase)
-	for lp, c := range cols {
-		primes[len(factorBase)+int(c)] = int64(lp)
+	for c, id := range activeIDs {
+		colOfID[id] = int32(c)
+		primes[len(factorBase)+c] = int64(s.lpPrimes[id])
 	}
 	base := int32(len(factorBase) + 1)
-	for i, p := range s.partials {
+	for i := range s.partials {
 		if !alive[i] {
 			continue
 		}
-		f := append(p.Factors, base+cols[p.lp1])
-		if p.lp2 != 0 {
-			f = append(f, base+cols[p.lp2])
+		p := &s.partials[i]
+		f := append(p.Factors, base+colOfID[p.id1])
+		if p.id2 >= 0 {
+			f = append(f, base+colOfID[p.id2])
 		}
 		s.relations = append(s.relations, relation{X: p.X, Factors: f})
 	}
