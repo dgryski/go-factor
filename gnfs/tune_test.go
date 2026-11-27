@@ -137,6 +137,54 @@ var tuneCands = map[string]Params{
 		MfbRat: 47, MfbAlg: 47, MaxLPRat: 2, MaxLPAlg: 2,
 		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 2048, JMax: 2048,
 		SlackRat: 48, SlackAlg: 48, NumQCs: 64, RelTargetRatio: 0.86},
+	"m5_332_3lp": {Degree: 4, Br: 700000, Ba: 800000, LpBoundRat: 12000000, LpBoundAlg: 12000000,
+		MfbRat: 62, MfbAlg: 64, MaxLPRat: 3, MaxLPAlg: 3,
+		UseLattice: true, QMin: 280000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 50, SlackAlg: 53, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_d4_2lp_4k": {Degree: 4, Br: 850000, Ba: 1000000, LpBoundRat: 1 << 24, LpBoundAlg: 1 << 24,
+		MfbRat: 48, MfbAlg: 48, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 49, SlackAlg: 49, NumQCs: 64, RelTargetRatio: 0.80},
+	"m5_d4_3lp_4k": {Degree: 4, Br: 850000, Ba: 1000000, LpBoundRat: 1 << 24, LpBoundAlg: 1 << 24,
+		MfbRat: 64, MfbAlg: 66, MaxLPRat: 3, MaxLPAlg: 3,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 52, SlackAlg: 55, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_d4_3lp_hi": {Degree: 4, Br: 850000, Ba: 1000000, LpBoundRat: 1 << 24, LpBoundAlg: 1 << 24,
+		MfbRat: 66, MfbAlg: 68, MaxLPRat: 3, MaxLPAlg: 3,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 55, SlackAlg: 58, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_d5_2lp_4k": {Degree: 5, Br: 850000, Ba: 1000000, LpBoundRat: 1 << 24, LpBoundAlg: 1 << 24,
+		MfbRat: 48, MfbAlg: 48, MaxLPRat: 2, MaxLPAlg: 2,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 49, SlackAlg: 49, NumQCs: 64, RelTargetRatio: 0.80},
+	"m5_d5_3lp_4k": {Degree: 5, Br: 850000, Ba: 1000000, LpBoundRat: 1 << 24, LpBoundAlg: 1 << 24,
+		MfbRat: 64, MfbAlg: 66, MaxLPRat: 3, MaxLPAlg: 3,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 52, SlackAlg: 55, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_d5_3lp_24m": {Degree: 5, Br: 1000000, Ba: 1200000, LpBoundRat: 24000000, LpBoundAlg: 24000000,
+		MfbRat: 65, MfbAlg: 68, MaxLPRat: 3, MaxLPAlg: 3,
+		UseLattice: true, QMin: 400000, QMax: 6000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 54, SlackAlg: 57, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_105_d4_asym": {Degree: 4, Br: 800000, Ba: 1100000, LpBoundRat: 14000000, LpBoundAlg: 20000000,
+		MfbRat: 48, MfbAlg: 66, MaxLPRat: 2, MaxLPAlg: 3,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 49, SlackAlg: 54, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_105_d5_asym": {Degree: 5, Br: 750000, Ba: 1100000, LpBoundRat: 14000000, LpBoundAlg: 20000000,
+		MfbRat: 48, MfbAlg: 66, MaxLPRat: 2, MaxLPAlg: 3,
+		UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 49, SlackAlg: 54, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_110_d5_asym": {Degree: 5, Br: 900000, Ba: 1400000, LpBoundRat: 16000000, LpBoundAlg: 28000000,
+		MfbRat: 48, MfbAlg: 68, MaxLPRat: 2, MaxLPAlg: 3,
+		UseLattice: true, QMin: 400000, QMax: 6000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 49, SlackAlg: 56, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_110_d5_asym3": {Degree: 5, Br: 1000000, Ba: 1500000, LpBoundRat: 20000000, LpBoundAlg: 32000000,
+		MfbRat: 64, MfbAlg: 70, MaxLPRat: 3, MaxLPAlg: 3,
+		UseLattice: true, QMin: 450000, QMax: 7000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 52, SlackAlg: 57, NumQCs: 64, RelTargetRatio: 0.78},
+	"m5_110_d5_fast": {Degree: 5, Br: 1100000, Ba: 1600000, LpBoundRat: 16000000, LpBoundAlg: 28000000,
+		MfbRat: 49, MfbAlg: 69, MaxLPRat: 2, MaxLPAlg: 3,
+		UseLattice: true, QMin: 450000, QMax: 7000000, IHalf: 4096, JMax: 2048,
+		SlackRat: 50, SlackAlg: 56, NumQCs: 64, RelTargetRatio: 0.78},
 }
 
 // TestSweep times splitWithParams on random semiprimes of each GNFS_BITS
@@ -214,4 +262,70 @@ func candNames() string {
 		names = append(names, k)
 	}
 	return strings.Join(names, ",")
+}
+
+func TestYieldProbe(t *testing.T) {
+	if !*tune || os.Getenv("GNFS_PROBE") == "" || os.Getenv("GNFS_BITS") == "" {
+		t.Skip("run with -tune and GNFS_PROBE=1 GNFS_BITS=... GNFS_CANDS=...")
+	}
+	for _, bs := range strings.Split(os.Getenv("GNFS_BITS"), ",") {
+		bits, err := strconv.Atoi(bs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rnd := rand.New(rand.NewSource(int64(1000 + bits)))
+		n := new(big.Int).Mul(testutil.RandomPrime(rnd, bits/2), testutil.RandomPrime(rnd, bits-bits/2))
+		for _, name := range strings.Split(os.Getenv("GNFS_CANDS"), ",") {
+			var p Params
+			if name == "default" {
+				p = *defaultParams(n)
+			} else {
+				c, ok := tuneCands[name]
+				if !ok {
+					t.Fatalf("unknown cand %q", name)
+				}
+				p = c
+			}
+			t0 := time.Now()
+			poly, fac := selectPolyWithParams(n, &p)
+			if fac != nil || poly == nil {
+				t.Fatalf("selectPoly failed")
+			}
+			polyDur := time.Since(t0).Round(time.Millisecond)
+			qcMin := computeQCMin(&p)
+			fb := BuildFactorBases(poly, p.Br, p.Ba, qcMin, -1)
+
+			var sample []LatticeQ
+			for _, off := range []uint64{10000, 400000, 1200000} {
+				sub := p
+				sub.QMin = p.QMin + off
+				sub.QMax = sub.QMin + 4000
+				sqs := buildSpecialQs(poly, fb, &sub)
+				if len(sqs) > 30 {
+					sqs = sqs[:30]
+				}
+				sample = append(sample, sqs...)
+			}
+			seen := make(map[[2]int64]struct{}, len(sample)*16)
+			threeLP := 0
+			ts := time.Now()
+			sieveLatticeQs(poly, fb, &p, sample, func(r Relation) {
+				key := [2]int64{r.A, r.B}
+				if _, ok := seen[key]; !ok {
+					seen[key] = struct{}{}
+					if r.RatLPs[2] != 0 || len(r.AlgLPs) >= 3 {
+						threeLP++
+					}
+				}
+			}, func() bool { return false })
+			sieveDur := time.Since(ts)
+			relPerSec := float64(len(seen)) / sieveDur.Seconds()
+			relPerQ := float64(len(seen)) / float64(len(sample))
+			ideals := len(arith.PrimesUpTo(int64(p.LpBoundRat))) + len(arith.PrimesUpTo(int64(p.LpBoundAlg)))
+			estMin := (0.80 * float64(ideals) / max(1.0, relPerSec)) / 60.0
+			t.Logf("%d bits (%dd) %-15s deg=%d c_d=%v a_1=%v skew=%.0f alpha=%.2f poly=%v | %d qs -> %d rels (%.1f/q, %d 3LP+) in %v = %.0f rel/s | LP=%d est=%.1fm",
+				n.BitLen(), len(n.String()), name, poly.Degree, poly.Coeffs[poly.Degree], poly.A1, poly.Skew, poly.Alpha, polyDur,
+				len(sample), len(seen), relPerQ, threeLP, sieveDur.Round(time.Millisecond), relPerSec, ideals, estMin)
+		}
+	}
 }

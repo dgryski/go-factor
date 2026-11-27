@@ -133,23 +133,32 @@ func defaultParams(n *big.Int) *Params {
 			SlackRat: 47, SlackAlg: 47, NumQCs: 64,
 			RelTargetRatio: 0.77,
 		}
-	case bits < 365:
+	case bits < 340:
 		return &Params{
-			Degree: 4, Br: 700000, Ba: 800000,
-			LpBoundRat: 12000000, LpBoundAlg: 12000000,
-			MfbRat: 47, MfbAlg: 47, MaxLPRat: 2, MaxLPAlg: 2,
-			UseLattice: true, QMin: 280000, QMax: 5000000, IHalf: 2048, JMax: 2048,
-			SlackRat: 48, SlackAlg: 48, NumQCs: 64,
-			RelTargetRatio: 0.80,
+			Degree: 4, Br: 700000, Ba: 850000,
+			LpBoundRat: 12000000, LpBoundAlg: 15000000,
+			MfbRat: 47, MfbAlg: 64, MaxLPRat: 2, MaxLPAlg: 3,
+			UseLattice: true, QMin: 280000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+			SlackRat: 48, SlackAlg: 53, NumQCs: 64,
+			RelTargetRatio: 0.78,
+		}
+	case bits < 356:
+		return &Params{
+			Degree: 4, Br: 800000, Ba: 1100000,
+			LpBoundRat: 14000000, LpBoundAlg: 20000000,
+			MfbRat: 48, MfbAlg: 66, MaxLPRat: 2, MaxLPAlg: 3,
+			UseLattice: true, QMin: 350000, QMax: 5000000, IHalf: 4096, JMax: 2048,
+			SlackRat: 49, SlackAlg: 54, NumQCs: 64,
+			RelTargetRatio: 0.78,
 		}
 	default:
 		return &Params{
-			Degree: 5, Br: 500000, Ba: 800000,
-			LpBoundRat: 1 << 26, LpBoundAlg: 1 << 26,
-			MfbRat: 52, MfbAlg: 52, MaxLPRat: 2, MaxLPAlg: 2,
-			UseLattice: true, QMin: 400000, QMax: 10000000, IHalf: 4096, JMax: 2048,
-			SlackRat: 53, SlackAlg: 53, NumQCs: 64,
-			RelTargetRatio: 1.05,
+			Degree: 5, Br: 1100000, Ba: 1600000,
+			LpBoundRat: 16000000, LpBoundAlg: 28000000,
+			MfbRat: 49, MfbAlg: 69, MaxLPRat: 2, MaxLPAlg: 3,
+			UseLattice: true, QMin: 450000, QMax: 7000000, IHalf: 4096, JMax: 2048,
+			SlackRat: 50, SlackAlg: 56, NumQCs: 64,
+			RelTargetRatio: 0.78,
 		}
 	}
 }

@@ -1572,6 +1572,15 @@ func kleinjungCandidates(n *big.Int, d int) ([]*Poly, *big.Int) {
 		15120, 25200, 27720, 50400, 60060, 110880, 180180, 360360,
 		540540, 720720, 1081080, 1441440,
 	}
+	if d >= 5 {
+		cds = []uint64{
+			6, 12, 18, 24, 30, 36, 42, 48, 60, 72, 84, 90, 108, 120,
+			144, 168, 180, 210, 240, 252, 300, 336, 360, 420, 504, 540,
+			600, 630, 720, 840, 1008, 1080, 1260, 1512, 1680, 2100,
+			2520, 3360, 3780, 4200, 5040, 7560, 10080, 15120, 25200,
+			27720, 50400, 60060, 110880, 180180, 360360,
+		}
+	}
 
 	var out []*Poly
 	dBig := big.NewInt(int64(d))
@@ -1654,22 +1663,27 @@ func chooseKleinjungTuples(prs []kjPrimeRoots, maxA1 uint64) [][]kjPrimeRoots {
 	}
 
 	var out [][]kjPrimeRoots
-	for start := 0; start+bestK <= len(prs) && len(out) < 3; start++ {
+	for start := 0; start+bestK <= len(prs) && len(out) < 6; start++ {
 		cand := prs[start : start+bestK]
 		if tupleProductFits(cand, maxA1) {
 			out = append(out, cand)
 		}
 	}
-	if bestK < len(prs) && len(out) < 4 {
+	for rep := bestK; rep < len(prs) && len(out) < 9; rep++ {
 		alt := make([]kjPrimeRoots, bestK)
 		copy(alt, prs[:bestK-1])
-		alt[bestK-1] = prs[bestK]
+		alt[bestK-1] = prs[rep]
 		if tupleProductFits(alt, maxA1) {
 			out = append(out, alt)
 		}
 	}
 	if bestK >= 4 {
-		out = append(out, prs[:bestK-1])
+		for start := 0; start+bestK-1 <= len(prs) && len(out) < 12; start++ {
+			cand := prs[start : start+bestK-1]
+			if tupleProductFits(cand, maxA1) {
+				out = append(out, cand)
+			}
+		}
 	}
 	return out
 }

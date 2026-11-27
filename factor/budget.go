@@ -66,7 +66,7 @@ var qs15Cores = []timePoint{
 
 // gnfs15Cores holds 15-worker GNFS times on an Apple M5 Pro.
 var gnfs15Cores = []timePoint{
-	{35, 0.25}, {45, 0.60}, {59, 3.0}, {70, 8.4}, {80, 41.4}, {89, 202}, {95, 411}, {100, 1520},
+	{35, 0.25}, {45, 0.60}, {59, 3.0}, {70, 8.4}, {80, 41.4}, {89, 202}, {95, 411}, {100, 1520}, {105, 2618},
 }
 
 func interpLogTime(table []timePoint, digits int) float64 {
