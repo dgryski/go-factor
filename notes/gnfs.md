@@ -45,7 +45,7 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | 115–150 | $d = 4$, Br = Ba = 8000, LP $2^{17}$, ratio 0.80. 0.3s at 115 bits, 0.6s at 149 bits. |
 | 150–200 | $d = 4$, Br = Ba = 30000, LP $2^{18}$, $Q_{\min} = 20\text{k}$, $I = 1024$, $J = 512$, ratio 0.85. 1.6s at 151 bits, 3–4s at 195 bits. |
 | 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $Q_{\min} = 60\text{k}$, $I = J = 1024$, ratio 0.82. 7.86s total (4.83s sieve) at 231 bits / 70 digits after free relations + `lpFilter` (down from 11.0s after poly+arena, and 26–33s originally). |
-| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.82. 48.0s–1m01.7s at 265–266 bits / 80 digits (29.8s–41.0s sieve; down from 4m34s). |
+| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.82. 43.8s at 264 bits / 80 digits after free relations + `lpFilter` + sub-segment log-norms (34.4s sieve, 4.5s LA, 3.4s sqrt; down from 54.0s and 4m34s). |
 | 275–305 | $d = 4$, Br = Ba = 400000, LP $2^{22}$, mfb 44, $Q_{\min} = 150\text{k}$, $I = J = 2048$, ratio 0.84. 3m53s at 295 bits / 89 digits (3m19s sieve, 14.1s LA, 16.5s sqrt, 0 bad squares; down from 21m51s). |
 | 305–365 | $d = 4$, Br = 550000, Ba = 600000, LP $2^{23}$, mfb 46, $Q_{\min} = 250\text{k}$, $I = J = 2048$, ratio 0.88. Extrapolated from 265 and 295 bits; not yet timed. |
 | ≥ 365 | $d = 5$, Br = 500000, Ba = 800000, LP $2^{26}$, mfb 52. Not tested. |
@@ -61,24 +61,26 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 - **Progress** is measured in relations against a per-row `RelTargetRatio` times $\pi(\text{LP}_{\text{rat}}) + \pi(\text{LP}_{\text{alg}})$, switching to slope extrapolation once the 2-core slope reaches 0.2 (ignoring tiny pre-percolation slopes).
 - **Overshoot:** excess is checked with zero-allocation dense-ID `lpFilter` buffers every ~7% before $-\#\text{fixed}/2$, every ~1% while climbing, and every `2*(goal - excess)` (clamped to `[100, 1000]`) above $-2000$.
 
-### Prioritized Algorithmic Plan & Remaining Work
+### Prioritized Algorithmic Plan Relative to M3 & M5
+
+At 89 digits (295 bits), sieving + cofactoring is **85.5%** of wall time (`3m19s`), LA is **6.0%** (`14.1s`), square root is **7.1%** (`16.5s`), and coarse bad ideals have produced **0 bad squares**. Items that improve sieve/polynomial yield come **before** M3 parameter tuning (since they shift optimal `Br`, `Ba`, `Slack`, and the `qs`/`gnfs` crossover), while >64-bit cofactoring, L2 superblocking, LA/sqrt scaling, and exact bad ideals belong in **M5** (100–115+ digits) and **Post-M5** (115–130+ digits).
 
 Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped without `-tune` and prints live 15s progress lines. For example, `GNFS_BITS=266 GNFS_CANDS=default GNFS_SEEDS=2 go test ./gnfs -run Sweep -v -tune -timeout 120m`. The package path has to come before `-tune`.
 
-| Priority | Task | Status | Notes |
+| Tier / Milestone | Task | Status | Rationale & Scope |
 | :--- | :--- | :--- | :--- |
-| Done | Free relations and dense-ID `lpFilter` pruning | Done | Free relations for $p \le \min(B_r, B_a)$ scanned directly from `fb.AFB`; `lpFilter` eliminates per-recount map/slice allocations. 70d seed 1 down from 9.83s to 7.86s. |
-| 1 | Sub-segment log-norm initialization | Pending | Replace 16 KB 4-corner maximum norm thresholds (`latticeBlockThresholdAlg`/`Rat`) with per-line 64–128 byte segment $\log_2|F|, \log_2|G|$ initialization via `float64` Horner evaluation so small-$(i, j)$ and near-real-root points are not discarded. |
-| 1 | Line-prime batch resieving / reciprocal divisibility | Pending | Replace per-candidate 64-bit `(i - j*lambda) % p` loops over ~550 `ratLines`/`algLines` in `cofactorRatLattice`/`cofactorAlgLattice` with block-level hit gathering onto `candBits` or `uint32` Lemire reciprocals. |
-| 1 | Small prime-power sieving ($p^k < 2I$) | Pending | Sieve small prime powers ($p^2, p^3 \le 512$ and powers of small primes $< 29$) to tighten norm residuals by 2–4 bits and cut false-positive trial divisions. |
-| 1 | Kleinjung $a_1 = P_1 P_2$ collision + Murphy $E(f, g)$ | Pending | Meet-in-the-middle fractional-part collision over $d^3 \times d^3 = d^6$ CRT roots ($4{,}096$ at $d=4$, $15{,}625$ at $d=5$) in $O(d^3 \log d)$ time, ranked by 64-angle directional Murphy $E(f, g)$ quadrature over $\theta \in [0, \pi]$. |
-| 2 | 3LP + 128-bit Montgomery P−1 and ECM cofactoring | Pending | Widen `RatLPs` to `[3]uint64` and split 65–100 bit cofactors with stack-allocated 128-bit Montgomery Stage-1 P−1 + Suyama Montgomery-curve ECM (`mfb` up to ~2.7 $\log_2\text{LP}$). |
-| 2 | Exact bad ideals (Round-2 $p$-maximal order) | Pending | Compute $\mathcal{O}_p$, exact prime ideals $\mathfrak{P}_j \mid p$ ($e_j, f_j$), and anti-uniformizer matrices $\beta_j \in \mathcal{O}_p$ once per polynomial (Cohen 1993, Alg. 4.8.17, 6.1.8, 6.2.9), replacing coarse bad columns and extra QCs. |
-| 2 | Two-level cache-blocked bucket sieving | Pending | Partition large $(I, J)$ sieve regions into L2-resident $J$-strips (~256 blocks of 16 KB) so 15 workers' `fkArena` slabs fit in per-cluster L2/SLC cache at 105+ digits. |
-| 2 | Cavallar clique pruning + Markowitz SGE | Pending | Prune heavy 2-weight LP components when `excess` exceeds goal before SGE, and select `Reducer` pivots by ascending Markowitz fill `(w-1)*(rowLen-1)` via a min-bucket queue. |
-| 2 | Kronecker + Karp–Markstein + 64-bit NTT square root | Pending | Replace $d^2$ schoolbook `big.Int` muls in `polyAlgMulModModBig` with point-evaluation / Kronecker packing, use a coupled Karp–Markstein final Newton step, and add a 3-prime 64-bit NTT for multi-Mbit `big.Int` products. |
-| 3 | M3 & M5 parameter retuning and 80–110+ digit sweeps | Pending | Multi-seed sweeps at 80d, 89d, 95d, 100d, and $d = 4$ vs $d = 5$ at 105–110+ digits; measure exact `qs`/`gnfs` crossover and update `qsMaxBits` / `gnfs15Cores` in `factor/`. |
-| Deferred | SIMD / `avo` core sieving loop | Skipped | Deferred per operator direction. |
+| **Done (M2/M5)** | Free relations and dense-ID `lpFilter` pruning | Done | Free relations for $p \le \min(B_r, B_a)$ scanned from `fb.AFB`; zero-alloc `lpFilter` recounts. 70d seed 1 down from 9.83s to 7.86s (`b6a7e82`). |
+| **Done (M3)** | Sub-segment log-norm initialization | Done | Per-line 64B (and 16B near roots/steep gradients) `float64` Horner $\log_2|F|, \log_2|G|$ baselines replace 16 KB 4-corner maximums. `go test ./gnfs` down from 11.4s to 7.23s; 80d down from 54.0s to 43.8s (34.4s sieve). |
+| **Tier 1 (Pre-M3 tune — M3)** | Line-prime batch resieving + small prime-power sieving ($p^k < 2I$) | Next | Eliminates ~550 per-candidate 64-bit `%` divisions in `cofactorRatLattice`/`cofactorAlgLattice` (main cofactor hotspot after interior norm recovery) and sieves small $p^k$ to tighten `SlackRat`/`SlackAlg`. |
+| **Tier 1 (Pre-M3 tune — M4)** | Kleinjung $a_1 = P_1 P_2$ collision + directional Murphy $E(f, g)$ | Pending | Searches $d^6$ CRT roots in $O(d^3 \log d)$ time and scores real-root corridors now captured by sub-segment norms; shifts yield across all 80–115d rows, so do before M3/M5 parameter sweeps. |
+| **Tier 2 (Finish M3)** | M3 tuning & crossover verification at 80–100 digits | Pending | Multi-seed checks on 250–275b (80d) and 275–305b (89d), tune/time 305–340b at **95d (315b)** and **100d (332b)**, measure exact `qs`/`gnfs` crossover, and update `qsMaxBits` / `gnfs15Cores` in `factor/`. **Completes M3.** |
+| **Tier 3 (Core M5)** | 3LP + 128-bit Montgomery P−1 and ECM cofactoring | Pending | Not needed for M3 (where 2LP `mfb` $\le 48 < 64$); unlocks `RatLPs [3]uint64` and 65–100 bit cofactors (`mfb` $\approx 2.7\log_2\text{LP}$) required for 105–115d yield. |
+| **Tier 3 (Core M5)** | Two-level $J$-strip cache-blocked `fkArena` buckets | Pending | Not needed at $I = J = 2048$ (M3, 4 MB/worker); keeps 15 workers' `fkArena` slabs L2-resident when $I \times J \ge 4096 \times 2048$ at 105+ digits. |
+| **Tier 3 (Core M2/M5)** | Cavallar clique pruning + Markowitz SGE & Karp–Markstein + point-eval sqrt | Pending | LA + sqrt are only ~13% of runtime at 89d, rising at 105–115d (1M+ raw relations, $10^5$+ dep weight); shrinks reduced Lanczos core by ~20% and cuts final Hensel lift multiplies ~3×. |
+| **Tier 4 (Finish M5)** | $d = 4$ vs $d = 5$ tuning and 105–110+ digit runs | Pending | Tune degree-5 polynomial selection and factor-base / 3LP rows at 340–370 bits (103–111d) with progress and time-left logging. |
+| **Tier 4 (Finish M5)** | Exact bad ideals (Round-2 $p$-maximal order $\mathcal{O}_p$) | Pending | 0 bad squares seen with coarse bad ideals + extra QCs, so near-zero wall-clock gain; implement via Cohen (1993) Alg. 4.8.17 / 6.1.8 / 6.2.9 to complete M5 cleanly (promote earlier only if a 100–110d run shows bad squares). **Completes M5.** |
+| **Tier 5 (Post-M5)** | 3-prime 64-bit NTT for multi-Mbit `big.Int` products | Deferred | Defer past M5 unless `tryDependency` exceeds ~60s above 110–115 digits; product tree + Karp–Markstein on `math/big` Karatsuba handles $\le 110$ digits in seconds. |
+| **Skipped** | SIMD / `avo` core sieving loop | Skipped | Skipped per operator direction. |
 
 GNFS trial-divides only up to $\max(B_r, B_a)$. That is enough for correctness, and `factor/main.go` runs rho and ECM first.
 
