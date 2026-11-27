@@ -12,18 +12,18 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 
 ### Baselines (Apple M5 Pro, 15 cores)
 
-- **`qs`:**
-  - 80 digits (264 bits): 15.9s total (14.6s sieve, $B = 1.47\text{M}$, want 56,291 relations, matrix 81.1k×79.3k reduced to 14.6k×14.5k in 0.63s, Block Lanczos 0.53s, LA total 1.28s).
-  - 90 digits (297 bits): 2m11s total (2m06.6s sieve, $B = 4.13\text{M}$, want 146,021 relations, matrix 205.1k×202.8k reduced to 36.1k×36.0k in 1.87s, Block Lanczos 2.08s, LA total 4.24s).
-  - 95 digits (315 bits): 9m06s total (8m56.0s sieve, $B = 7.09\text{M}$, want 241,682 relations, matrix 346.1k×339.0k reduced to 60.3k×60.2k in 3.96s, Block Lanczos 5.22s, LA total 9.66s). Extrapolates to ~38m at 100 digits.
-- **`BenchmarkQuadraticSieve` pre vs post refactor:** unchanged within noise (60 bits 382µs vs 376µs, 120 bits 4.11ms vs 4.16ms, 160 bits 34.2ms vs 34.1ms).
+- **`qs` (after 2026-11-26 SIQS + DLP + `qsArena` + $Q_2(x)$ speedups):**
+  - 80 digits (265–266 bits): 8.8s–11.0s total (was 15.9s).
+  - 90 digits (297 bits): 54.8s total (50.5s sieve, 4.1s LA; was 2m11s).
+  - 95 digits (314 bits): 3m42s total (3m34s sieve, 8.0s LA; was 9m06s). Extrapolates to ~15m at 100 digits.
+- **`BenchmarkQuadraticSieve` pre vs post refactor:** unchanged within noise at refactor, now 259µs (60b), 2.88ms (120b), 23.1ms (160b).
 - **`BenchmarkBlockLanczos` (row weight 40):** 0.19s / 21 MB at 10k cols, 2.45s / 123 MB at 50k cols, 16.7s / 540 MB at 150k cols.
 - **`BenchmarkBigMul` (`math/big`):** 8.1ms at 1 Mbit, 24.3ms at 2 Mbit, 102ms at 5 Mbit, 309ms at 10 Mbit.
 - **80-digit (265-bit) GNFS progression:**
   1. Initial `160k_21` baseline: 9m53.8s wall (9m30.6s sieve = 96.1%, 11.4s LA, 9.0s sqrt).
   2. Prime-outer line sieving, skipping both-even $(i, j)$, 8-byte SWAR threshold scans, `invMod32`, two-stage 128/64-bit cofactoring, and `250k_q80k`: 4m34.0s wall (3m56.4s sieve, 10.2s LA).
   3. Skewed fixed-$c_d$ and non-monic Kleinjung polynomials, translation + $2\times 2$ rotation size optimisation, bounded skewness, parallel prime-power root sieve, 16 KB blocks, and flat `uint32` `fkArena` buckets grouped by `LogP`: **54.0s wall (40.3s sieve, 4.7s LA, 7.2s sqrt)**, 11× faster than baseline.
-- **Expected `qs` / `gnfs` crossover:** `gnfs` is 54.0s at 80 digits (3.4× `qs`) and 3m53s at 89 digits (~1.8× `qs` at 90 digits), projecting crossover around 95–97 digits (~315–322 bits).
+- **Expected `qs` / `gnfs` crossover:** with `qs` now at 54.8s (90d) and 3m42s (95d) and `gnfs` at 54.0s (80d) and 3m53s (89d), crossover projects around 100–102 digits (~332–339 bits); `qsMaxBits` in `factor/main.go` is set to `332`.
 
 ### Milestones
 
