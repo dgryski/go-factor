@@ -18,6 +18,13 @@ import (
 // allMethods lists the factoring methods in the order they run.
 var allMethods = []string{"trial", "brent", "p-1", "p+1", "squfof", "ecm", "qs", "gnfs"}
 
+// Sieve bit limits when -methods is not explicitly set. QS hands off to GNFS
+// above 332 bits (100 digits), near their extrapolated crossover.
+const (
+	qsMaxBits   = 332
+	gnfsMaxBits = 450
+)
+
 func main() {
 	// 21251589199163473368424683523876245871651712859289
 
@@ -78,11 +85,6 @@ func main() {
 		}
 	}
 
-	// At 266 bits (80 digits) the quadratic sieve takes about 15s on 15
-	// cores and 550MB, and the time doubles every 3 or 4 digits. Asking for
-	// qs by name with -methods lifts the limit.
-	const qsMaxBits = 266
-	const gnfsMaxBits = 450
 	qsRuns := func(n *big.Int) bool {
 		return run["qs"] && (methodsSet || n.BitLen() <= qsMaxBits)
 	}

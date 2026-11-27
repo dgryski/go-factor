@@ -10,7 +10,7 @@ import (
 // Methods before the sieve share pretestFraction of the estimated sieve time.
 // Unused time from earlier methods carries forward to later ones.
 const (
-	pretestFraction = 1.0 / 3
+	pretestFraction = 0.25
 
 	shareBrent  = 0.10
 	sharePMinus = 0.20
@@ -58,16 +58,15 @@ func (b *budget) context(c *big.Int, share float64) (ctx context.Context, cancel
 	return ctx, cancel, name, true
 }
 
-// qsSingle holds 1-worker quadratic sieve times on an Apple M-series machine.
-var qsSingle = []timePoint{
-	{30, 0.004}, {39, 0.019}, {45, 0.081}, {50, 0.24}, {55, 0.60},
-	{60, 1.54}, {64, 4.9}, {67, 9.5}, {71, 20.5}, {74, 52},
-	{79, 159}, {90, 1140}, {95, 4750},
+// qs15Cores holds 15-worker quadratic sieve times on an Apple M5 Pro.
+var qs15Cores = []timePoint{
+	{30, 0.0014}, {36, 0.0029}, {42, 0.0085}, {48, 0.023},
+	{60, 0.19}, {70, 1.23}, {80, 9.9}, {90, 54.8}, {95, 222}, {100, 900},
 }
 
 // gnfs15Cores holds 15-worker GNFS times on an Apple M5 Pro.
 var gnfs15Cores = []timePoint{
-	{35, 0.25}, {45, 0.60}, {59, 3.0}, {70, 17}, {75, 95}, {80, 274}, {89, 1311},
+	{35, 0.25}, {45, 0.60}, {59, 3.0}, {70, 11.0}, {80, 54.0}, {89, 233}, {100, 1350},
 }
 
 func interpLogTime(table []timePoint, digits int) float64 {
@@ -85,9 +84,9 @@ func qsTime(n *big.Int, workers int) time.Duration {
 	if workers < 1 {
 		workers = 1
 	}
-	seconds := interpLogTime(qsSingle, len(n.String()))
-	speedup := 1 + 0.55*float64(workers-1)
-	return time.Duration(seconds / speedup * float64(time.Second))
+	seconds15 := interpLogTime(qs15Cores, len(n.String()))
+	scale := (1 + 0.55*14) / (1 + 0.55*float64(workers-1))
+	return time.Duration(seconds15 * scale * float64(time.Second))
 }
 
 func gnfsTime(n *big.Int, workers int) time.Duration {
