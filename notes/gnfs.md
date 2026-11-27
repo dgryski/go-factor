@@ -32,10 +32,10 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | **M-1** | Done. `qs` timed at 80, 90 and 95 digits; `BenchmarkBigMul` recorded at 1–10 Mbit; `BenchmarkBlockLanczos` recorded up to 150k cols; pre/post refactor `qs` benchmarks verified equal. |
 | **M0** | Done. `internal/arith` and `internal/linalg` shared with `qs` with no benchmark regression. |
 | **M1** | Done. Base-$m$, coarse bad ideals, QCs, line sieve, square root by Hensel lifting, and all 4.7 checks. Zero bad squares observed across all runs up to 295 bits. |
-| **M2** | Done. Dedup, singleton pruning on $(p, r)$ ideals, `Reducer`, parallel Block Lanczos benchmarked to 150k columns. |
-| **M3** | Mostly done. Gauss reduction, $\lambda_p$, 16 KB prime-outer line sieving, flat `uint32` Franke–Kleinjung bucket arena grouped by `LogP`, both-even skipping, SWAR candidate scan, two-stage 128/64-bit 2LP cofactoring, extended special-$q$ sieving. Verified up to 295 bits (89 digits); 305–365 bits (92–110 digits) still needs tuning runs. |
-| **M4** | Done. Skewed fixed-$c_d$ search, bounded skewness, translation + $2\times 2$ rotation size optimisation, parallel prime-power root sieve, Murphy $\alpha$ + Dickman yield scoring, and `-gnfs-save` checkpointing + full/partial resume + `TestSavedRelations`. |
-| **M5** | Partial. Non-monic Kleinjung polynomial selection, product-tree square root, and $d = 5$ parameter row exist. Exact bad ideals, P−1/ECM cofactoring and runs at 95–110+ digits are not done. |
+| **M2** | Mostly done. Dedup, zero-allocation dense-ID `lpFilter` singleton pruning on $(p, r)$ ideals, `Reducer`, parallel Block Lanczos benchmarked to 150k columns. Cavallar clique pruning and Markowitz priority-queue pivoting remain. |
+| **M3** | Mostly done. Gauss reduction, $\lambda_p$, 16 KB prime-outer line sieving, flat `uint32` Franke–Kleinjung bucket arena grouped by `LogP`, both-even skipping, SWAR candidate scan, two-stage 128/64-bit 2LP cofactoring, extended special-$q$ sieving. Sub-segment log-norm initialization, line-prime resieving, prime-power sieving, and 305–365 bit tuning remain. |
+| **M4** | Mostly done. Skewed fixed-$c_d$ search, bounded skewness, translation + $2\times 2$ rotation size optimisation, parallel prime-power root sieve, Murphy $\alpha$, and `-gnfs-save` checkpointing + full/partial resume + `TestSavedRelations`. Kleinjung $a_1 = P_1 P_2$ collision search and directional Murphy $E(f, g)$ scoring remain. |
+| **M5** | Partial. Non-monic Kleinjung polynomial selection, free relations, product-tree square root, and $d = 5$ parameter row exist. 3LP + 128-bit Montgomery P−1/ECM cofactoring, exact bad ideals, two-level cache-blocked buckets, Kronecker + Karp–Markstein + NTT square root, and tuned runs at 95–110+ digits remain. |
 
 ### Parameter table (`defaultParams`)
 
@@ -44,8 +44,8 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | < 115 | Line sieve, $d = 3$, Br 1200, Ba 1800, LP 32k/48k, ratio 0.80. 80–96ms at 95 bits, 134–272ms at 114 bits (down from 603ms with Br 800, Ba 1200). |
 | 115–150 | $d = 4$, Br = Ba = 8000, LP $2^{17}$, ratio 0.80. 0.3s at 115 bits, 0.6s at 149 bits. |
 | 150–200 | $d = 4$, Br = Ba = 30000, LP $2^{18}$, $Q_{\min} = 20\text{k}$, $I = 1024$, $J = 512$, ratio 0.85. 1.6s at 151 bits, 3–4s at 195 bits. |
-| 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $Q_{\min} = 60\text{k}$, $I = J = 1024$, ratio 0.82. 11.0s total (6.98s sieve) at 230 bits / 70 digits (down from 17s before poly+arena, and 26–33s originally). |
-| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.82. 54.0s at 265 bits / 80 digits (40.3s sieve, 4.7s LA, 7.2s sqrt; down from 4m34s). |
+| 200–250 | $d = 4$, Br = Ba = 100000, LP $2^{20}$, mfb 40, $Q_{\min} = 60\text{k}$, $I = J = 1024$, ratio 0.82. 7.86s total (4.83s sieve) at 231 bits / 70 digits after free relations + `lpFilter` (down from 11.0s after poly+arena, and 26–33s originally). |
+| 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.82. 48.0s–1m01.7s at 265–266 bits / 80 digits (29.8s–41.0s sieve; down from 4m34s). |
 | 275–305 | $d = 4$, Br = Ba = 400000, LP $2^{22}$, mfb 44, $Q_{\min} = 150\text{k}$, $I = J = 2048$, ratio 0.84. 3m53s at 295 bits / 89 digits (3m19s sieve, 14.1s LA, 16.5s sqrt, 0 bad squares; down from 21m51s). |
 | 305–365 | $d = 4$, Br = 550000, Ba = 600000, LP $2^{23}$, mfb 46, $Q_{\min} = 250\text{k}$, $I = J = 2048$, ratio 0.88. Extrapolated from 265 and 295 bits; not yet timed. |
 | ≥ 365 | $d = 5$, Br = 500000, Ba = 800000, LP $2^{26}$, mfb 52. Not tested. |
@@ -55,29 +55,30 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 ### Differences from the plan
 
 - **Skewness** minimises $\log\operatorname{RMS}(F) + \log\operatorname{RMS}(G)$ capped near $1.5\sqrt{Q_{\min} Q_{\max}}$ so $|b| \ge 1$ is realisable on the integer special-$q$ lattice.
-- **Bad ideals** are flagged for any multiple root of $f \bmod p$, which is a little more than $p^2 \mid \operatorname{disc}(f)$ requires.
+- **Bad ideals** are currently flagged for any multiple root of $f \bmod p$, which is a little more than $p^2 \mid \operatorname{disc}(f)$ requires (exact Round-2 valuation planned below).
 - **Multiple roots above $B_a$** have no QC, so special-$q$ roots and algebraic large primes at multiple roots are skipped.
 - **Small composite factors** that fit in 64 bits go to rho instead of back into GNFS.
 - **Progress** is measured in relations against a per-row `RelTargetRatio` times $\pi(\text{LP}_{\text{rat}}) + \pi(\text{LP}_{\text{alg}})$, switching to slope extrapolation once the 2-core slope reaches 0.2 (ignoring tiny pre-percolation slopes).
-- **Overshoot:** excess is checked every ~7% before $-\#\text{fixed}/2$, every ~1% while climbing, and every `2*(goal - excess)` (clamped to `[100, 1000]`) above $-2000$. Recent runs stopped at excess 57–70 against a goal of 32.
+- **Overshoot:** excess is checked with zero-allocation dense-ID `lpFilter` buffers every ~7% before $-\#\text{fixed}/2$, every ~1% while climbing, and every `2*(goal - excess)` (clamped to `[100, 1000]`) above $-2000$.
 
-### Remaining work
-
-Priority 1 covers tuning and crossover verification at 92–100 digits. Priority 2 covers $d = 5$ scaling to 100–110+ digits. Priority 3 covers larger M5 cofactoring, exact bad ideals, and low-level vectorisation.
+### Prioritized Algorithmic Plan & Remaining Work
 
 Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped without `-tune` and prints live 15s progress lines. For example, `GNFS_BITS=266 GNFS_CANDS=default GNFS_SEEDS=2 go test ./gnfs -run Sweep -v -tune -timeout 120m`. The package path has to come before `-tune`.
 
-| Priority | Task | Size | Notes |
+| Priority | Task | Status | Notes |
 | :--- | :--- | :--- | :--- |
-| 1 | Time and tune the 305–365 bit row (92–100 digits) | M | Verify 95- and 100-digit semiprimes end to end, measure the exact crossover against `qs` (projected around 95–97 digits), and raise `qsMaxBits` accordingly. |
-| 1 | Check 250–275 and 275–305 bit rows on more seeds | S | One seed each timed with Kleinjung + root sieve + `fkArena` so far. |
-| 2 | $d = 5$ tuning and 100–110 digit runs (M5) | M | Tune degree-5 polynomial selection (`kleinjungCandidates` $d=5$ and skewness bounds) and factor base parameters at 105–115 digits. |
-| 2 | Cache-blocked bucket sieving above L2 | M | Partition `fkArena` into two-level superblocks if `numBlocks * stride` outgrows L2/SLC at 110+ digits. |
-| 3 | P−1/ECM cofactoring for mfb above 64 bits | M | Needed once 2LP/3LP cofactor bounds exceed 64 bits above ~105 digits. |
-| 3 | Exact bad ideals | L | Only if coarse handling shows dependencies failing $\beta^2 = \gamma$ at larger sizes; 0 bad squares seen so far. |
-| 3 | Free relations | S | `cofactorPair` already supports them; small gain (about $1/|\mathrm{Gal}|$ of primes). |
-| 3 | Skewness from $\int F^2$ alone | S | Matches the plan; made no difference on the polynomials checked once skewness is bounded by $\sqrt{Q_{\min}Q_{\max}}$. |
-| 3 | SIMD / `avo` core sieving loop | M | After algorithmic improvements are done; rewrite the inner sieve and threshold scan loops using Go's `simd` package or [`avo`](https://github.com/mmcloughlin/avo). |
+| Done | Free relations and dense-ID `lpFilter` pruning | Done | Free relations for $p \le \min(B_r, B_a)$ scanned directly from `fb.AFB`; `lpFilter` eliminates per-recount map/slice allocations. 70d seed 1 down from 9.83s to 7.86s. |
+| 1 | Sub-segment log-norm initialization | Pending | Replace 16 KB 4-corner maximum norm thresholds (`latticeBlockThresholdAlg`/`Rat`) with per-line 64–128 byte segment $\log_2|F|, \log_2|G|$ initialization via `float64` Horner evaluation so small-$(i, j)$ and near-real-root points are not discarded. |
+| 1 | Line-prime batch resieving / reciprocal divisibility | Pending | Replace per-candidate 64-bit `(i - j*lambda) % p` loops over ~550 `ratLines`/`algLines` in `cofactorRatLattice`/`cofactorAlgLattice` with block-level hit gathering onto `candBits` or `uint32` Lemire reciprocals. |
+| 1 | Small prime-power sieving ($p^k < 2I$) | Pending | Sieve small prime powers ($p^2, p^3 \le 512$ and powers of small primes $< 29$) to tighten norm residuals by 2–4 bits and cut false-positive trial divisions. |
+| 1 | Kleinjung $a_1 = P_1 P_2$ collision + Murphy $E(f, g)$ | Pending | Meet-in-the-middle fractional-part collision over $d^3 \times d^3 = d^6$ CRT roots ($4{,}096$ at $d=4$, $15{,}625$ at $d=5$) in $O(d^3 \log d)$ time, ranked by 64-angle directional Murphy $E(f, g)$ quadrature over $\theta \in [0, \pi]$. |
+| 2 | 3LP + 128-bit Montgomery P−1 and ECM cofactoring | Pending | Widen `RatLPs` to `[3]uint64` and split 65–100 bit cofactors with stack-allocated 128-bit Montgomery Stage-1 P−1 + Suyama Montgomery-curve ECM (`mfb` up to ~2.7 $\log_2\text{LP}$). |
+| 2 | Exact bad ideals (Round-2 $p$-maximal order) | Pending | Compute $\mathcal{O}_p$, exact prime ideals $\mathfrak{P}_j \mid p$ ($e_j, f_j$), and anti-uniformizer matrices $\beta_j \in \mathcal{O}_p$ once per polynomial (Cohen 1993, Alg. 4.8.17, 6.1.8, 6.2.9), replacing coarse bad columns and extra QCs. |
+| 2 | Two-level cache-blocked bucket sieving | Pending | Partition large $(I, J)$ sieve regions into L2-resident $J$-strips (~256 blocks of 16 KB) so 15 workers' `fkArena` slabs fit in per-cluster L2/SLC cache at 105+ digits. |
+| 2 | Cavallar clique pruning + Markowitz SGE | Pending | Prune heavy 2-weight LP components when `excess` exceeds goal before SGE, and select `Reducer` pivots by ascending Markowitz fill `(w-1)*(rowLen-1)` via a min-bucket queue. |
+| 2 | Kronecker + Karp–Markstein + 64-bit NTT square root | Pending | Replace $d^2$ schoolbook `big.Int` muls in `polyAlgMulModModBig` with point-evaluation / Kronecker packing, use a coupled Karp–Markstein final Newton step, and add a 3-prime 64-bit NTT for multi-Mbit `big.Int` products. |
+| 3 | M3 & M5 parameter retuning and 80–110+ digit sweeps | Pending | Multi-seed sweeps at 80d, 89d, 95d, 100d, and $d = 4$ vs $d = 5$ at 105–110+ digits; measure exact `qs`/`gnfs` crossover and update `qsMaxBits` / `gnfs15Cores` in `factor/`. |
+| Deferred | SIMD / `avo` core sieving loop | Skipped | Deferred per operator direction. |
 
 GNFS trial-divides only up to $\max(B_r, B_a)$. That is enough for correctness, and `factor/main.go` runs rho and ECM first.
 
@@ -252,16 +253,19 @@ Choose $f$ (irreducible, primitive) and $g(x) = a_1 x - a_0$ with common root $m
   - **Size optimisation (`sizeOptimizePoly`):** alternate translation $x \mapsto x + k_t$ ($k_t = \lfloor -c_{d-1}/(d c_d) \rceil$, updating $a_0 \leftarrow a_0 - k_t a_1$) with the exact $2\times 2$ quadratic-form minimum over $(u, v)$ in $f + (ux + v)(a_1 x - a_0)$ at current skewness $s$, accepting steps monotonically.
   - **Bounded skewness:** cap $s$ near $1.5\sqrt{Q_{\min} Q_{\max}}$ so $|b| \approx A/\sqrt{s} \ge 1$ is realisable on the integer special-$q$ lattice instead of drifting to unphysical $s \gg q$.
   - **Prime-power root sieve (`rootSieveOptimize`):** for the top size-optimised candidates in parallel, sieve $v \in [-V, V]$ across $u \in [-U, U]$ (up to $U \le 12, V \le 768$) over all prime powers $p^k \le 97$. For each $x \in [0, p^k)$ with $p \nmid g(x)$, hits lie on the single arithmetic progression $v \equiv -f_u(x) g(x)^{-1} \pmod{p^k}$ with weight $\frac{\log p}{(p+1) p^{k-1}}$, summing identically to $\frac{p}{p^2-1}\log p$ on simple roots and handling ramified roots without special cases.
-  - **Dickman yield scoring (`dickmanYieldScore`):** rank survivors by $u_F \ln u_F + u_G \ln u_G$ at typical lattice scale $A = \sqrt{I (J/2) q_{\text{typ}}}$, with $u_F = (\ln\operatorname{RMS}(F) + d\ln A - \ln q_{\text{typ}} + \alpha(f))/\ln B_a$ and $u_G = (\ln\operatorname{RMS}(G) + \ln A)/\ln B_r$.
+  - **Dickman / Directional Murphy $E(f, g)$ scoring:** rank size-optimised candidates quickly by isotropic $u_F \ln u_F + u_G \ln u_G$, and rank root-sieved survivors by Murphy's directional yield integral (Murphy 1999, Section 5.1.3):
+    $$E(f, g) = \frac{1}{K} \sum_{k=1}^{K} \rho(u_F(\theta_k))\, \rho(u_G(\theta_k)), \qquad (a_k, b_k) = \left(\sqrt{A^2 s}\cos\theta_k,\; \sqrt{A^2 / s}\sin\theta_k\right), \quad \theta_k = \frac{\pi(k - 1/2)}{K}$$
+    with $u_F(\theta) = (\ln|F(a, b)| - \ln q_{\text{typ}} + \alpha(f))/\ln B_a$ and $u_G(\theta) = \ln|G(a, b)|/\ln B_r$, capturing extra smoothness along real roots of $F$ and $G$.
   - **$\alpha(f)$ definition.** $\alpha$ compares the expected $p$-adic valuation of a random integer, $1/(p-1)$, with that of $F(a, b)$ over coprime pairs:
     $$\alpha(f) = \sum_{p \le B} \left(\frac{1}{p-1} - \mathbb{E}[v_p(F(a, b))]\right) \log p.$$
     $F(a, b)$ behaves like a number $e^{\alpha}$ times its size for smoothness, so negative $\alpha$ is better.
     - For $p \nmid \operatorname{disc}(f)$ with $n_p$ roots mod $p$, counting the projective root when $p \mid c_d$: over coprime $(a, b)$, $p \mid F$ with probability $n_p/(p+1)$, and the expected valuation is $n_p\,p/(p^2-1)$. So the term is
       $$\left(1 - \frac{n_p\, p}{p + 1}\right) \frac{\log p}{p - 1}.$$
     - For $p \mid \operatorname{disc}(f)$, roots can be multiple and that formula is wrong. Compute $\mathbb{E}[v_p(F)]$ by lifting the roots mod $p^k$ (Hensel, branching at multiple roots) until the contribution is negligible.
-- **Phase 1C — Non-monic Kleinjung candidates (`kleinjungCandidates`):**
-  - For smooth $c_d$, find small primes $p_j \nmid d c_d$ where $c_d x^d \equiv N \pmod{p_j}$ splits into $d$ roots, Hensel-lift each root to $\bmod p_j^2$, and combine $k \in \{3, 4\}$ primes into $a_1 = \prod p_j$ ($a_1^2 < 2^{62}$) giving $d^k$ roots $r \bmod a_1^2$ by CRT in `uint64`.
-  - For each root, pick $a_0 \equiv r \pmod{a_1^2}$ closest to $(N/c_d)^{1/d}$, let $M = (N - c_d a_0^d)/a_1^2$, and select the roots with smallest $|M - t_{d-1} a_0^{d-1}|$ so both $c_{d-1} = a_1 t_{d-1}$ and $c_{d-2}$ are small simultaneously. Expand the remaining coefficients so $\sum_{i=0}^d c_i a_0^i a_1^{d-i} = N$ identically, then pass through the same Stage 1B size optimisation and root sieve.
+- **Phase 1C — Non-monic Kleinjung candidates and meet-in-the-middle collision (`kleinjungCandidates`):**
+  - For smooth $c_d$, find small primes $p_j \nmid d c_d$ where $c_d x^d \equiv N \pmod{p_j}$ splits into $d$ roots and Hensel-lift each root to $\bmod p_j^2$.
+  - **Direct CRT ($k \in \{3, 4\}$)** combines $k$ primes into $a_1 = \prod p_j$ ($a_1^2 < 2^{62}$) for $d^k$ roots, while **meet-in-the-middle collision ($a_1 = P_1 P_2$, $3 + 3$ primes)** splits CRT into two halves $R_1 \bmod P_1^2$ and $R_2 \bmod P_2^2$ of size $d^3$ each, sorting fractional parts of $r_1 e_1 / a_1^2 \bmod 1$ against $(m_0 - r_2 e_2)/a_1^2 \bmod 1$ (Kleinjung 2006, Section 2.2) to search $d^6$ roots in $O(d^3 \log d)$ time.
+  - For the closest matches to $m_0 = (N/c_d)^{1/d}$, let $M = (N - c_d a_0^d)/a_1^2$, minimise $|M - t_{d-1} a_0^{d-1}|$ so both $c_{d-1} = a_1 t_{d-1}$ and $c_{d-2}$ are small simultaneously, expand $\sum_{i=0}^d c_i a_0^i a_1^{d-i} = N$, and pass through Stage 1B size optimisation and root sieve.
 
 ---
 
@@ -269,15 +273,13 @@ Choose $f$ (irreducible, primitive) and $g(x) = a_1 x - a_0$ with common root $m
 
 1. **Rational factor base:** all primes $p \le B_r$, with roots $a_0 a_1^{-1} \bmod p$, or projective ($p \mid b$) when $p \mid a_1$ (4.4).
 2. **Algebraic factor base:** for each prime $p \le B_a$, the roots $r \in [0, p)$ of $f \bmod p$, plus the projective root $(p, \infty)$ when $p \mid c_d$. Each $(p, r)$ is its own column.
-3. **Bad ideals** ($p \mid c_d$ or $p^2 \mid \operatorname{disc}(f)$, usually 5–20 small primes):
-   - **M1 option:** one column per $(p, r)$ carrying $v_p(F(a, b))$, plus one extra QC per such column. The wrong valuations only add a finite-dimensional obstruction, which the extra characters remove with high probability. Measure how many dependencies then fail $\beta^2 = \gamma$. If it is more than a few, implement the exact rule.
-   - **Exact:** compute valuations at the prime ideals above $p$ in $\mathcal{O}_K$, or use CADO-NFS's `badideals` approach (computed once per polynomial).
+3. **Bad ideals** ($p \mid c_d$ or $p^2 \mid \operatorname{disc}(\hat f)$, usually 5–20 small primes):
+   - **M1 option:** one column per $(p, r)$ carrying $v_p(F(a, b))$, plus one extra QC per such column.
+   - **Exact (M5):** compute the $p$-maximal overorder $\mathcal{O}_p \supseteq \mathbb{Z}[\hat\alpha]$ via Zassenhaus Round 2 (Cohen 1993, Algorithm 6.1.8), decompose $\mathcal{O}_p / p\mathcal{O}_p$ into prime ideals $\mathfrak{P}_1, \dots, \mathfrak{P}_g$ with $(e_j, f_j)$ (Algorithm 6.2.9), and precompute anti-uniformizer matrices $\beta_j \in \mathcal{O}_p$ ($\tau_j = \beta_j / p \in \mathfrak{P}_j^{-1} \setminus \mathcal{O}_p$, Algorithm 4.8.17) once per polynomial so $v_{\mathfrak{P}_j}(c_d a - b\hat\alpha) \bmod 2$ is evaluated exactly in `buildMatrix` without extra QCs.
 4. **Quadratic character base:** 50–64 pairs $(q, s)$ chosen as in 4.6, with $q$ above every algebraic large-prime bound and special-$q$.
 5. **Fixed columns:** all-ones, rational sign, optional algebraic sign (4.5).
-6. **Free relations (low priority):** for $p \nmid c_d \operatorname{disc}(f)$ where $f$ splits completely mod $p$, the ideal $(p)$ is the product of the $d$ ideals $(p, r_i)$. That gives a relation with rational prime $p$ and all $d$ algebraic ideals, without sieving.
-   - The element is $p$ itself on both sides. It multiplies $\gamma$ by $p$ on the algebraic side, and adds $p$ with exponent 1 to $\prod G$ on the rational side.
-   - It has no $(a, b)$, so it brings no factor of $c_d$ or $a_1$, and it does **not** set the all-ones bit. Its QC bits are $\left(\frac{p}{q}\right)$.
-   - Only about $1/|\mathrm{Gal}|$ of primes qualify ($1/120$ for $S_5$), so the gain is small.
+6. **Free relations (done):** for $p \le \min(B_r, B_a)$ with $p \nmid c_d$ where $f$ has $d$ distinct affine roots mod $p$ (scanned directly from `fb.AFB` with no extra root-finding), $(p)\mathcal{O}_K = \prod_{i=1}^d \mathfrak{p}_i$ gives a full relation $(p, 0)$ immediately before sieving.
+   - The element is $p$ itself on both sides: it multiplies $\gamma$ by $p$ on the algebraic side and adds $p$ to $\prod G$ on the rational side, omits `ColAllOnes` and sign columns, and sets QC bits to $\left(\frac{p}{q}\right)$.
 
 ---
 
@@ -296,11 +298,12 @@ Choose $f$ (irreducible, primitive) and $g(x) = a_1 x - a_0$ with common root $m
   $$i \equiv \lambda_p\, j, \qquad \lambda_p = (r_p v_2 - v_1)(u_1 - r_p u_2)^{-1} \bmod p.$$
   - If $u_1 - r_p u_2 \equiv 0 \pmod p$, the hits are the lines $j \equiv 0 \pmod p$. Both factors cannot vanish together, since $\det(\mathbf{u}, \mathbf{v}) = \pm q$ and $p \ne q$.
   - Projective roots transform the same way with $(r_p : 1)$ replaced by $(1 : 0)$.
-- **Enumerating hits and bucket layout:**
+- **Enumerating hits, norm initialization, and bucket layout:**
   - **16 KB L1-resident blocks (`blockShift = 14`):** both `algBuf` and `ratBuf` fit in 32 KB total, block boundaries align with full lines of width $W = 2I$ for $I \le 8192$, and block offsets fit in 14 bits.
-  - $p < 2I$ (**prime-outer block line sieving**): loop prime-outer over each 16 KB block with carried per-line offsets (`off += lambda; if off >= p { off -= p }`, no per-line `% p`), stepping by $2p$ on even-$j$ lines to skip both-even $(i, j)$ and unrolling 4×.
-  - $p \ge 2I$ (**flat `uint32` Franke–Kleinjung arena `fkArena`**): group FK ideals by `LogP` (~7 groups), walk the $p$-lattice skipping both-even $(i, j)$ via `pos & (W|1) != 0`, and write 4-byte `uint32(idx)<<14 | off` entries into a single pre-allocated power-of-2-stride slab per block (`counts` in L1 cache, overflow slice fallback for safety). Draining iterates each `LogP` slice with constant register `lg` and 4× unrolling, cutting bucket memory traffic in half compared with `[][]uint64` slices.
-  - **Candidate scan and two-stage cofactoring:** scan 8 bytes per word (`binary.LittleEndian.Uint64` SWAR mask), gather rational bucket hits and cofactor $G(a, b)$ in 128/64-bit arithmetic first, and scan algebraic bucket hits only on blocks with Stage 1 survivors.
+  - **Sub-segment log-norm initialization:** instead of taking the 4-corner maximum of $|F|$ and $|G|$ across an entire 16 KB block, evaluate $\log_2|F(i, j)|$ and $\log_2|G(i, j)|$ along each line $j$ in 64–128 byte segments using `float64` Horner polynomials and initialize segment bytes to `bias - (normBits - slack)` so a fixed byte threshold captures small-$(i, j)$ and real-root corridors accurately.
+  - **Small prime powers and line sieving ($p^k < 2I$):** loop prime-outer over each 16 KB block with carried per-line offsets (`off += lambda; if off >= p { off -= p }`), stepping by $2p$ on even-$j$ lines to skip both-even $(i, j)$, unrolling 4×, and sieving small prime powers ($p^k \le 512$ and powers of primes $< 29$) to tighten norm residuals.
+  - $p \ge 2I$ (**flat `uint32` Franke–Kleinjung arena `fkArena` + two-level $J$-strips**): group FK ideals by `LogP` (~7 groups), walk the $p$-lattice skipping both-even $(i, j)$ via `pos & (W|1) != 0`, and write 4-byte `uint32(idx)<<14 | off` entries into a pre-allocated power-of-2-stride slab per block; for large $I \times J$, process $J$ in L2-resident strips (~256 blocks) so all workers' arenas stay in cache.
+  - **Candidate scan, line-prime resieving, and two-stage cofactoring:** scan 8 bytes per word (`binary.LittleEndian.Uint64` SWAR mask), gather both bucket hits and line-prime hits onto `candBits` (or test line primes via `uint32` Lemire reciprocals instead of 64-bit `%`), cofactor $G(a, b)$ first, and gather/cofactor algebraic hits only for Stage 1 survivors.
 - **Coprimality and sign:**
   - Skip $(i, j)$ with both even (a quarter of the area), and those with $\gcd(i, j) \ne 1$.
   - $\gcd(i, j) = 1$ is necessary for $\gcd(a, b) = 1$ but not sufficient, since $a$ and $b$ can still share the factor $q$. So check $\gcd(a, b) = 1$ on the survivors too.
@@ -315,21 +318,19 @@ For candidates passing both thresholds:
 1. Reconstruct $(a, b)$, normalise $b > 0$, require $\gcd(a, b) = 1$.
 2. Factor one side by small-prime scan plus resieving and bucket hits, and reject as soon as its cofactor exceeds the side's bound. The bound is the "mfb", the maximum cofactor bits, a tuning parameter.
 3. Factor the other side the same way. On the algebraic side include the special-$q$, and record each prime as an ideal $(p, r)$ with $r = ab^{-1} \bmod p$ (4.4).
-4. **Cofactor splitting (up to 2LP per side):**
-   - `isPrime64` and `rho64`/`splitCofactor` handle cofactors up to the mfb. At 100 digits with large-prime bounds around $2^{27}$ that is about $2^{54}$.
-   - For larger mfb or 3LP: `uint64` SQUFOF, P−1 and ECM, as CADO-NFS's cofactorization chain does.
+4. **Cofactor splitting (up to 3LP per side):**
+   - For $\le 64$-bit 2LP cofactors: `IsPrime64` + `Rho64` / Montgomery P−1 + ECM.
+   - For 3LP (`RatLPs [3]uint64`, `AlgLPs []LargeIdeal`) and `mfb > 64` bits (up to 128 bits): stack-allocated 128-bit Montgomery arithmetic (`mont128`), BPSW/Miller–Rabin primality test to reject inert cofactors early, Stage-1 Pollard P−1, and Suyama-parametrized Montgomery-curve ECM with `rho128` fallback.
 
 ---
 
 ### Stage 5: Filtering & Linear Algebra (`filter.go`, `internal/linalg`)
 
-A relation can carry large primes on both sides, up to four in total.
+A relation can carry up to three large primes per side.
 
-1. **Deduplicate** on $(a, b)$ with $b > 0$, globally across all special-$q$. This is also the only cross-$q$ duplicate rule needed. Requiring every algebraic prime to be $\le q$ would lose relations whose largest algebraic prime lies outside the special-$q$ range.
-2. **Singleton pruning on ideals:** a rational large prime is identified by $p$, an algebraic one by $(p, r)$. Two relations sharing $p$ with different roots are in different ideals, and matching them produces dependencies that are not squares.
-   - Iteratively drop relations containing an ideal of weight 1 until a 2-core remains.
-   - Track $\text{excess} = \#\text{relations} - \#\text{active large-prime ideals} - \#\text{fixed columns}$, where the fixed columns are the factor bases, QCs and the sign/all-ones columns.
-3. **SGE + Block Lanczos:** build sparse rows from the all-ones, sign, RFB, AFB, QC and active large-prime columns, reduce with `reducer`, and solve the core with parallel Block Lanczos.
+1. **Deduplicate** on $(a, b)$ with $b > 0$ (and $(p, 0)$ for free relations), globally across all special-$q$.
+2. **Dense-ID singleton and clique pruning on ideals:** intern rational LPs $p$ and algebraic LPs $(p, r)$ to dense `int32` IDs in `lpFilter` so iterative 2-core peeling during sieving runs in reusable flat arrays with zero heap allocations. When `excess` exceeds the target before matrix build, Cavallar clique removal drops the heaviest 2-weight LP components to shrink the matrix and final dependency weight.
+3. **Markowitz SGE + Block Lanczos:** build sparse rows from fixed, exact bad-ideal, QC and active LP columns, pivot in ascending Markowitz fill `(w - 1)*(rowLen - 1)` order in `Reducer`, and solve the compact core with parallel Block Lanczos.
 
 ---
 
@@ -351,9 +352,9 @@ The method is the one common to msieve and CADO-NFS: form $\gamma$ explicitly, t
    - If none exists ($d = 4$ with no 4-cycle in the Galois group), use a $p$ where $\hat f$ splits into distinct factors. Lift a root modulo each factor and combine them by CRT, trying the $2^{k-1}$ sign combinations for $k$ factors.
 4. **Lift:**
    - Take $\gamma^{-1/2}$ in $\mathbb{F}_{p^d}$. Choosing $p \equiv 3 \pmod 4$ with $d$ odd gives $p^d \equiv 3 \pmod 4$, so a square root is a single power, $\gamma^{(p^d + 1)/4}$. Otherwise use Tonelli–Shanks or Cipolla in $\mathbb{F}_{p^d}$.
-   - Lift with the Newton iteration $x \leftarrow x(3 - \gamma x^2)/2$, doubling the precision each step, until $p^K > 2 M_\beta$.
-   - Then $\beta = \gamma x \bmod p^K$, with coefficients taken as symmetric residues.
-   - Check $\beta^2 = \gamma$ (4.7). If it fails, the dependency was not a square, so log it and move on.
+   - Lift $x \equiv \gamma^{-1/2}$ up to half precision $\lceil K/2 \rceil$ with Newton steps $x \leftarrow x(3 - \gamma x^2)/2$, then finish the last doubling step via Karp–Markstein's coupled step ($b_0 = \gamma x \bmod p^{\lceil K/2 \rceil}$, $\beta = b_0 + x(\gamma - b_0^2)/2 \bmod p^K$) so full precision needs only 2 polynomial multiplies instead of 4.
+   - Accelerate degree-$d$ polynomial products via Kronecker substitution / evaluation at $2d - 1$ small points, and accelerate multi-Mbit `big.Int` multiplications via a 3-prime 64-bit NTT in `internal/arith` ($O(B \log B)$ vs `math/big` Karatsuba's $O(B^{1.585})$).
+   - Take symmetric residues of $\beta \bmod p^K$ and check $\beta^2 = \gamma$ (4.7). If it fails, the dependency was not a square, so log it and move on.
 5. **Factor:** $X_{\text{alg}} = \beta(\hat m) \bmod N$. $X_{\text{rat}}$ is as in 4.5. Check $X_{\text{alg}}^2 \equiv X_{\text{rat}}^2 \pmod N$, then $\gcd(X_{\text{alg}} \pm X_{\text{rat}}, N)$.
 
 **Cost.** This is a rough estimate to replace with measurements at M1 and M5.
@@ -418,10 +419,10 @@ type Relation struct {
 | **M-1: Baseline** | Time `qs` at 90, 95, 100 digits; benchmark `big.Int` multiplication at 1–10 Mbit | Recorded numbers that set the GNFS target and the square root design budget |
 | **M0: Shared Refactor** | `internal/arith`, `internal/linalg`, rows-based `findDependencies`; polynomial roots mod $p$ and Rabin's test | `qs` tests and benchmarks unchanged; roots match brute force for $p \le 5000$ |
 | **M1: End-to-End Prototype** | Base-$m$ ($d = 3$ and $4$), factor bases with coarse bad ideals, QCs, line sieve, 1LP cofactors, exact $\gamma$ + Hensel square root | Factor 30–60 digit semiprimes reliably; every check in 4.7 passes; count of dependencies failing $\beta^2 = \gamma$ |
-| **M2: Filtering & Parallel LA** | Dedup, singleton pruning on $(p, r)$ ideals, `reducer` + parallel Block Lanczos | 150k × 150k sparse matrix benchmark; dependency count and wall time |
-| **M3: Special-$q$ Lattice Sieve** | Gauss reduction, $\lambda_p$, Franke–Kleinjung buckets, resieving, two-sided 2LP | Factor 80–95 digit numbers; profile sieve vs cofactorization vs LA |
-| **M4: Polynomial Selection** | Chosen $c_d$, translation/rotation, Murphy $\alpha$, skewness; checkpointing on `qs/relfile.go` | Yield vs M1 polynomials at 90–100 digits; crossover against `qs` |
-| **M5: Scale & Tune (100–120+ digits)** | $d = 5$, parameter table (`Br`, `Ba`, large-prime bounds, mfb, `I`, `J`), product-tree square root, exact bad ideals, optional Kleinjung / P−1 / ECM cofactoring | 100 and 110 digit semiprimes end to end, with progress and time-left logging |
+| **M2: Filtering & Parallel LA** | Dedup, dense-ID `lpFilter` singleton pruning, Cavallar clique pruning, Markowitz `Reducer` + parallel Block Lanczos | 150k × 150k sparse matrix benchmark; dependency count and wall time |
+| **M3: Special-$q$ Lattice Sieve** | Gauss reduction, $\lambda_p$, sub-segment log-norms, prime-power sieving, Franke–Kleinjung buckets, line-prime resieving, two-sided 2LP | Factor 80–95 digit numbers; profile sieve vs cofactorization vs LA |
+| **M4: Polynomial Selection** | Chosen $c_d$, translation/rotation, root sieve, Kleinjung $P_1 P_2$ collision, directional Murphy $E(f, g)$; checkpointing on `qs/relfile.go` | Yield vs M1 polynomials at 90–100 digits; crossover against `qs` |
+| **M5: Scale & Tune (100–120+ digits)** | $d = 5$, parameter table, free relations, two-level cache-blocked buckets, exact Round-2 bad ideals, 3LP + 128-bit Montgomery P−1/ECM, Kronecker + Karp–Markstein + NTT square root | 100 and 110 digit semiprimes end to end, with progress and time-left logging |
 
 ---
 
