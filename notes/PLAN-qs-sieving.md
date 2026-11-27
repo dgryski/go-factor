@@ -817,8 +817,8 @@ With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20�
 
 3. **Done (`a09a31e`). $Q_2(x)$ polynomials when $kN \equiv 1 \pmod 8$**
    - Sieve $Y_2(x) = ((2Ax + B)^2 - kN)/(4A)$ with odd $B$ (choosing the sign of $B_{s-1}$ so $B$ is odd) and $X = (2Ax + B)(N+1)/2 \bmod N$, halving target $A$ and dividing sieve values by 4.
-4. **Done (`a09a31e`). Tighter partial recount schedule near completion**
-   - Shrink the `countPartials` interval as `len(relations) + partialExcess` approaches `want`. Together with $Q_2(x)$, cut 80-digit polynomials from 225,643 to 194,913, overshoot from +1,972 to 0 (`59,391/59,391`), and runtime to 10.41s (9.03s sieve).
+4. **Done (`a09a31e`, `prunePartials`). Tighter zero-allocation partial recount**
+   - Shrink the recount interval near `want`, track 1-LP excess incrementally in $O(1)$ without scanning partials, and prune 2-LP singletons in reusable flat `int32` adjacency slices instead of rebuilding `map[uint64][]int32` per recount. Cut 80-digit runtime to ~9.3s (`M = 128K`) and 8.86s (`M = 256K`, `small = 100`).
 5. **Retune factor base table, Double Large Primes, sieve width, and small-prime skip**
    - Replace `L(N)^0.46` above ~200 bits with a smaller table-driven $B$ paired with Double Large Primes (`dlpMinBits`, `dlpSlackFrac`, higher `largePrimeMult`), `largeSieveRange` (`256K`), and higher `minSievePrime` (small-prime variation), swept after Priorities 1–2.4 are in place.
 
@@ -827,6 +827,6 @@ With GNFS crossing over around 95–97 digits (~315–322 bits), `qs` covers 20�
 6. **Done (`bf0508f`). Combine all 64 Lanczos dependencies by GCD** (`splitAll` / `refineDependencies`) so composites with 3+ factors split from one matrix without re-sieving composite cofactors.
 7. **Done (`bf0508f`). Sieve additional relations if all dependencies are trivial** (`maxSieveRetries = 3`, resuming `aRng`/`aSeen`) instead of returning `nil`.
 8. **Raise `qsMaxBits` to the QS/GNFS crossover (~95 digits)** and retune the parallel ECM pretest share in `factor/budget.go`.
-9. **Done. Single `n mod p` setup pass** (`limbs32`, `modLimbs`, `prepareFactorBase`) combining trial division, Legendre symbol, and modular square root setup.
-10. **Small P−1 / ECM cofactor split** ahead of `rho64` if `SplitCofactor` becomes hot under DLP.
+9. **Done (`787e8ea`). Single `n mod p` setup pass** (`limbs32`, `modLimbs`, `prepareFactorBase`) combining trial division, Legendre symbol, and modular square root setup.
+10. **Profiled (`< 2%` CPU). Small P−1 / ECM cofactor split** ahead of `rho64`: profiling 80-digit DLP (`B = 500k, lpm = 128, frac = 0.48`) showed `Rho64` at 1.38% CPU and `IsPrime64` at 0.53% CPU, so `Rho64` is not a bottleneck at QS sizes.
 11. **SIMD / `avo` inner sieve and medium-prime kernel** after algorithmic and parameter changes settle.
