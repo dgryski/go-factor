@@ -60,15 +60,27 @@ func TestSweep(t *testing.T) {
 	}
 	var inputs []*big.Int
 	if os.Getenv("QS_N") != "" {
-		n, _ := new(big.Int).SetString(os.Getenv("QS_N"), 10)
-		inputs = append(inputs, n)
+		for _, s := range list("QS_N", "") {
+			n, _ := new(big.Int).SetString(s, 10)
+			inputs = append(inputs, n)
+		}
 	} else {
+		seeds, _ := strconv.Atoi(os.Getenv("QS_SEEDS"))
+		if seeds <= 0 {
+			seeds = 1
+		}
 		for _, bStr := range list("QS_BITS", "") {
 			bits, _ := strconv.Atoi(bStr)
-			rnd := rand.New(rand.NewSource(7))
-			h1 := bits / 2
-			h2 := bits - h1
-			inputs = append(inputs, new(big.Int).Mul(testutil.RandomPrime(rnd, h1), testutil.RandomPrime(rnd, h2)))
+			for seed := 1; seed <= seeds; seed++ {
+				src := int64(7)
+				if seeds > 1 {
+					src = int64(seed*1000 + bits)
+				}
+				rnd := rand.New(rand.NewSource(src))
+				h1 := bits / 2
+				h2 := bits - h1
+				inputs = append(inputs, new(big.Int).Mul(testutil.RandomPrime(rnd, h1), testutil.RandomPrime(rnd, h2)))
+			}
 		}
 	}
 	defer func(b int64, l uint64, s uint32, r int64, dm int, df float64) {
