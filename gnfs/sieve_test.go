@@ -367,3 +367,107 @@ func TestSubSegmentNormInit(t *testing.T) {
 		t.Fatalf("expected center baseline (%d) > corner baseline (%d) on j=1", center, corner)
 	}
 }
+
+func TestOddModInv32AndPowerSieving(t *testing.T) {
+	for _, p64 := range arith.PrimesUpTo(5000) {
+		if p64 == 2 {
+			continue
+		}
+		p := uint32(p64)
+		inv, lim := oddModInv32(p)
+		for u := uint32(0); u < 20000; u += 3 {
+			got := u*inv <= lim
+			want := u%p == 0
+			if got != want {
+				t.Fatalf("oddModInv32(p=%d) at u=%d: got %v, want %v", p, u, got, want)
+			}
+		}
+	}
+
+	powers := []sievePower{
+		{pk: 16, lambda: 3, logP: 1, evenP: true},
+		{pk: 16, lambda: 4, logP: 1, evenP: true},
+		{pk: 25, lambda: 11, logP: 2, evenP: false},
+		{pk: 27, lambda: 0, logP: 2, evenP: false},
+	}
+	for _, I := range []int{64, 60} {
+		W := 2 * I
+		const J = 20
+		total := (J - 1) * W
+		got := make([]byte, total)
+		step := 384
+		for bStart := 0; bStart < total; bStart += step {
+			bEnd := bStart + step
+			if bEnd > total {
+				bEnd = total
+			}
+			sieveBlockPowersAdd(got[bStart:bEnd], bStart, bEnd, I, W, powers)
+		}
+		for j := 1; j < J; j++ {
+			for i := -I; i < I; i++ {
+				pos := (j-1)*W + (i + I)
+				if (i|j)&1 == 0 {
+					if got[pos] != 0 {
+						t.Fatalf("I=%d both-even (%d,%d) got %d, want 0", I, i, j, got[pos])
+					}
+					continue
+				}
+				var want byte
+				for _, sp := range powers {
+					if (int64(i)-int64(j)*int64(sp.lambda))%int64(sp.pk) == 0 {
+						want += sp.logP
+					}
+				}
+				if got[pos] != want {
+					t.Fatalf("I=%d (%d,%d): got %d, want %d", I, i, j, got[pos], want)
+				}
+			}
+		}
+	}
+
+	lines := []linePrime{
+		{idx: 10, p: 29, lambda: 0, logP: 5},
+		{idx: 11, p: 31, lambda: 17, logP: 5},
+		{idx: 12, p: 37, lambda: 36, logP: 5},
+	}
+	verts := []vertPrime{{idx: 13, p: 5, logP: 2}}
+	for _, I := range []int{64, 60} {
+		W := 2 * I
+		const J = 16
+		total := (J - 1) * W
+		var candBits [blockSize / 64]uint64
+		var candSlot [blockSize]uint16
+		var cands []int
+		for pos := 0; pos < total; pos += 13 {
+			j := 1 + pos/W
+			i := (pos % W) - I
+			if (i|j)&1 == 0 {
+				continue
+			}
+			candSlot[pos] = uint16(len(cands))
+			candBits[pos>>6] |= 1 << (uint(pos) & 63)
+			cands = append(cands, pos)
+		}
+		hits := make([][]int32, len(cands))
+		gatherBlockLineHits(0, total, I, W, lines, verts, &candBits, &candSlot, hits)
+		for k, pos := range cands {
+			j := 1 + pos/W
+			i := (pos % W) - I
+			gotSet := make(map[int32]bool)
+			for _, id := range hits[k] {
+				gotSet[id] = true
+			}
+			for _, vp := range verts {
+				if (j%int(vp.p) == 0) != gotSet[vp.idx] {
+					t.Fatalf("I=%d vert (%d,%d) mismatch", I, i, j)
+				}
+			}
+			for _, lp := range lines {
+				want := (int64(i)-int64(j)*int64(lp.lambda))%int64(lp.p) == 0
+				if want != gotSet[lp.idx] {
+					t.Fatalf("I=%d line p=%d (%d,%d) mismatch: got %v, want %v", I, lp.p, i, j, gotSet[lp.idx], want)
+				}
+			}
+		}
+	}
+}

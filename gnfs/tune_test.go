@@ -68,7 +68,7 @@ var tuneCands = map[string]Params{
 	"250k_q80k": {Degree: 4, Br: 250000, Ba: 250000, LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
 		MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
 		UseLattice: true, QMin: 80000, QMax: 800000, IHalf: 2048, JMax: 1024,
-		SlackRat: 48, SlackAlg: 48, NumQCs: 64},
+		SlackRat: 43, SlackAlg: 43, NumQCs: 64},
 	"300k_22_q120k": {Degree: 4, Br: 300000, Ba: 300000, LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
 		MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
 		UseLattice: true, QMin: 120000, QMax: 1500000, IHalf: 2048, JMax: 1024,

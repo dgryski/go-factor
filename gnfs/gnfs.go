@@ -94,7 +94,7 @@ func defaultParams(n *big.Int) *Params {
 			LpBoundRat: 1 << 18, LpBoundAlg: 1 << 18,
 			MfbRat: 36, MfbAlg: 36, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 20000, QMax: 120000, IHalf: 1024, JMax: 512,
-			SlackRat: 40, SlackAlg: 40, NumQCs: 64,
+			SlackRat: 38, SlackAlg: 38, NumQCs: 64,
 			RelTargetRatio: 0.85,
 		}
 	case bits < 250:
@@ -103,7 +103,7 @@ func defaultParams(n *big.Int) *Params {
 			LpBoundRat: 1 << 20, LpBoundAlg: 1 << 20,
 			MfbRat: 40, MfbAlg: 40, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 60000, QMax: 400000, IHalf: 1024, JMax: 1024,
-			SlackRat: 46, SlackAlg: 46, NumQCs: 64,
+			SlackRat: 41, SlackAlg: 41, NumQCs: 64,
 			RelTargetRatio: 0.82,
 		}
 	case bits < 275:
@@ -112,7 +112,7 @@ func defaultParams(n *big.Int) *Params {
 			LpBoundRat: 1 << 21, LpBoundAlg: 1 << 21,
 			MfbRat: 42, MfbAlg: 42, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 80000, QMax: 800000, IHalf: 2048, JMax: 1024,
-			SlackRat: 48, SlackAlg: 48, NumQCs: 64,
+			SlackRat: 43, SlackAlg: 43, NumQCs: 64,
 			RelTargetRatio: 0.82,
 		}
 	case bits < 305:
@@ -121,7 +121,7 @@ func defaultParams(n *big.Int) *Params {
 			LpBoundRat: 1 << 22, LpBoundAlg: 1 << 22,
 			MfbRat: 44, MfbAlg: 44, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 150000, QMax: 2000000, IHalf: 2048, JMax: 2048,
-			SlackRat: 50, SlackAlg: 50, NumQCs: 64,
+			SlackRat: 45, SlackAlg: 45, NumQCs: 64,
 			RelTargetRatio: 0.84,
 		}
 	case bits < 365:
@@ -130,7 +130,7 @@ func defaultParams(n *big.Int) *Params {
 			LpBoundRat: 1 << 23, LpBoundAlg: 1 << 23,
 			MfbRat: 46, MfbAlg: 46, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 250000, QMax: 3500000, IHalf: 2048, JMax: 2048,
-			SlackRat: 52, SlackAlg: 52, NumQCs: 64,
+			SlackRat: 47, SlackAlg: 47, NumQCs: 64,
 			RelTargetRatio: 0.88,
 		}
 	default:
@@ -139,7 +139,7 @@ func defaultParams(n *big.Int) *Params {
 			LpBoundRat: 1 << 26, LpBoundAlg: 1 << 26,
 			MfbRat: 52, MfbAlg: 52, MaxLPRat: 2, MaxLPAlg: 2,
 			UseLattice: true, QMin: 400000, QMax: 10000000, IHalf: 4096, JMax: 2048,
-			SlackRat: 58, SlackAlg: 58, NumQCs: 64,
+			SlackRat: 53, SlackAlg: 53, NumQCs: 64,
 			RelTargetRatio: 1.05,
 		}
 	}

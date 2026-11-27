@@ -13,11 +13,23 @@ import (
 )
 
 const (
-	blockShift    = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
-	blockSize     = 1 << blockShift
-	blockMask     = blockSize - 1
-	minSievePrime = 29
+	blockShift     = 14 // 16 KB sieve blocks keep both sides L1-resident and fit offsets in 14 bits
+	blockSize      = 1 << blockShift
+	blockMask      = blockSize - 1
+	minSievePrime  = 29
+	minSievePower  = 32
+	maxSievePower  = 256
 )
+
+// oddModInv32 returns p^-1 mod 2^32 and floor((2^32-1)/p) for exact uint32
+// divisibility (Granlund and Montgomery, PLDI 1994, Section 9).
+func oddModInv32(p uint32) (inv, lim uint32) {
+	inv = p
+	for i := 0; i < 4; i++ {
+		inv *= 2 - p*inv
+	}
+	return inv, ^uint32(0) / p
+}
 
 // LatticeQ represents a special-q algebraic ideal (Q, R) and its Gauss-reduced
 // lattice basis u = (U1, U2), v = (V1, V2) with det(u, v) = ±Q.
@@ -34,13 +46,32 @@ type linePrime struct {
 	idx    int32
 	p      uint32
 	lambda uint32
+	bias   uint32
+	pInv   uint32
+	pLim   uint32
 	logP   byte
 }
 
 type vertPrime struct {
 	idx  int32
 	p    uint32
+	pInv uint32
+	pLim uint32
 	logP byte
+}
+
+type primePowerIdeal struct {
+	pk   uint32
+	p    uint32
+	a, b uint32
+	logP byte
+}
+
+type sievePower struct {
+	pk     uint32
+	lambda uint32
+	logP   byte
+	evenP  bool
 }
 
 type logGroup struct {
@@ -807,9 +838,11 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 	algGroups := buildLogGroupsAlg(fb.AFB, algFK)
 	ratExpHits := estimateExpectedFKHitsPerBlock(fb.RFB, nil, ratFK, true)
 	algExpHits := estimateExpectedFKHitsPerBlock(nil, fb.AFB, algFK, false)
+	ratPowIdeals := buildRatPowerIdeals(poly, fb, W)
+	algPowIdeals := buildAlgPowerIdeals(poly, fb, W)
 
-	smallSlackRat := expectedSmallLogSumRat(fb, minSievePrime)
-	smallSlackAlg := expectedSmallLogSumAlg(fb, minSievePrime)
+	smallSlackRat := expectedUnsievedLogSumRat(fb, minSievePrime, ratPowIdeals)
+	smallSlackAlg := expectedUnsievedLogSumAlg(fb, minSievePrime, algPowIdeals)
 	fastPoly := newFastNormPoly(poly)
 
 	nw := Workers
@@ -830,11 +863,11 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 	var wg sync.WaitGroup
 
 	type ratSurv struct {
-		off     int
-		i, j    int
-		a, b    int64
-		ratCols []int32
-		ratLPs  [2]uint64
+		off              int
+		i, j             int
+		a, b             int64
+		colStart, colEnd int
+		ratLPs           [2]uint64
 	}
 
 	for w := 0; w < nw; w++ {
@@ -849,9 +882,11 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 			ratLines := make([]linePrime, 0, len(ratLineIdx))
 			var ratVerts []vertPrime
 			var ratAll []int32
+			ratPowers := make([]sievePower, 0, len(ratPowIdeals))
 			algLines := make([]linePrime, 0, len(algLineIdx))
 			var algVerts []vertPrime
 			var algAll []int32
+			algPowers := make([]sievePower, 0, len(algPowIdeals))
 
 			var rawOffs []int
 			var candPos []int
@@ -861,6 +896,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 			var candSlot [blockSize]uint16
 			var ratCandHits, algCandHits [][]int32
 			var survivors []ratSurv
+			var survColsBuf []int32
 
 			for !stop.Load() {
 				qi := int(nextQ.Add(1) - 1)
@@ -884,11 +920,18 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						ratAll = append(ratAll, idx)
 						ratAllLog += id.LogP
 					} else if vert {
-						ratVerts = append(ratVerts, vertPrime{idx: idx, p: id.P, logP: id.LogP})
+						inv, lim := uint32(0), uint32(0)
+						if id.P&1 != 0 {
+							inv, lim = oddModInv32(id.P)
+						}
+						ratVerts = append(ratVerts, vertPrime{idx: idx, p: id.P, pInv: inv, pLim: lim, logP: id.LogP})
 					} else {
-						ratLines = append(ratLines, linePrime{idx: idx, p: id.P, lambda: lam, logP: id.LogP})
+						inv, lim := oddModInv32(id.P)
+						bias := uint32((I/int(id.P) + 1) * int(id.P))
+						ratLines = append(ratLines, linePrime{idx: idx, p: id.P, lambda: lam, bias: bias, pInv: inv, pLim: lim, logP: id.LogP})
 					}
 				}
+				ratPowers = transformPowerIdeals(ratPowers[:0], ratPowIdeals, lq)
 
 				algLines = algLines[:0]
 				algVerts = algVerts[:0]
@@ -904,11 +947,18 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						algAll = append(algAll, idx)
 						algAllLog += id.LogP
 					} else if vert {
-						algVerts = append(algVerts, vertPrime{idx: idx, p: id.P, logP: id.LogP})
+						inv, lim := uint32(0), uint32(0)
+						if id.P&1 != 0 {
+							inv, lim = oddModInv32(id.P)
+						}
+						algVerts = append(algVerts, vertPrime{idx: idx, p: id.P, pInv: inv, pLim: lim, logP: id.LogP})
 					} else {
-						algLines = append(algLines, linePrime{idx: idx, p: id.P, lambda: lam, logP: id.LogP})
+						inv, lim := oddModInv32(id.P)
+						bias := uint32((I/int(id.P) + 1) * int(id.P))
+						algLines = append(algLines, linePrime{idx: idx, p: id.P, lambda: lam, bias: bias, pInv: inv, pLim: lim, logP: id.LogP})
 					}
 				}
+				algPowers = transformPowerIdeals(algPowers[:0], algPowIdeals, lq)
 
 				for g, grp := range ratGroups {
 					for _, idx := range ratFK[grp.start:grp.end] {
@@ -956,6 +1006,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 					ab := algBuf[:bLen]
 					aThresh := initLatticeNormsAlg(ab, &fastPoly, lq, bStart, bEnd, I, W, logQ, params.SlackAlg+smallSlackAlg, algAllLog)
 					sieveBlockLinesAdd(ab, bStart, bEnd, I, W, algLines, algVerts)
+					sieveBlockPowersAdd(ab, bStart, bEnd, I, W, algPowers)
 					algArena.drainBlock(bi, ab, algGroups)
 
 					if !hasByteGe(ab, aThresh) {
@@ -965,6 +1016,7 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 					rb := ratBuf[:bLen]
 					rThresh := initLatticeNormsRat(rb, &fastPoly, lq, bStart, bEnd, I, W, params.SlackRat+smallSlackRat, ratAllLog)
 					sieveBlockLinesAdd(rb, bStart, bEnd, I, W, ratLines, ratVerts)
+					sieveBlockPowersAdd(rb, bStart, bEnd, I, W, ratPowers)
 					ratArena.drainBlock(bi, rb, ratGroups)
 
 					rawOffs = appendBothGe(rawOffs[:0], ab, rb, aThresh, rThresh)
@@ -1026,27 +1078,42 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						ratCandHits[k] = ratCandHits[k][:0]
 					}
 					ratArena.gatherHits(bi, &candBits, &candSlot, ratCandHits)
+					batchRatLines := len(candPos) >= 10
+					if batchRatLines {
+						gatherBlockLineHits(bStart, bEnd, I, W, ratLines, ratVerts, &candBits, &candSlot, ratCandHits)
+					}
 					for _, off := range candPos {
 						candBits[off/64] = 0
 					}
 
+					var ratLinesForCof []linePrime
+					var ratVertsForCof []vertPrime
+					if !batchRatLines {
+						ratLinesForCof = ratLines
+						ratVertsForCof = ratVerts
+					}
+
 					survivors = survivors[:0]
+					survColsBuf = survColsBuf[:0]
 					for k := range candPos {
 						ratCols, ratLPs, ok := cofactorRatLattice(
 							poly, fb, params,
 							candI[k], candJ[k], candA[k], candB[k],
-							ratSmall, ratLines, ratVerts, ratAll, ratCandHits[k],
+							ratSmall, ratLinesForCof, ratVertsForCof, ratAll, ratCandHits[k],
 							scratch,
 						)
 						if ok {
+							cStart := len(survColsBuf)
+							survColsBuf = append(survColsBuf, ratCols...)
 							survivors = append(survivors, ratSurv{
-								off:     candPos[k],
-								i:       candI[k],
-								j:       candJ[k],
-								a:       candA[k],
-								b:       candB[k],
-								ratCols: ratCols,
-								ratLPs:  ratLPs,
+								off:      candPos[k],
+								i:        candI[k],
+								j:        candJ[k],
+								a:        candA[k],
+								b:        candB[k],
+								colStart: cStart,
+								colEnd:   len(survColsBuf),
+								ratLPs:   ratLPs,
 							})
 						}
 					}
@@ -1065,8 +1132,19 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						algCandHits[k] = algCandHits[k][:0]
 					}
 					algArena.gatherHits(bi, &candBits, &candSlot, algCandHits)
+					batchAlgLines := len(survivors) >= 10
+					if batchAlgLines {
+						gatherBlockLineHits(bStart, bEnd, I, W, algLines, algVerts, &candBits, &candSlot, algCandHits)
+					}
 					for _, sv := range survivors {
 						candBits[sv.off/64] = 0
+					}
+
+					var algLinesForCof []linePrime
+					var algVertsForCof []vertPrime
+					if !batchAlgLines {
+						algLinesForCof = algLines
+						algVertsForCof = algVerts
 					}
 
 					for k := range survivors {
@@ -1074,8 +1152,8 @@ func sieveLattice(poly *Poly, fb *FactorBases, params *Params, onRel func(Relati
 						rel, ok := cofactorAlgLattice(
 							poly, fb, params,
 							sv.i, sv.j, sv.a, sv.b,
-							sv.ratCols, sv.ratLPs,
-							algSmall, algLines, algVerts, algAll, algCandHits[k],
+							survColsBuf[sv.colStart:sv.colEnd], sv.ratLPs,
+							algSmall, algLinesForCof, algVertsForCof, algAll, algCandHits[k],
 							lq, scratch,
 						)
 						if ok {
@@ -1128,7 +1206,7 @@ func sieveBlockLines(buf []byte, bStart, bEnd, I, W int, lines []linePrime, vert
 
 // sieveBlockLinesAdd adds line and vertical prime logP hits onto an initialized block.
 func sieveBlockLinesAdd(buf []byte, bStart, bEnd, I, W int, lines []linePrime, verts []vertPrime) {
-	if bStart%W == 0 && bEnd%W == 0 {
+	if bStart%W == 0 && bEnd%W == 0 && W&63 == 0 {
 		j0 := 1 + bStart/W
 		nLines := (bEnd - bStart) / W
 		iOddFirst := (I & 1) ^ 1
@@ -1272,6 +1350,407 @@ func expectedSmallLogSumAlg(fb *FactorBases, cut uint32) float64 {
 			break
 		}
 		sum += float64(id.LogP) / float64(id.P+1)
+	}
+	return sum
+}
+
+// gatherBlockLineHits scatters line and vertical prime hits in [bStart, bEnd) onto candidates in candBits.
+func gatherBlockLineHits(bStart, bEnd, I, W int, lines []linePrime, verts []vertPrime, candBits *[blockSize / 64]uint64, candSlot *[blockSize]uint16, dst [][]int32) {
+	j0 := 1 + bStart/W
+	if bStart%W == 0 && bEnd%W == 0 && W&63 == 0 {
+		nLines := (bEnd - bStart) / W
+		for _, vp := range verts {
+			vpP := int(vp.p)
+			rem := j0 % vpP
+			firstL := 0
+			if rem != 0 {
+				firstL = vpP - rem
+			}
+			for l := firstL; l < nLines; l += vpP {
+				base := l * W
+				wStart, wEnd := base>>6, (base+W)>>6
+				for w := wStart; w < wEnd; w++ {
+					m := candBits[w]
+					for m != 0 {
+						off := w<<6 | bits.TrailingZeros64(m)
+						dst[candSlot[off]] = append(dst[candSlot[off]], vp.idx)
+						m &= m - 1
+					}
+				}
+			}
+		}
+		i64 := uint64(I)
+		j064 := uint64(j0)
+		for k := range lines {
+			lp := lines[k]
+			p := int(lp.p)
+			p2 := p << 1
+			lam := int(lp.lambda)
+			idx := lp.idx
+			off := int((j064*uint64(lp.lambda) + i64) % uint64(lp.p))
+			for l := 0; l < nLines; l++ {
+				base := l * W
+				x := off
+				step := p
+				if (j0+l)&1 == 0 {
+					if (x-I)&1 == 0 {
+						x += p
+					}
+					step = p2
+				}
+				for ; x < W; x += step {
+					bOff := base + x
+					if candBits[bOff>>6]&(1<<(uint(bOff)&63)) != 0 {
+						dst[candSlot[bOff]] = append(dst[candSlot[bOff]], idx)
+					}
+				}
+				off += lam
+				if off >= p {
+					off -= p
+				}
+			}
+		}
+		return
+	}
+
+	for _, vp := range verts {
+		vpP := int(vp.p)
+		for pos := bStart; pos < bEnd; {
+			j := 1 + pos/W
+			xFrom := pos % W
+			segLen := W - xFrom
+			if bEnd-pos < segLen {
+				segLen = bEnd - pos
+			}
+			if j%vpP == 0 {
+				for x := 0; x < segLen; x++ {
+					bOff := pos - bStart + x
+					if candBits[bOff>>6]&(1<<(uint(bOff)&63)) != 0 {
+						dst[candSlot[bOff]] = append(dst[candSlot[bOff]], vp.idx)
+					}
+				}
+			}
+			pos += segLen
+		}
+	}
+	i64 := uint64(I)
+	for k := range lines {
+		lp := lines[k]
+		p := int(lp.p)
+		lam := int(lp.lambda)
+		idx := lp.idx
+		off := int((uint64(j0)*uint64(lp.lambda) + i64) % uint64(lp.p))
+		for pos := bStart; pos < bEnd; {
+			xFrom := pos % W
+			segLen := W - xFrom
+			if bEnd-pos < segLen {
+				segLen = bEnd - pos
+			}
+			xGlobal := off
+			if xGlobal < xFrom {
+				xGlobal += ((xFrom - xGlobal + p - 1) / p) * p
+			}
+			for x := xGlobal - xFrom; x < segLen; x += p {
+				bOff := pos - bStart + x
+				if candBits[bOff>>6]&(1<<(uint(bOff)&63)) != 0 {
+					dst[candSlot[bOff]] = append(dst[candSlot[bOff]], idx)
+				}
+			}
+			if xFrom+segLen == W {
+				off += lam
+				if off >= p {
+					off -= p
+				}
+			}
+			pos += segLen
+		}
+	}
+}
+
+// buildRatPowerIdeals builds prime power sieve entries p^k in [minSievePower, min(W-1, maxSievePower)]
+// for rational primes p.
+func buildRatPowerIdeals(poly *Poly, fb *FactorBases, W int) []primePowerIdeal {
+	limit := maxSievePower
+	if W-1 < limit {
+		limit = W - 1
+	}
+	if limit < minSievePower {
+		return nil
+	}
+	var out []primePowerIdeal
+	var bigM, rTmp big.Int
+	for _, id := range fb.RFB {
+		p := uint64(id.P)
+		if p*p > uint64(limit) {
+			break
+		}
+		for pk := p * p; pk <= uint64(limit); pk *= p {
+			if int(pk) < minSievePower {
+				continue
+			}
+			bigM.SetUint64(pk)
+			a1m := rTmp.Mod(poly.A1, &bigM).Uint64()
+			a0m := rTmp.Mod(poly.A0, &bigM).Uint64()
+			g := arith.Gcd64(arith.Gcd64(a1m, a0m), pk)
+			if g > 1 {
+				continue
+			}
+			out = append(out, primePowerIdeal{
+				pk:   uint32(pk),
+				p:    id.P,
+				a:    uint32(a1m),
+				b:    uint32(a0m),
+				logP: id.LogP,
+			})
+		}
+	}
+	return out
+}
+
+// buildAlgPowerIdeals lifts simple roots of f mod p to p^k in [minSievePower, min(W-1, maxSievePower)].
+func buildAlgPowerIdeals(poly *Poly, fb *FactorBases, W int) []primePowerIdeal {
+	limit := maxSievePower
+	if W-1 < limit {
+		limit = W - 1
+	}
+	if limit < minSievePower {
+		return nil
+	}
+	var out []primePowerIdeal
+	for _, id := range fb.AFB {
+		p := uint64(id.P)
+		if p*p > uint64(limit) {
+			break
+		}
+		if id.R == id.P {
+			continue
+		}
+		fp := poly.CoeffsModP(p)
+		dfp := arith.PolyDerivModP(fp, p)
+		deriv := arith.PolyEvalModP(dfp, uint64(id.R), p)
+		if deriv == 0 {
+			continue
+		}
+		invDeriv := arith.InvMod(deriv, p)
+		curR := uint64(id.R)
+		curPK := p
+		for curPK*p <= uint64(limit) {
+			nextPK := curPK * p
+			fMod := poly.CoeffsModP(nextPK)
+			val := arith.PolyEvalModP(fMod, curR, nextPK)
+			step := arith.MulMod64((p-(val/curPK)%p)%p, invDeriv, p)
+			curR += step * curPK
+			curPK = nextPK
+			if int(curPK) >= minSievePower {
+				out = append(out, primePowerIdeal{
+					pk:   uint32(curPK),
+					p:    id.P,
+					a:    1,
+					b:    uint32(curR),
+					logP: id.LogP,
+				})
+			}
+		}
+	}
+	return out
+}
+
+func transformPowerIdeals(dst []sievePower, ideals []primePowerIdeal, lq *LatticeQ) []sievePower {
+	u1, u2 := lq.U1, lq.U2
+	v1, v2 := lq.V1, lq.V2
+	for _, id := range ideals {
+		if id.p == lq.Q {
+			continue
+		}
+		pk := uint64(id.pk)
+		a := uint64(id.a)
+		b := uint64(id.b)
+		u1m, u2m := modInt64(u1, pk), modInt64(u2, pk)
+		v1m, v2m := modInt64(v1, pk), modInt64(v2, pk)
+		au1 := (a * u1m) % pk
+		bu2 := (b * u2m) % pk
+		var ap uint64
+		if au1 >= bu2 {
+			ap = au1 - bu2
+		} else {
+			ap = pk - (bu2 - au1)
+		}
+		if ap%uint64(id.p) == 0 {
+			continue
+		}
+		invAp, ok := arith.InvMod64(ap, pk)
+		if !ok {
+			continue
+		}
+		bv2 := (b * v2m) % pk
+		av1 := (a * v1m) % pk
+		var bp uint64
+		if bv2 >= av1 {
+			bp = bv2 - av1
+		} else {
+			bp = pk - (av1 - bv2)
+		}
+		lam := uint32((bp * invAp) % pk)
+		dst = append(dst, sievePower{
+			pk:     id.pk,
+			lambda: lam,
+			logP:   id.logP,
+			evenP:  id.p == 2,
+		})
+	}
+	return dst
+}
+
+// sieveBlockPowersAdd accumulates logP hits for prime powers pk < W, respecting even j parity for 2^k.
+func sieveBlockPowersAdd(buf []byte, bStart, bEnd, I, W int, powers []sievePower) {
+	if len(powers) == 0 {
+		return
+	}
+	if bStart%W == 0 && bEnd%W == 0 && W&63 == 0 {
+		j0 := 1 + bStart/W
+		nLines := (bEnd - bStart) / W
+		i64 := uint64(I)
+		j064 := uint64(j0)
+		for k := range powers {
+			sp := powers[k]
+			pk := int(sp.pk)
+			pk2 := pk << 1
+			lam := int(sp.lambda)
+			logP := sp.logP
+			off := int((j064*uint64(sp.lambda) + i64) % uint64(sp.pk))
+			if sp.evenP {
+				for l := 0; l < nLines; l++ {
+					if (j0+l)&1 != 0 || (off-I)&1 != 0 {
+						addSieveStride(buf[l*W:(l+1)*W], off, pk, W, logP)
+					}
+					off += lam
+					if off >= pk {
+						off -= pk
+					}
+				}
+			} else {
+				for l := 0; l < nLines; l++ {
+					seg := buf[l*W : (l+1)*W]
+					x := off
+					if (j0+l)&1 == 0 {
+						if (x-I)&1 == 0 {
+							x += pk
+						}
+						addSieveStride(seg, x, pk2, W, logP)
+					} else {
+						addSieveStride(seg, x, pk, W, logP)
+					}
+					off += lam
+					if off >= pk {
+						off -= pk
+					}
+				}
+			}
+		}
+		return
+	}
+
+	j0 := 1 + bStart/W
+	i64 := uint64(I)
+	for k := range powers {
+		sp := powers[k]
+		pk := int(sp.pk)
+		pk2 := pk << 1
+		lam := int(sp.lambda)
+		logP := sp.logP
+		off := int((uint64(j0)*uint64(sp.lambda) + i64) % uint64(sp.pk))
+		for pos := bStart; pos < bEnd; {
+			j := 1 + pos/W
+			xFrom := pos % W
+			segLen := W - xFrom
+			if bEnd-pos < segLen {
+				segLen = bEnd - pos
+			}
+			seg := buf[pos-bStart : pos-bStart+segLen]
+			xGlobal := off
+			if xGlobal < xFrom {
+				xGlobal += ((xFrom - xGlobal + pk - 1) / pk) * pk
+			}
+			x := xGlobal - xFrom
+			if sp.evenP {
+				if j&1 != 0 || (xGlobal-I)&1 != 0 {
+					addSieveStride(seg, x, pk, segLen, logP)
+				}
+			} else if j&1 == 0 {
+				if (xGlobal-I)&1 == 0 {
+					x += pk
+				}
+				addSieveStride(seg, x, pk2, segLen, logP)
+			} else {
+				addSieveStride(seg, x, pk, segLen, logP)
+			}
+			if xFrom+segLen == W {
+				off += lam
+				if off >= pk {
+					off -= pk
+				}
+			}
+			pos += segLen
+		}
+	}
+}
+
+func expectedUnsievedLogSumRat(fb *FactorBases, cut uint32, sievedPows []primePowerIdeal) float64 {
+	sieved := make(map[uint32]bool, len(sievedPows))
+	for _, sp := range sievedPows {
+		sieved[sp.pk] = true
+	}
+	sum := 0.0
+	for _, id := range fb.RFB {
+		p := id.P
+		if p >= cut && p*p > maxSievePower {
+			break
+		}
+		if p < cut {
+			sum += float64(id.LogP) / float64(p+1)
+		}
+		for pk := uint64(p) * uint64(p); pk <= maxSievePower; pk *= uint64(p) {
+			if !sieved[uint32(pk)] {
+				sum += float64(id.LogP) * float64(p) / (float64(p+1) * float64(pk))
+			}
+		}
+	}
+	return sum
+}
+
+func expectedUnsievedLogSumAlg(fb *FactorBases, cut uint32, sievedPows []primePowerIdeal) float64 {
+	sievedCount := make(map[uint32]int, len(sievedPows))
+	for _, sp := range sievedPows {
+		sievedCount[sp.pk]++
+	}
+	sum := 0.0
+	for _, id := range fb.AFB {
+		p := id.P
+		if p >= cut {
+			break
+		}
+		sum += float64(id.LogP) / float64(p+1)
+	}
+	// Add unsieved prime powers below minSievePower (such as 4, 8, 16, 9, 27, 25).
+	for i := 0; i < len(fb.AFB); {
+		p := fb.AFB[i].P
+		if uint64(p)*uint64(p) >= minSievePower {
+			break
+		}
+		logP := fb.AFB[i].LogP
+		nRoots := 0
+		j := i
+		for j < len(fb.AFB) && fb.AFB[j].P == p {
+			nRoots++
+			j++
+		}
+		for pk := uint64(p) * uint64(p); pk < minSievePower; pk *= uint64(p) {
+			unsieved := nRoots - sievedCount[uint32(pk)]
+			if unsieved > 0 {
+				sum += float64(unsieved) * float64(logP) * float64(p) / (float64(p+1) * float64(pk))
+			}
+		}
+		i = j
 	}
 	return sum
 }
@@ -1437,7 +1916,7 @@ func initLatticeNormsRat(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bEn
 }
 
 func initLatticeNormsSide(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bEnd, I, W int, deduct, slack float64, allLog byte, isAlg bool) int {
-	const coarseStep = 64
+	const coarseStep = 128
 	const fineStep = 16
 	var segEnd [1088]uint16
 	var segT [1088]uint8
@@ -1446,23 +1925,6 @@ func initLatticeNormsSide(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bE
 
 	u1, u2 := float64(lq.U1), float64(lq.U2)
 	v1, v2 := float64(lq.V1), float64(lq.V2)
-	eval := fp.evalLog2G
-	if isAlg {
-		eval = fp.evalLog2F
-	}
-
-	appendSeg := func(endOff int, t uint8) {
-		if t > tMax {
-			tMax = t
-		}
-		if nSeg > 0 && segT[nSeg-1] == t {
-			segEnd[nSeg-1] = uint16(endOff)
-			return
-		}
-		segEnd[nSeg] = uint16(endOff)
-		segT[nSeg] = t
-		nSeg++
-	}
 
 	for pos := bStart; pos < bEnd; {
 		j := float64(1 + pos/W)
@@ -1476,7 +1938,12 @@ func initLatticeNormsSide(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bE
 		aLine := j*v1 - float64(I)*u1
 		bLine := j*v2 - float64(I)*u2
 
-		v0, l0 := eval(aLine+float64(xFrom)*u1, bLine+float64(xFrom)*u2)
+		var v0, l0 float64
+		if isAlg {
+			v0, l0 = fp.evalLog2F(aLine+float64(xFrom)*u1, bLine+float64(xFrom)*u2)
+		} else {
+			v0, l0 = fp.evalLog2G(aLine+float64(xFrom)*u1, bLine+float64(xFrom)*u2)
+		}
 		for x0 := xFrom; x0 < xEnd; {
 			x1 := x0 + coarseStep
 			if x1 > xEnd {
@@ -1486,23 +1953,62 @@ func initLatticeNormsSide(buf []byte, fp *fastNormPoly, lq *LatticeQ, bStart, bE
 			if x1 == xEnd && xEnd > x0+1 {
 				xEval = xEnd - 1
 			}
-			v1, l1 := eval(aLine+float64(xEval)*u1, bLine+float64(xEval)*u2)
-			if (v0*v1 <= 0 || math.Abs(l1-l0) > 4.0) && x1-x0 > fineStep {
-				va, la := v0, l0
+			var v1, l1 float64
+			if isAlg {
+				v1, l1 = fp.evalLog2F(aLine+float64(xEval)*u1, bLine+float64(xEval)*u2)
+			} else {
+				v1, l1 = fp.evalLog2G(aLine+float64(xEval)*u1, bLine+float64(xEval)*u2)
+			}
+			if (v0*v1 <= 0 || math.Abs(l1-l0) > 3.0) && x1-x0 > fineStep {
+				la := l0
 				for xs := x0; xs < x1; {
 					xe := xs + fineStep
 					if xe >= x1 {
-						appendSeg(baseOff+(x1-xFrom), segPairThreshold(la, l1, deduct))
+						t := segPairThreshold(la, l1, deduct)
+						if t > tMax {
+							tMax = t
+						}
+						endOff := uint16(baseOff + (x1 - xFrom))
+						if nSeg > 0 && segT[nSeg-1] == t {
+							segEnd[nSeg-1] = endOff
+						} else {
+							segEnd[nSeg], segT[nSeg] = endOff, t
+							nSeg++
+						}
 						break
 					}
-					vb, lb := eval(aLine+float64(xe)*u1, bLine+float64(xe)*u2)
-					appendSeg(baseOff+(xe-xFrom), segPairThreshold(la, lb, deduct))
-					va, la = vb, lb
-					_ = va
+					var lb float64
+					if isAlg {
+						_, lb = fp.evalLog2F(aLine+float64(xe)*u1, bLine+float64(xe)*u2)
+					} else {
+						_, lb = fp.evalLog2G(aLine+float64(xe)*u1, bLine+float64(xe)*u2)
+					}
+					t := segPairThreshold(la, lb, deduct)
+					if t > tMax {
+						tMax = t
+					}
+					endOff := uint16(baseOff + (xe - xFrom))
+					if nSeg > 0 && segT[nSeg-1] == t {
+						segEnd[nSeg-1] = endOff
+					} else {
+						segEnd[nSeg], segT[nSeg] = endOff, t
+						nSeg++
+					}
+					la = lb
 					xs = xe
 				}
 			} else {
-				appendSeg(baseOff+(x1-xFrom), segPairThreshold(l0, l1, deduct))
+				t := segPairThreshold(l0, l1, deduct)
+				if t > tMax {
+					tMax = t
+				}
+				endOff := uint16(baseOff + (x1 - xFrom))
+				if nSeg > 0 && segT[nSeg-1] == t {
+					segEnd[nSeg-1] = endOff
+				} else {
+					segEnd[nSeg], segT[nSeg] = endOff, t
+					nSeg++
+				}
 			}
 			v0, l0 = v1, l1
 			x0 = x1
@@ -1601,10 +2107,19 @@ func fillNormSegments(buf []byte, segEnd []uint16, segT []uint8, tMax int, slack
 		} else if initVal > 255 {
 			initVal = 255
 		}
-		bVal := byte(initVal)
 		seg := buf[prev:end]
-		for i := range seg {
-			seg[i] = bVal
+		if initVal == 0 {
+			clear(seg)
+		} else {
+			bVal := byte(initVal)
+			wVal := uint64(bVal) * 0x0101010101010101
+			n8 := len(seg) &^ 7
+			for i := 0; i < n8; i += 8 {
+				binary.LittleEndian.PutUint64(seg[i:], wVal)
+			}
+			for i := n8; i < len(seg); i++ {
+				seg[i] = bVal
+			}
 		}
 		prev = end
 	}

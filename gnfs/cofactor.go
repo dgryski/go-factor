@@ -207,16 +207,36 @@ func cofactorRatLattice(
 			addMult(idx, pr)
 		}
 	}
-	i64, j64 := int64(i), int64(j)
-	for _, vp := range ratVerts {
-		if j%int(vp.p) == 0 {
-			addMult(vp.idx, uint64(vp.p))
+	if i >= -16384 && i <= 16384 && j > 0 && j <= 16384 {
+		i32, j32 := uint32(int32(i)), uint32(j)
+		for _, vp := range ratVerts {
+			if vp.pInv != 0 {
+				if j32*vp.pInv <= vp.pLim {
+					addMult(vp.idx, uint64(vp.p))
+				}
+			} else if j%int(vp.p) == 0 {
+				addMult(vp.idx, uint64(vp.p))
+			}
 		}
-	}
-	for k := range ratLines {
-		lp := &ratLines[k]
-		if (i64-j64*int64(lp.lambda))%int64(lp.p) == 0 {
-			addMult(lp.idx, uint64(lp.p))
+		for k := range ratLines {
+			lp := &ratLines[k]
+			u := j32*lp.lambda + lp.bias - i32
+			if u*lp.pInv <= lp.pLim {
+				addMult(lp.idx, uint64(lp.p))
+			}
+		}
+	} else {
+		i64, j64 := int64(i), int64(j)
+		for _, vp := range ratVerts {
+			if j%int(vp.p) == 0 {
+				addMult(vp.idx, uint64(vp.p))
+			}
+		}
+		for k := range ratLines {
+			lp := &ratLines[k]
+			if (i64-j64*int64(lp.lambda))%int64(lp.p) == 0 {
+				addMult(lp.idx, uint64(lp.p))
+			}
 		}
 	}
 	for _, idx := range ratHits {
@@ -233,7 +253,7 @@ func cofactorRatLattice(
 			return nil, [2]uint64{}, false
 		}
 	}
-	return append([]int32(nil), cols...), ratLPs, true
+	return cols, ratLPs, true
 }
 
 // cofactorAlgLattice factors F(a, b) for a lattice-sieve candidate that already
@@ -298,16 +318,36 @@ func cofactorAlgLattice(
 			addMult(idx, pr)
 		}
 	}
-	i64, j64 := int64(i), int64(j)
-	for _, vp := range algVerts {
-		if j%int(vp.p) == 0 {
-			addMult(vp.idx, uint64(vp.p))
+	if i >= -16384 && i <= 16384 && j > 0 && j <= 16384 {
+		i32, j32 := uint32(int32(i)), uint32(j)
+		for _, vp := range algVerts {
+			if vp.pInv != 0 {
+				if j32*vp.pInv <= vp.pLim {
+					addMult(vp.idx, uint64(vp.p))
+				}
+			} else if j%int(vp.p) == 0 {
+				addMult(vp.idx, uint64(vp.p))
+			}
 		}
-	}
-	for k := range algLines {
-		lp := &algLines[k]
-		if (i64-j64*int64(lp.lambda))%int64(lp.p) == 0 {
-			addMult(lp.idx, uint64(lp.p))
+		for k := range algLines {
+			lp := &algLines[k]
+			u := j32*lp.lambda + lp.bias - i32
+			if u*lp.pInv <= lp.pLim {
+				addMult(lp.idx, uint64(lp.p))
+			}
+		}
+	} else {
+		i64, j64 := int64(i), int64(j)
+		for _, vp := range algVerts {
+			if j%int(vp.p) == 0 {
+				addMult(vp.idx, uint64(vp.p))
+			}
+		}
+		for k := range algLines {
+			lp := &algLines[k]
+			if (i64-j64*int64(lp.lambda))%int64(lp.p) == 0 {
+				addMult(lp.idx, uint64(lp.p))
+			}
 		}
 	}
 	for _, idx := range algHits {
@@ -338,7 +378,7 @@ func cofactorAlgLattice(
 	return Relation{
 		A:       a,
 		B:       b,
-		RatCols: ratCols,
+		RatCols: append([]int32(nil), ratCols...),
 		AlgCols: append([]int32(nil), algCols...),
 		RatLPs:  ratLPs,
 		AlgLPs:  algLPs,
