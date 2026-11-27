@@ -36,7 +36,7 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | **M2** | Done. Dedup, zero-allocation dense-ID `lpFilter` singleton pruning on $(p, r)$ ideals, Cavallar weight-2 clique pruning, Markowitz fill-ordered `Reducer`, and parallel Block Lanczos benchmarked to 150k columns. |
 | **M3** | Done. Gauss reduction, $\lambda_p$, sub-segment log-norm initialization, prime-power sieving, 16 KB prime-outer line sieving, flat `uint32` Franke–Kleinjung bucket arena grouped by `LogP`, line-prime batch resieving, SWAR candidate scan, two-stage 128/64-bit 2LP cofactoring, and tuned parameter rows timed through 100 digits (`332` bits). |
 | **M4** | Done. Skewed fixed-$c_d$ search, bounded skewness, translation + $2\times 2$ rotation size optimisation, parallel prime-power root sieve, Murphy $\alpha$, Kleinjung $a_1 = P_1 P_2$ fractional collision search, 2LP directional Murphy $E(f, g)$ + 30-lattice yield probe, `-gnfs-save` checkpointing + full/partial resume, and measured `qs`/`gnfs` crossover (`342` bits). |
-| **M5** | Partial. Non-monic Kleinjung polynomial selection, free relations, 3LP + 128-bit Montgomery P−1/ECM cofactoring, two-level cache-blocked buckets, product-tree + point-evaluation + Karp–Markstein square root, and $d = 5$ parameter row exist. Exact bad ideals and tuned runs at 105–110+ digits remain. |
+| **M5** | Done. Non-monic Kleinjung polynomial selection, free relations, 3LP + 128-bit Montgomery P−1/ECM cofactoring, two-level cache-blocked buckets, exact Round-2 bad-ideal valuations, product-tree + point-evaluation + Karp–Markstein square root, tuned $d = 4$ / $d = 5$ rows, and 105-digit (`349`-bit) end-to-end verification (`43m38s`). |
 
 ### Parameter table (`defaultParams`)
 
@@ -49,15 +49,16 @@ The package exists and factors end to end: `gnfs.Factor`, wired into `factor/mai
 | 250–275 | $d = 4$, Br = Ba = 250000, LP $2^{21}$, mfb 42, $Q_{\min} = 80\text{k}$, $I = 2048$, $J = 1024$, ratio 0.82. 31.3s–54.0s at 264–265 bits / 80 digits, 24.4s mean sieve over 6 seeds (down from 28.3s before 2LP Murphy $E$ + lattice probe, 32.4s before $P_1 P_2$ collision, 54.0s and 4m34s originally). |
 | 275–305 | $d = 4$, Br = Ba = 400000, LP $2^{22}$, mfb 44, $Q_{\min} = 150\text{k}$, $I = J = 2048$, ratio 0.84. 3m22s at 295 bits / 89 digits (2m34s sieve, 14.1s LA, 29.4s 3-try sqrt, 0 bad squares; down from 3m53s and 21m51s). |
 | 305–325 | $d = 4$, Br = 550000, Ba = 600000, LP $2^{23}$, mfb 46, $Q_{\min} = 220\text{k}$, $I = J = 2048$, ratio 0.77. 6m51s at 315 bits / 95 digits (5m41s sieve, 32.1s LA, 30.2s sqrt, 0 bad squares). |
-| 325–365 | $d = 4$, Br = 700000, Ba = 800000, LP $1.2\times 10^7$, mfb 47, $Q_{\min} = 280\text{k}$, $I = J = 2048$, ratio 0.80. 21m12s sieve, 1m43s LA, ~73s/try sqrt at 332 bits / 100 digits (down from 23m20s sieve with LP $2^{23}$; 31m40s wall on 7-try seed 1, 0 bad squares). |
-| ≥ 365 | $d = 5$, Br = 500000, Ba = 800000, LP $2^{26}$, mfb 52. Not tested. |
+| 325–340 | $d = 4$, Br = 700000, Ba = 850000, LP $1.2\times 10^7 / 1.5\times 10^7$, 2LP/3LP, $Q_{\min} = 280\text{k}$, $I = 4096, J = 2048$, ratio 0.78. 21m12s 2LP sieve baseline at 332 bits / 100 digits (~11m projected with 3LP + $I = 4096$). |
+| 340–356 | $d = 4$, Br = 800000, Ba = 1100000, LP $1.4\times 10^7 / 2.0\times 10^7$, 2LP/3LP, $Q_{\min} = 350\text{k}$, $I = 4096, J = 2048$, ratio 0.78. **43m38s total at 349 bits / 105 digits** (40m58s sieve on 1.75M relations, 1m30s LA on 219.8k core, 54.7s sqrt, 0 bad squares; ~1.4× faster than `qs`). |
+| ≥ 356 | $d = 5$, Br = 1100000, Ba = 1600000, LP $1.6\times 10^7 / 2.8\times 10^7$, 2LP/3LP, $Q_{\min} = 450\text{k}$, $I = 4096, J = 2048$, ratio 0.78. $d = 5$ + 3LP probed 1.7× faster than $d = 4$ at 365–366 bits (110–111 digits). |
 
 `chooseDegree` reads the degree from this table.
 
 ### Differences from the plan
 
 - **Skewness** minimises $\log\operatorname{RMS}(F) + \log\operatorname{RMS}(G)$ capped near $1.5\sqrt{Q_{\min} Q_{\max}}$ so $|b| \ge 1$ is realisable on the integer special-$q$ lattice.
-- **Bad ideals** are currently flagged for any multiple root of $f \bmod p$, which is a little more than $p^2 \mid \operatorname{disc}(f)$ requires (exact Round-2 valuation planned below).
+- **Bad ideals** ($p \mid c_d$ or repeated affine root mod $p$) are decomposed via Zassenhaus Round 2 into exact $\mathcal{O}_p$ prime ideals with anti-uniformizer valuations in `buildMatrix`.
 - **Multiple roots above $B_a$** have no QC, so special-$q$ roots and algebraic large primes at multiple roots are skipped.
 - **Small composite factors** that fit in 64 bits go to rho instead of back into GNFS.
 - **Progress** is measured in relations against a per-row `RelTargetRatio` times $\pi(\text{LP}_{\text{rat}}) + \pi(\text{LP}_{\text{alg}})$, switching to slope extrapolation once the 2-core slope reaches 0.2 (ignoring tiny pre-percolation slopes).
@@ -80,8 +81,8 @@ Parameter sweeps use `TestSweep` in `gnfs/tune_test.go`, which is skipped withou
 | **Done (M5)** | 3LP + 128-bit Montgomery P−1 and ECM cofactoring | Done | Widened `Relation.RatLPs` to `[3]uint64`, added stack-allocated `mont128` CIOS arithmetic, `isPrime128` Miller–Rabin rejection, Stage-1 Pollard P−1 ($B_1 = 300$), Suyama Montgomery-curve ECM ($B_1 = 250..2000$), `rho128` fallback, and 3LP `semiSmoothCurve` support. |
 | **Done (M5)** | Two-level $J$-strip cache-blocked `fkArena` buckets | Done | Resumable `fkWalker` state advances FK lattice walks across 256-block (4 MB/worker) L2 strips without repeating `transformRoot` or `fkReduce`, matching single-strip relations identically. |
 | **Done (M2/M5)** | Cavallar clique pruning + Markowitz SGE & Karp–Markstein + point-eval sqrt | Done | Added weight-2 tree clique pruning above `KeepSurplus + 16`, Markowitz ascending-fill column pivoting in `Reducer`, $2d-1$ integer point evaluation + Newton interpolation in `polyConvolveBig`, and Karp–Markstein half-precision final Hensel step in `algebraicSqrt` (80d LA `3.46s` → `2.08s`, sqrt `3.4s/try` → `1.45s/try`, seeds 1–2 wall `28.4s–29.9s`). **Completes M2.** |
-| **Tier 4 (Finish M5)** | $d = 4$ vs $d = 5$ tuning and 105–110+ digit runs | Next | Tune degree-5 polynomial selection and factor-base / 3LP rows at 340–370 bits (103–111d) with progress and time-left logging. |
-| **Tier 4 (Finish M5)** | Exact bad ideals (Round-2 $p$-maximal order $\mathcal{O}_p$) | Pending | 0 bad squares seen with coarse bad ideals + extra QCs, so near-zero wall-clock gain; implement via Cohen (1993) Alg. 4.8.17 / 6.1.8 / 6.2.9 to complete M5 cleanly (promote earlier only if a 100–110d run shows bad squares). **Completes M5.** |
+| **Done (M5)** | $d = 4$ vs $d = 5$ tuning and 105–110+ digit runs | Done | Probed $d = 4$ vs $d = 5$ and asymmetric 2LP/3LP bounds (`TestYieldProbe`), expanded $d = 5$ Kleinjung $c_d$/tuple search, set $d = 5$ switch at `356` bits, and verified 105d (`349b`) end-to-end in `43m38s` (`40m58s` sieve, `1m30s` LA, `54.7s` sqrt). |
+| **Done (M5)** | Exact bad ideals (Round-2 $p$-maximal order $\mathcal{O}_p$) | Done | Implemented Zassenhaus Round-2 $\mathcal{O}_p$ (`computePMaximalOrder`), étale idempotent splitting (`decomposeOrderModP`), and anti-uniformizer valuations (`BadPrimeDecomp.valuations`) per Cohen (1993) Alg. 4.8.17 / 6.1.8 / 6.2.9, replacing coarse bad-ideal columns and extra QCs. **Completes M5.** |
 | **Tier 5 (Post-M5)** | 3-prime 64-bit NTT for multi-Mbit `big.Int` products | Deferred | Defer past M5 unless `tryDependency` exceeds ~60s above 110–115 digits; product tree + Karp–Markstein on `math/big` Karatsuba handles $\le 110$ digits in seconds. |
 | **Skipped** | SIMD / `avo` core sieving loop | Skipped | Skipped per operator direction. |
 
